@@ -152,6 +152,7 @@ sailroute::RouteResult route_with_workers(
     request.options.max_nodes_per_bucket = 3;
     request.options.worker_count = worker_count;
     request.options.maximum_route_duration = std::chrono::hours{12};
+    request.options.capture_isochrones = true;
 
     auto result = router.optimize(request);
     if (!result.has_value()) {
@@ -199,6 +200,23 @@ void require_same_route(
             left_point.cumulative_distance_nautical_miles ==
             right_point.cumulative_distance_nautical_miles);
     }
+    REQUIRE(left.isochrones.size() == right.isochrones.size());
+    for (std::size_t index = 0U; index < left.isochrones.size(); ++index) {
+        const sailroute::Isochrone& left_isochrone = left.isochrones[index];
+        const sailroute::Isochrone& right_isochrone = right.isochrones[index];
+        REQUIRE(left_isochrone.time == right_isochrone.time);
+        REQUIRE(left_isochrone.points.size() == right_isochrone.points.size());
+        for (std::size_t point_index = 0U;
+             point_index < left_isochrone.points.size();
+             ++point_index) {
+            REQUIRE(
+                left_isochrone.points[point_index].latitude_degrees ==
+                right_isochrone.points[point_index].latitude_degrees);
+            REQUIRE(
+                left_isochrone.points[point_index].longitude_degrees ==
+                right_isochrone.points[point_index].longitude_degrees);
+        }
+    }
 }
 
 }  // namespace
@@ -234,6 +252,12 @@ TEST_CASE("departure sources have stable names") {
         std::string_view{"forecast_start_fallback"});
 }
 
+TEST_CASE("routing defaults retain a wider configurable frontier") {
+    const sailroute::RoutingOptions options;
+    REQUIRE(options.max_nodes_per_bucket == 10U);
+    REQUIRE(!options.capture_isochrones);
+}
+
 TEST_CASE("spherical navigation handles cardinal courses and the antimeridian") {
     const sailroute::Coordinate origin{0.0, 0.0};
     const sailroute::Coordinate east{0.0, 1.0};
@@ -266,6 +290,17 @@ TEST_CASE("parallel candidate expansion is deterministic") {
     const sailroute::RouteResult automatic = route_with_workers(router, 0U);
 
     REQUIRE(single.diagnostics.expanded_nodes > single.diagnostics.time_steps);
+    REQUIRE(!single.isochrones.empty());
+    std::size_t captured_points = 0U;
+    sailroute::TimePoint previous_time{};
+    for (const sailroute::Isochrone& isochrone : single.isochrones) {
+        REQUIRE(!isochrone.points.empty());
+        REQUIRE(previous_time == sailroute::TimePoint{} ||
+                isochrone.time > previous_time);
+        previous_time = isochrone.time;
+        captured_points += isochrone.points.size();
+    }
+    REQUIRE(captured_points + 1U == single.diagnostics.retained_candidates);
     require_same_route(single, parallel);
     require_same_route(parallel, repeated);
     require_same_route(single, automatic);
@@ -310,4 +345,5 @@ TEST_CASE("omitted departure falls back to forecast start") {
     REQUIRE(
         route.value().departure_source ==
         sailroute::DepartureSource::forecast_start_fallback);
+    REQUIRE(route.value().isochrones.empty());
 }
