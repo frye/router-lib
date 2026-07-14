@@ -45,6 +45,7 @@ Enable the microbenchmarks with
   --destination 21.3069,-157.8583 \
   --polar boat.pol \
   --departure 2026-07-14T16:19:01Z \
+  --routing-intervals 15m@6h,30m@24h,2h \
   --json route.json \
   --gpx route.gpx \
   --isochrones-json isochrones.json \
@@ -61,6 +62,19 @@ frontier.
 The router retains up to 10 nodes per spatial bucket by default. Increase
 `--max-nodes-per-bucket` to preserve a larger set of alternate paths, or reduce
 it when runtime and memory are more important than search breadth.
+
+Routing intervals are measured from departure. By default, the router creates
+points every 30 minutes for the first 4 hours, every hour through the first 24
+hours, and every 3 hours thereafter. Override the schedule with
+`--routing-intervals`; each bounded tier uses `INTERVAL@CUTOFF`, followed by one
+open-ended interval. Durations are positive integers suffixed with `m` or `h`,
+for example `5m@2h,30m@12h,1h`. Cutoffs must increase, and configured intervals
+must be at least 5 minutes. A step is shortened when necessary to land exactly
+on a cutoff or the routing horizon. Use `--time-step-minutes N` for a constant
+interval; it is mutually exclusive with `--routing-intervals`. C++ callers can
+set `RoutingOptions::time_step` and set
+`RoutingOptions::use_routing_intervals` to `false` for the same
+constant-interval compatibility behavior.
 
 The `samples/` directory contains an approximate First 44-class polar and
 offshore coordinates for a Race Rocks to Port Angeles demonstration:
@@ -87,6 +101,11 @@ sailroute::Router router{weather.value(), polar.value()};
 sailroute::RouteRequest request{
     .start = {37.7749, -122.4194},
     .destination = {21.3069, -157.8583},
+};
+request.options.routing_intervals = {
+    {std::chrono::minutes{15}, std::chrono::hours{6}},
+    {std::chrono::minutes{30}, std::chrono::hours{24}},
+    {std::chrono::hours{2}, std::nullopt},
 };
 request.options.capture_isochrones = true;
 auto result = router.optimize(request);

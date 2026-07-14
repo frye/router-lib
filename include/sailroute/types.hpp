@@ -24,6 +24,11 @@ struct Wind {
     [[nodiscard]] double direction_from_degrees() const noexcept;
 };
 
+struct RoutingInterval {
+    std::chrono::minutes interval{};
+    std::optional<std::chrono::minutes> until_elapsed;
+};
+
 enum class DepartureSource {
     explicit_time,
     current_time,
@@ -40,6 +45,12 @@ struct RoutingOptions {
     std::chrono::hours maximum_route_duration{240};
     double minimum_boat_speed_knots{0.05};
     bool capture_isochrones{false};
+    bool use_routing_intervals{true};
+    std::vector<RoutingInterval> routing_intervals{
+        {std::chrono::minutes{30}, std::chrono::minutes{240}},
+        {std::chrono::minutes{60}, std::chrono::minutes{1'440}},
+        {std::chrono::minutes{180}, std::nullopt},
+    };
 };
 
 struct RouteRequest {

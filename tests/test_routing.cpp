@@ -2,6 +2,7 @@
 #include "sailroute/time.hpp"
 
 #include "../src/routing/geodesy.hpp"
+#include "../src/routing/intervals.hpp"
 #include "test_support.hpp"
 
 #include <eccodes.h>
@@ -146,6 +147,7 @@ sailroute::RouteResult route_with_workers(
     request.destination = {1.0, 1.0};
     request.departure_time = departure.value();
     request.options.time_step = std::chrono::minutes{30};
+    request.options.use_routing_intervals = false;
     request.options.heading_step_degrees = 10.0;
     request.options.arrival_radius_nautical_miles = 0.5;
     request.options.spatial_bucket_nautical_miles = 3.0;
@@ -256,6 +258,108 @@ TEST_CASE("routing defaults retain a wider configurable frontier") {
     const sailroute::RoutingOptions options;
     REQUIRE(options.max_nodes_per_bucket == 10U);
     REQUIRE(!options.capture_isochrones);
+    REQUIRE(options.time_step == std::chrono::minutes{30});
+    REQUIRE(options.use_routing_intervals);
+    REQUIRE(options.routing_intervals.size() == 3U);
+    REQUIRE(
+        options.routing_intervals[0U].interval ==
+        std::chrono::minutes{30});
+    REQUIRE(
+        options.routing_intervals[0U].until_elapsed ==
+        std::chrono::minutes{240});
+    REQUIRE(
+        options.routing_intervals[1U].interval ==
+        std::chrono::minutes{60});
+    REQUIRE(
+        options.routing_intervals[1U].until_elapsed ==
+        std::chrono::minutes{1'440});
+    REQUIRE(
+        options.routing_intervals[2U].interval ==
+        std::chrono::minutes{180});
+    REQUIRE(!options.routing_intervals[2U].until_elapsed.has_value());
+}
+
+TEST_CASE("routing interval schedules select and clamp elapsed-time tiers") {
+    const sailroute::RoutingOptions options;
+    REQUIRE(!sailroute::detail::validate_routing_intervals(options).has_value());
+    const auto remaining = std::chrono::hours{100};
+
+    REQUIRE(
+        sailroute::detail::routing_step(
+            options,
+            std::chrono::seconds::zero(),
+            remaining) ==
+        std::chrono::minutes{30});
+    REQUIRE(
+        sailroute::detail::routing_step(
+            options,
+            std::chrono::hours{3} + std::chrono::minutes{45},
+            remaining) ==
+        std::chrono::minutes{15});
+    REQUIRE(
+        sailroute::detail::routing_step(
+            options,
+            std::chrono::hours{4},
+            remaining) ==
+        std::chrono::hours{1});
+    REQUIRE(
+        sailroute::detail::routing_step(
+            options,
+            std::chrono::hours{23} + std::chrono::minutes{30},
+            remaining) ==
+        std::chrono::minutes{30});
+    REQUIRE(
+        sailroute::detail::routing_step(
+            options,
+            std::chrono::hours{24},
+            remaining) ==
+        std::chrono::hours{3});
+    REQUIRE(
+        sailroute::detail::routing_step(
+            options,
+            std::chrono::hours{24},
+            std::chrono::minutes{45}) ==
+        std::chrono::minutes{45});
+}
+
+TEST_CASE("routing intervals enforce valid tiers and a five-minute minimum") {
+    sailroute::RoutingOptions options;
+    options.routing_intervals = {
+        {std::chrono::minutes{5}, std::chrono::minutes{10}},
+        {std::chrono::minutes{15}, std::nullopt},
+    };
+    REQUIRE(!sailroute::detail::validate_routing_intervals(options).has_value());
+    REQUIRE(
+        sailroute::detail::routing_step(
+            options,
+            std::chrono::minutes{5},
+            std::chrono::hours{1}) ==
+        std::chrono::minutes{5});
+    REQUIRE(
+        sailroute::detail::routing_step(
+            options,
+            std::chrono::minutes{10},
+            std::chrono::hours{1}) ==
+        std::chrono::minutes{15});
+
+    options.routing_intervals.front().interval = std::chrono::minutes{4};
+    REQUIRE(sailroute::detail::validate_routing_intervals(options).has_value());
+    options.routing_intervals.front().interval = std::chrono::minutes{5};
+    options.routing_intervals.front().until_elapsed = std::chrono::minutes{20};
+    options.routing_intervals.back().until_elapsed = std::chrono::minutes{10};
+    REQUIRE(sailroute::detail::validate_routing_intervals(options).has_value());
+
+    options.time_step = std::chrono::minutes{4};
+    options.use_routing_intervals = false;
+    REQUIRE(sailroute::detail::validate_routing_intervals(options).has_value());
+    options.time_step = std::chrono::minutes{5};
+    REQUIRE(!sailroute::detail::validate_routing_intervals(options).has_value());
+    REQUIRE(
+        sailroute::detail::routing_step(
+            options,
+            std::chrono::hours{24},
+            std::chrono::hours{1}) ==
+        std::chrono::minutes{5});
 }
 
 TEST_CASE("spherical navigation handles cardinal courses and the antimeridian") {
@@ -304,6 +408,46 @@ TEST_CASE("parallel candidate expansion is deterministic") {
     require_same_route(single, parallel);
     require_same_route(parallel, repeated);
     require_same_route(single, automatic);
+}
+
+TEST_CASE("router produces scheduled points at five-minute intervals") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    const auto departure = sailroute::parse_utc_time("2026-07-14T12:00:00Z");
+    REQUIRE(departure.has_value());
+
+    sailroute::RouteRequest request;
+    request.start = {1.0, 0.5};
+    request.destination = {1.0, 0.7};
+    request.departure_time = departure.value();
+    request.options.routing_intervals = {
+        {std::chrono::minutes{5}, std::nullopt},
+    };
+    request.options.use_routing_intervals = true;
+    request.options.arrival_radius_nautical_miles = 0.5;
+    request.options.spatial_bucket_nautical_miles = 3.0;
+    request.options.max_nodes_per_bucket = 3U;
+    request.options.maximum_route_duration = std::chrono::hours{12};
+
+    const auto route = router.optimize(request);
+    if (!route.has_value()) {
+        throw std::runtime_error(route.error().message);
+    }
+    REQUIRE(route.value().points.size() > 2U);
+    for (std::size_t index = 1U;
+         index + 1U < route.value().points.size();
+         ++index) {
+        REQUIRE(
+            route.value().points[index].time -
+                route.value().points[index - 1U].time ==
+            std::chrono::minutes{5});
+    }
+    REQUIRE(
+        route.value().points.back().time -
+            route.value().points[route.value().points.size() - 2U].time <=
+        std::chrono::minutes{5});
 }
 
 TEST_CASE("explicit departure outside forecast coverage is rejected") {

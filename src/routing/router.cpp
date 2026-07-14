@@ -1,6 +1,7 @@
 #include "sailroute/router.hpp"
 
 #include "routing/geodesy.hpp"
+#include "routing/intervals.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -96,8 +97,9 @@ std::optional<Error> validate_request(const RouteRequest& request) {
     }
 
     const RoutingOptions& options = request.options;
-    if (options.time_step <= std::chrono::minutes::zero()) {
-        return Error{ErrorCode::invalid_argument, "routing time_step must be positive"};
+    if (const auto interval_error = detail::validate_routing_intervals(options);
+        interval_error.has_value()) {
+        return interval_error;
     }
     if (!std::isfinite(options.heading_step_degrees) ||
         options.heading_step_degrees <= 0.0 ||
@@ -744,8 +746,6 @@ Result<RouteResult> Router::optimize(const RouteRequest& request) const {
     const TimePoint horizon_end = departure + request.options.maximum_route_duration;
     const TimePoint route_end = std::min(horizon_end, metadata.last_valid_time);
     const bool forecast_limited = metadata.last_valid_time <= horizon_end;
-    const auto configured_step =
-        std::chrono::duration_cast<std::chrono::seconds>(request.options.time_step);
     const std::size_t heading_count = static_cast<std::size_t>(
         std::ceil(360.0 / request.options.heading_step_degrees));
     ExpansionBuffer single_worker_buffer;
@@ -758,7 +758,11 @@ Result<RouteResult> Router::optimize(const RouteRequest& request) const {
         }
         const auto remaining =
             std::chrono::duration_cast<std::chrono::seconds>(route_end - current_time);
-        const auto step = std::min(configured_step, remaining);
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                current_time - departure);
+        const auto step =
+            detail::routing_step(request.options, elapsed, remaining);
         if (step <= std::chrono::seconds::zero()) {
             return exhausted_error(forecast_limited, diagnostics);
         }

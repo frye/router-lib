@@ -76,6 +76,7 @@ int main(int argc, char** argv) {
     request.destination = {20.0, 5.8};
     request.departure_time = departure.value();
     request.options.time_step = std::chrono::minutes{30};
+    request.options.use_routing_intervals = false;
     request.options.heading_step_degrees = 5.0;
     request.options.arrival_radius_nautical_miles = 0.5;
     request.options.spatial_bucket_nautical_miles = 3.0;
