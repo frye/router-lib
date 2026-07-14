@@ -53,7 +53,8 @@ void print_help(std::ostream& output) {
         "  --isochrones-gpx PATH               Write retained frontiers as GPX 1.1\n"
         "\n"
         "Routing controls:\n"
-        "  --time-step-minutes N               Routing time step (> 0)\n"
+        "  --routing-intervals SPEC            Interval schedule (default: 30m@4h,1h@24h,3h)\n"
+        "  --time-step-minutes N               Constant interval in minutes (>= 5)\n"
         "  --heading-step-degrees N            Heading increment (0 < N <= 180)\n"
         "  --arrival-radius-nm N               Arrival radius (> 0)\n"
         "  --spatial-bucket-nm N               Spatial pruning bucket size (> 0)\n"
@@ -87,6 +88,114 @@ bool parse_unsigned(std::string_view text, unsigned long long& value) {
     const char* const end = begin + text.size();
     const auto parsed = std::from_chars(begin, end, value);
     return parsed.ec == std::errc{} && parsed.ptr == end;
+}
+
+sailroute::Result<std::chrono::minutes> parse_duration_minutes(
+    std::string_view text,
+    std::string_view description) {
+    if (text.size() < 2U) {
+        return usage_error(
+            std::string{description} + " must be an integer followed by m or h");
+    }
+
+    unsigned long long multiplier = 0U;
+    switch (text.back()) {
+        case 'm':
+            multiplier = 1U;
+            break;
+        case 'h':
+            multiplier = 60U;
+            break;
+        default:
+            return usage_error(
+                std::string{description} + " must use an m or h suffix");
+    }
+
+    unsigned long long value = 0U;
+    using Rep = std::chrono::minutes::rep;
+    const auto maximum =
+        static_cast<unsigned long long>(std::numeric_limits<Rep>::max());
+    if (!parse_unsigned(text.substr(0U, text.size() - 1U), value) ||
+        value == 0U ||
+        value > maximum / multiplier) {
+        return usage_error(
+            std::string{description} + " must be a positive duration");
+    }
+    return std::chrono::minutes{
+        static_cast<Rep>(value * multiplier)};
+}
+
+sailroute::Result<std::vector<sailroute::RoutingInterval>>
+parse_routing_intervals(std::string_view text) {
+    if (text.empty()) {
+        return usage_error("--routing-intervals must not be empty");
+    }
+    if (text.back() == ',') {
+        return usage_error(
+            "--routing-intervals must not contain empty tiers");
+    }
+
+    std::vector<sailroute::RoutingInterval> intervals;
+    std::chrono::minutes previous_cutoff = std::chrono::minutes::zero();
+    std::size_t offset = 0U;
+    while (offset < text.size()) {
+        const std::size_t comma = text.find(',', offset);
+        const bool final_tier = comma == std::string_view::npos;
+        const std::string_view tier =
+            final_tier ? text.substr(offset) : text.substr(offset, comma - offset);
+        if (tier.empty()) {
+            return usage_error(
+                "--routing-intervals must not contain empty tiers");
+        }
+
+        const std::size_t at = tier.find('@');
+        if (at != std::string_view::npos &&
+            tier.find('@', at + 1U) != std::string_view::npos) {
+            return usage_error(
+                "--routing-intervals tiers may contain at most one @");
+        }
+        auto interval = parse_duration_minutes(
+            tier.substr(0U, at),
+            "routing interval");
+        if (!interval) {
+            return interval.error();
+        }
+        if (interval.value() < std::chrono::minutes{5}) {
+            return usage_error(
+                "routing intervals must be at least 5 minutes");
+        }
+
+        std::optional<std::chrono::minutes> cutoff;
+        if (at != std::string_view::npos) {
+            if (final_tier) {
+                return usage_error(
+                    "--routing-intervals must end with an open-ended interval");
+            }
+            auto parsed_cutoff = parse_duration_minutes(
+                tier.substr(at + 1U),
+                "routing interval cutoff");
+            if (!parsed_cutoff) {
+                return parsed_cutoff.error();
+            }
+            if (parsed_cutoff.value() <= previous_cutoff) {
+                return usage_error(
+                    "routing interval cutoffs must be strictly increasing");
+            }
+            cutoff = parsed_cutoff.value();
+            previous_cutoff = *cutoff;
+        } else if (!final_tier) {
+            return usage_error(
+                "only the final routing interval may omit a cutoff");
+        }
+
+        intervals.push_back(
+            sailroute::RoutingInterval{interval.value(), cutoff});
+        if (final_tier) {
+            break;
+        }
+        offset = comma + 1U;
+    }
+    return intervals;
 }
 
 sailroute::Result<sailroute::Coordinate> parse_coordinate(
@@ -125,6 +234,7 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
     bool gpx_seen = false;
     bool isochrones_json_seen = false;
     bool isochrones_gpx_seen = false;
+    bool routing_intervals_seen = false;
     bool time_step_seen = false;
     bool heading_step_seen = false;
     bool arrival_radius_seen = false;
@@ -273,9 +383,33 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
             }
             options.isochrones_gpx_path =
                 std::filesystem::path{value.value()};
+        } else if (argument == "--routing-intervals") {
+            if (const auto duplicate =
+                    reject_duplicate(routing_intervals_seen, argument)) {
+                return *duplicate;
+            }
+            if (time_step_seen) {
+                return usage_error(
+                    "--routing-intervals and --time-step-minutes are mutually exclusive");
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            auto intervals = parse_routing_intervals(value.value());
+            if (!intervals) {
+                return intervals.error();
+            }
+            options.routing.routing_intervals =
+                std::move(intervals.value());
+            options.routing.time_step.reset();
         } else if (is_option(argument, "--time-step-minutes", "--time-step")) {
             if (const auto duplicate = reject_duplicate(time_step_seen, "--time-step-minutes")) {
                 return *duplicate;
+            }
+            if (routing_intervals_seen) {
+                return usage_error(
+                    "--routing-intervals and --time-step-minutes are mutually exclusive");
             }
             auto value = value_after(argument);
             if (!value) {
@@ -283,9 +417,11 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
             }
             unsigned long long parsed = 0;
             using Rep = std::chrono::minutes::rep;
-            if (!parse_unsigned(value.value(), parsed) || parsed == 0 ||
+            if (!parse_unsigned(value.value(), parsed) || parsed < 5U ||
                 parsed > static_cast<unsigned long long>(std::numeric_limits<Rep>::max())) {
-                return usage_error(std::string{argument} + " must be a positive integer");
+                return usage_error(
+                    std::string{argument} +
+                    " must be an integer of at least 5");
             }
             options.routing.time_step = std::chrono::minutes{static_cast<Rep>(parsed)};
         } else if (is_option(argument, "--heading-step-degrees", "--heading-step")) {

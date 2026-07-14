@@ -28,6 +28,7 @@ add_library(sailroute STATIC
     src/weather/weather_dataset.cpp
     src/polar/vessel_polar.cpp
     src/routing/geodesy.cpp
+    src/routing/intervals.cpp
     src/routing/router.cpp
     src/serialization/json.cpp
     src/serialization/gpx.cpp
@@ -77,11 +78,67 @@ if(SAILROUTE_BUILD_TESTS)
     target_compile_definitions(
         sailroute_tests
         PRIVATE SAILROUTE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
+    function(add_cli_failure_test test_name expected_output)
+        add_test(
+            NAME ${test_name}
+            COMMAND
+                ${CMAKE_COMMAND}
+                "-DCOMMAND_PATH=$<TARGET_FILE:sailroute_cli>"
+                "-DCOMMAND_ARGUMENTS=${ARGN}"
+                "-DEXPECTED_OUTPUT=${expected_output}"
+                -P
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ExpectCommandFailure.cmake")
+    endfunction()
+
     add_test(NAME sailroute_tests COMMAND sailroute_tests)
     add_test(NAME sailroute_cli_help COMMAND sailroute_cli --help)
+    add_cli_failure_test(
+        sailroute_cli_custom_intervals
+        "cannot open GRIB file"
+        --grib sailroute-missing-forecast.grib
+        --start 0,0
+        --destination 0,1
+        --routing-intervals 5m@10m,15m)
+    add_cli_failure_test(
+        sailroute_cli_constant_interval
+        "cannot open GRIB file"
+        --grib sailroute-missing-forecast.grib
+        --start 0,0
+        --destination 0,1
+        --time-step-minutes 5)
+    add_cli_failure_test(
+        sailroute_cli_interval_too_short
+        "at least 5 minutes"
+        --grib sailroute-missing-forecast.grib
+        --start 0,0
+        --destination 0,1
+        --routing-intervals 4m)
+    add_cli_failure_test(
+        sailroute_cli_interval_conflict
+        "mutually exclusive"
+        --grib sailroute-missing-forecast.grib
+        --start 0,0
+        --destination 0,1
+        --routing-intervals 30m
+        --time-step-minutes 30)
+    add_cli_failure_test(
+        sailroute_cli_invalid_interval_cutoffs
+        "strictly increasing"
+        --grib sailroute-missing-forecast.grib
+        --start 0,0
+        --destination 0,1
+        --routing-intervals 30m@4h,1h@3h,3h)
+    add_cli_failure_test(
+        sailroute_cli_empty_interval_tier
+        "must not contain empty tiers"
+        --grib sailroute-missing-forecast.grib
+        --start 0,0
+        --destination 0,1
+        --routing-intervals 5m@10m,)
     set_tests_properties(
         sailroute_cli_help
-        PROPERTIES PASS_REGULAR_EXPRESSION "--isochrones-json PATH")
+        PROPERTIES PASS_REGULAR_EXPRESSION "--routing-intervals SPEC")
 endif()
 
 if(SAILROUTE_BUILD_BENCHMARKS)
