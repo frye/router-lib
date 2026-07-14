@@ -1,0 +1,9 @@
+/build/
+/build-*/
+/.cache/
+compile_commands.json
+*.grib
+*.grib1
+*.grib2
+!samples/sample.grib
+*.gpx

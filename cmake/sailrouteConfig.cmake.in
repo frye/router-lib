@@ -1,0 +1,18 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+find_package(eccodes CONFIG QUIET)
+if(NOT TARGET eccodes AND NOT TARGET eccodes_shared AND NOT TARGET ECCODES::eccodes)
+    find_dependency(PkgConfig)
+    pkg_check_modules(ECCODES REQUIRED IMPORTED_TARGET eccodes)
+    add_library(eccodes INTERFACE IMPORTED)
+    set_property(
+        TARGET eccodes
+        PROPERTY INTERFACE_LINK_LIBRARIES PkgConfig::ECCODES)
+    add_library(eccodes_shared INTERFACE IMPORTED)
+    set_property(
+        TARGET eccodes_shared
+        PROPERTY INTERFACE_LINK_LIBRARIES PkgConfig::ECCODES)
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/sailrouteTargets.cmake")

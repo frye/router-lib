@@ -1,0 +1,20 @@
+# Race Rocks to Port Angeles sample route
+#
+# Decimal degrees, WGS84. These are approximate offshore planning points, not
+# surveyed marks or navigation advice.
+#
+# Race Rocks reference:
+#   OpenStreetMap center: 48.2981964, -123.5316968
+#   The start below is about 0.15 nautical miles south of the islets.
+#
+# Port Angeles reference:
+#   OpenStreetMap east tip of the main rock breakwater:
+#   approximately 48.1411, -123.4039
+#   The destination below is about 100 yards east of the breakwater tip.
+
+start=48.294300,-123.531697
+destination=48.141100,-123.402687
+
+# CLI arguments:
+# --start 48.294300,-123.531697
+# --destination 48.141100,-123.402687

@@ -1,0 +1,18 @@
+{
+  "departure":{"time":"2026-07-14T20:19:01Z","source":"explicit_time","position":{"latitude":48.2943,"longitude":-123.53169699999999}},
+  "arrival":{"time":"2026-07-14T22:14:57Z","position":{"latitude":48.167275347626322,"longitude":-123.43356944783949}},
+  "forecast":{"source":"samples/sample.grib"},
+  "polar":{"source":"Loaded vessel polar from 'samples/sample.pol'"},
+  "diagnostics":{"expandedNodes":43,"generatedCandidates":1290,"retainedCandidates":43,"timeSteps":8},
+  "points":[
+    {"time":"2026-07-14T20:19:01Z","position":{"latitude":48.2943,"longitude":-123.53169699999999},"headingDegrees":0,"boatSpeedKnots":0,"trueWindSpeedKnots":4.0867011529543271,"trueWindDirectionDegrees":233.78716852720686,"cumulativeDistanceNauticalMiles":0},
+    {"time":"2026-07-14T20:34:01Z","position":{"latitude":48.281546419343556,"longitude":-123.52063268757519},"headingDegrees":150,"boatSpeedKnots":3.5366121611736068,"trueWindSpeedKnots":4.0867011529543271,"trueWindDirectionDegrees":233.78716852720686,"cumulativeDistanceNauticalMiles":0.88415304029340169},
+    {"time":"2026-07-14T20:49:01Z","position":{"latitude":48.267407714677944,"longitude":-123.50837016584012},"headingDegrees":150,"boatSpeedKnots":3.9206942226010177,"trueWindSpeedKnots":4.4742432826638101,"trueWindDirectionDegrees":241.22494635928223,"cumulativeDistanceNauticalMiles":1.8643265959436561},
+    {"time":"2026-07-14T21:04:01Z","position":{"latitude":48.251733504065633,"longitude":-123.4947801324592},"headingDegrees":150,"boatSpeedKnots":4.3464717876536465,"trueWindSpeedKnots":4.9863169844546551,"trueWindDirectionDegrees":248.24269967110868,"cumulativeDistanceNauticalMiles":2.9509445428570675},
+    {"time":"2026-07-14T21:19:01Z","position":{"latitude":48.233916218430238,"longitude":-123.47933747305422},"headingDegrees":150,"boatSpeedKnots":4.9407139565283513,"trueWindSpeedKnots":5.683348607759747,"trueWindDirectionDegrees":254.85995809108425,"cumulativeDistanceNauticalMiles":4.1861230319891556},
+    {"time":"2026-07-14T21:34:01Z","position":{"latitude":48.216447719703332,"longitude":-123.4642022641537},"headingDegrees":150,"boatSpeedKnots":4.8440013989835151,"trueWindSpeedKnots":5.6395699961174532,"trueWindDirectionDegrees":263.16115975221931,"cumulativeDistanceNauticalMiles":5.3971233817350344},
+    {"time":"2026-07-14T21:49:01Z","position":{"latitude":48.197618426910203,"longitude":-123.45392096973148},"headingDegrees":160,"boatSpeedKnots":4.8121773623642063,"trueWindSpeedKnots":5.5840514825760943,"trueWindDirectionDegrees":271.3468971954278,"cumulativeDistanceNauticalMiles":6.600167722326086},
+    {"time":"2026-07-14T22:04:01Z","position":{"latitude":48.179125117707443,"longitude":-123.44382676988312},"headingDegrees":160,"boatSpeedKnots":4.7263126092609973,"trueWindSpeedKnots":5.5794048157371723,"trueWindDirectionDegrees":279.51517249024567,"cumulativeDistanceNauticalMiles":7.7817458746413353},
+    {"time":"2026-07-14T22:14:57Z","position":{"latitude":48.167275347626322,"longitude":-123.43356944783949},"headingDegrees":150,"boatSpeedKnots":4.5068111876668357,"trueWindSpeedKnots":5.5922426515444137,"trueWindDirectionDegrees":286.31035993615683,"cumulativeDistanceNauticalMiles":8.6032440129835486}
+  ]
+}
