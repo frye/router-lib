@@ -1,9 +1,9 @@
-# sailroute
+# router-lib
 
-`sailroute` is a C++20 library and command-line tool for fastest-arrival sailing
-route optimization using downloaded GRIB weather forecasts and vessel polars.
-It uses ECMWF ecCodes for GRIB1/GRIB2 decoding and an isochrone search for
-time-dependent routing.
+`router-lib` is a C++20 library for fastest-arrival sailing route optimization
+using downloaded GRIB weather forecasts and vessel polars. It includes the
+`sailroute` command-line tool, uses ECMWF ecCodes for GRIB1/GRIB2 decoding, and
+performs an isochrone search for time-dependent routing.
 
 > [!WARNING]
 > The MVP does not model land, shorelines, currents, waves, traffic, restricted
