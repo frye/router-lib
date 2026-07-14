@@ -7,8 +7,8 @@ namespace sailroute::detail {
 
 std::optional<Error> validate_routing_intervals(
     const RoutingOptions& options) {
-    if (options.time_step.has_value()) {
-        if (*options.time_step < minimum_routing_interval) {
+    if (!options.use_routing_intervals) {
+        if (options.time_step < minimum_routing_interval) {
             return Error{
                 ErrorCode::invalid_argument,
                 "routing time_step must be at least 5 minutes"};
@@ -63,10 +63,10 @@ std::chrono::seconds routing_step(
     const RoutingOptions& options,
     std::chrono::seconds elapsed,
     std::chrono::seconds remaining) noexcept {
-    if (options.time_step.has_value()) {
+    if (!options.use_routing_intervals) {
         return std::min(
             std::chrono::duration_cast<std::chrono::seconds>(
-                *options.time_step),
+                options.time_step),
             remaining);
     }
 

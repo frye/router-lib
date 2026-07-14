@@ -72,8 +72,9 @@ for example `5m@2h,30m@12h,1h`. Cutoffs must increase, and configured intervals
 must be at least 5 minutes. A step is shortened when necessary to land exactly
 on a cutoff or the routing horizon. Use `--time-step-minutes N` for a constant
 interval; it is mutually exclusive with `--routing-intervals`. C++ callers can
-set `RoutingOptions::time_step` for the same constant-interval compatibility
-behavior.
+set `RoutingOptions::time_step` and set
+`RoutingOptions::use_routing_intervals` to `false` for the same
+constant-interval compatibility behavior.
 
 The `samples/` directory contains an approximate First 44-class polar and
 offshore coordinates for a Race Rocks to Port Angeles demonstration:

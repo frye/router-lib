@@ -36,7 +36,7 @@ enum class DepartureSource {
 };
 
 struct RoutingOptions {
-    std::optional<std::chrono::minutes> time_step;
+    std::chrono::minutes time_step{30};
     double heading_step_degrees{10.0};
     double arrival_radius_nautical_miles{2.0};
     double spatial_bucket_nautical_miles{10.0};
@@ -45,6 +45,7 @@ struct RoutingOptions {
     std::chrono::hours maximum_route_duration{240};
     double minimum_boat_speed_knots{0.05};
     bool capture_isochrones{false};
+    bool use_routing_intervals{true};
     std::vector<RoutingInterval> routing_intervals{
         {std::chrono::minutes{30}, std::chrono::minutes{240}},
         {std::chrono::minutes{60}, std::chrono::minutes{1'440}},

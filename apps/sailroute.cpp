@@ -402,7 +402,7 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
             }
             options.routing.routing_intervals =
                 std::move(intervals.value());
-            options.routing.time_step.reset();
+            options.routing.use_routing_intervals = true;
         } else if (is_option(argument, "--time-step-minutes", "--time-step")) {
             if (const auto duplicate = reject_duplicate(time_step_seen, "--time-step-minutes")) {
                 return *duplicate;
@@ -424,6 +424,7 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
                     " must be an integer of at least 5");
             }
             options.routing.time_step = std::chrono::minutes{static_cast<Rep>(parsed)};
+            options.routing.use_routing_intervals = false;
         } else if (is_option(argument, "--heading-step-degrees", "--heading-step")) {
             if (const auto duplicate =
                     reject_duplicate(heading_step_seen, "--heading-step-degrees")) {

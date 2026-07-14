@@ -147,6 +147,7 @@ sailroute::RouteResult route_with_workers(
     request.destination = {1.0, 1.0};
     request.departure_time = departure.value();
     request.options.time_step = std::chrono::minutes{30};
+    request.options.use_routing_intervals = false;
     request.options.heading_step_degrees = 10.0;
     request.options.arrival_radius_nautical_miles = 0.5;
     request.options.spatial_bucket_nautical_miles = 3.0;
@@ -257,7 +258,8 @@ TEST_CASE("routing defaults retain a wider configurable frontier") {
     const sailroute::RoutingOptions options;
     REQUIRE(options.max_nodes_per_bucket == 10U);
     REQUIRE(!options.capture_isochrones);
-    REQUIRE(!options.time_step.has_value());
+    REQUIRE(options.time_step == std::chrono::minutes{30});
+    REQUIRE(options.use_routing_intervals);
     REQUIRE(options.routing_intervals.size() == 3U);
     REQUIRE(
         options.routing_intervals[0U].interval ==
@@ -348,6 +350,7 @@ TEST_CASE("routing intervals enforce valid tiers and a five-minute minimum") {
     REQUIRE(sailroute::detail::validate_routing_intervals(options).has_value());
 
     options.time_step = std::chrono::minutes{4};
+    options.use_routing_intervals = false;
     REQUIRE(sailroute::detail::validate_routing_intervals(options).has_value());
     options.time_step = std::chrono::minutes{5};
     REQUIRE(!sailroute::detail::validate_routing_intervals(options).has_value());
@@ -422,6 +425,7 @@ TEST_CASE("router produces scheduled points at five-minute intervals") {
     request.options.routing_intervals = {
         {std::chrono::minutes{5}, std::nullopt},
     };
+    request.options.use_routing_intervals = true;
     request.options.arrival_radius_nautical_miles = 0.5;
     request.options.spatial_bucket_nautical_miles = 3.0;
     request.options.max_nodes_per_bucket = 3U;
