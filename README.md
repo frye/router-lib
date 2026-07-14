@@ -46,12 +46,21 @@ Enable the microbenchmarks with
   --polar boat.pol \
   --departure 2026-07-14T16:19:01Z \
   --json route.json \
-  --gpx route.gpx
+  --gpx route.gpx \
+  --isochrones-json isochrones.json \
+  --isochrones-gpx isochrones.gpx
 ```
 
 Omit `--polar` to use the approximate built-in 45-foot racer-cruiser polar.
 Omit `--json` to write JSON to stdout. Run `sailroute --help` for routing
-resolution controls.
+resolution controls. Isochrone output is optional and contains the retained
+post-pruning search frontier at each completed routing time step. The JSON
+output is a GeoJSON `FeatureCollection`; the GPX output contains one track per
+frontier.
+
+The router retains up to 10 nodes per spatial bucket by default. Increase
+`--max-nodes-per-bucket` to preserve a larger set of alternate paths, or reduce
+it when runtime and memory are more important than search breadth.
 
 The `samples/` directory contains an approximate First 44-class polar and
 offshore coordinates for a Race Rocks to Port Angeles demonstration:
@@ -63,7 +72,9 @@ offshore coordinates for a Race Rocks to Port Angeles demonstration:
   --destination 48.141100,-123.402687 \
   --polar samples/sample.pol \
   --json route.json \
-  --gpx route.gpx
+  --gpx route.gpx \
+  --isochrones-json isochrones.json \
+  --isochrones-gpx isochrones.gpx
 ```
 
 ## C++ API
@@ -77,11 +88,16 @@ sailroute::RouteRequest request{
     .start = {37.7749, -122.4194},
     .destination = {21.3069, -157.8583},
 };
+request.options.capture_isochrones = true;
 auto result = router.optimize(request);
+auto isochrones_json = sailroute::isochrones_to_json(result.value());
+auto isochrones_gpx = sailroute::isochrones_to_gpx(result.value());
 ```
 
 Loaded weather and polar objects are immutable and reusable across route
-requests, avoiding repeated GRIB decoding and polar preprocessing.
+requests, avoiding repeated GRIB decoding and polar preprocessing. Isochrone
+capture is disabled by default so route-only callers do not retain the full
+search frontier history.
 
 ## Polar formats
 

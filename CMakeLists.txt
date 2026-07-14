@@ -31,6 +31,7 @@ add_library(sailroute STATIC
     src/routing/router.cpp
     src/serialization/json.cpp
     src/serialization/gpx.cpp
+    src/serialization/isochrones.cpp
 )
 add_library(sailroute::sailroute ALIAS sailroute)
 
@@ -78,6 +79,9 @@ if(SAILROUTE_BUILD_TESTS)
         PRIVATE SAILROUTE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME sailroute_tests COMMAND sailroute_tests)
     add_test(NAME sailroute_cli_help COMMAND sailroute_cli --help)
+    set_tests_properties(
+        sailroute_cli_help
+        PROPERTIES PASS_REGULAR_EXPRESSION "--isochrones-json PATH")
 endif()
 
 if(SAILROUTE_BUILD_BENCHMARKS)

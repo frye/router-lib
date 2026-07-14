@@ -1,40 +1,21 @@
 #include "sailroute/serialization.hpp"
 
 #include "sailroute/time.hpp"
+#include "serialization/numeric_encoding.hpp"
 #include "serialization/text_encoding.hpp"
 
-#include <charconv>
 #include <cmath>
-#include <limits>
 #include <string>
 #include <string_view>
 
 namespace sailroute {
 namespace {
 
-bool append_number(std::string& output, double value) {
-    if (!std::isfinite(value)) {
-        return false;
-    }
-    char buffer[64]{};
-    const auto converted = std::to_chars(
-        std::begin(buffer),
-        std::end(buffer),
-        value,
-        std::chars_format::general,
-        std::numeric_limits<double>::max_digits10);
-    if (converted.ec != std::errc{}) {
-        return false;
-    }
-    output.append(buffer, converted.ptr);
-    return true;
-}
-
 void append_coordinate(std::string& output, Coordinate coordinate) {
     output.append("{\"latitude\":");
-    append_number(output, coordinate.latitude_degrees);
+    serialization_detail::append_number(output, coordinate.latitude_degrees);
     output.append(",\"longitude\":");
-    append_number(output, coordinate.longitude_degrees);
+    serialization_detail::append_number(output, coordinate.longitude_degrees);
     output.push_back('}');
 }
 
@@ -126,15 +107,19 @@ Result<std::string> route_to_json(const RouteResult& route) {
         output.append(",\"position\":");
         append_coordinate(output, point.position);
         output.append(",\"headingDegrees\":");
-        append_number(output, point.heading_degrees);
+        serialization_detail::append_number(output, point.heading_degrees);
         output.append(",\"boatSpeedKnots\":");
-        append_number(output, point.boat_speed_knots);
+        serialization_detail::append_number(output, point.boat_speed_knots);
         output.append(",\"trueWindSpeedKnots\":");
-        append_number(output, point.true_wind_speed_knots);
+        serialization_detail::append_number(output, point.true_wind_speed_knots);
         output.append(",\"trueWindDirectionDegrees\":");
-        append_number(output, point.true_wind_direction_degrees);
+        serialization_detail::append_number(
+            output,
+            point.true_wind_direction_degrees);
         output.append(",\"cumulativeDistanceNauticalMiles\":");
-        append_number(output, point.cumulative_distance_nautical_miles);
+        serialization_detail::append_number(
+            output,
+            point.cumulative_distance_nautical_miles);
         output.push_back('}');
     }
     if (!route.points.empty()) {

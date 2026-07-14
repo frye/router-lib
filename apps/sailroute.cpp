@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -25,6 +26,8 @@ struct CliOptions {
     std::optional<std::filesystem::path> polar_path;
     std::string json_path{"-"};
     std::optional<std::filesystem::path> gpx_path;
+    std::optional<std::filesystem::path> isochrones_json_path;
+    std::optional<std::filesystem::path> isochrones_gpx_path;
     sailroute::Coordinate start;
     sailroute::Coordinate destination;
     std::optional<sailroute::TimePoint> departure;
@@ -46,6 +49,8 @@ void print_help(std::ostream& output) {
         "  --polar PATH                        Vessel polar file (default: built-in)\n"
         "  --json PATH|-                       JSON output (default: stdout)\n"
         "  --gpx PATH                          Also write a GPX 1.1 track\n"
+        "  --isochrones-json PATH              Write retained frontiers as GeoJSON\n"
+        "  --isochrones-gpx PATH               Write retained frontiers as GPX 1.1\n"
         "\n"
         "Routing controls:\n"
         "  --time-step-minutes N               Routing time step (> 0)\n"
@@ -118,6 +123,8 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
     bool polar_seen = false;
     bool json_seen = false;
     bool gpx_seen = false;
+    bool isochrones_json_seen = false;
+    bool isochrones_gpx_seen = false;
     bool time_step_seen = false;
     bool heading_step_seen = false;
     bool arrival_radius_seen = false;
@@ -238,6 +245,34 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
                 return usage_error("--gpx requires a file path");
             }
             options.gpx_path = std::filesystem::path{value.value()};
+        } else if (argument == "--isochrones-json") {
+            if (const auto duplicate =
+                    reject_duplicate(isochrones_json_seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            if (value.value().empty() || value.value() == "-") {
+                return usage_error("--isochrones-json requires a file path");
+            }
+            options.isochrones_json_path =
+                std::filesystem::path{value.value()};
+        } else if (argument == "--isochrones-gpx") {
+            if (const auto duplicate =
+                    reject_duplicate(isochrones_gpx_seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            if (value.value().empty() || value.value() == "-") {
+                return usage_error("--isochrones-gpx requires a file path");
+            }
+            options.isochrones_gpx_path =
+                std::filesystem::path{value.value()};
         } else if (is_option(argument, "--time-step-minutes", "--time-step")) {
             if (const auto duplicate = reject_duplicate(time_step_seen, "--time-step-minutes")) {
                 return *duplicate;
@@ -386,17 +421,42 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
         }
         return usage_error("missing required option(s):" + missing);
     }
-    if (options.gpx_path && options.json_path != "-") {
-        std::error_code json_error;
-        std::error_code gpx_error;
-        const auto json_path = std::filesystem::absolute(
-                                   std::filesystem::path{options.json_path},
-                                   json_error)
-                                   .lexically_normal();
-        const auto gpx_path =
-            std::filesystem::absolute(*options.gpx_path, gpx_error).lexically_normal();
-        if (!json_error && !gpx_error && json_path == gpx_path) {
-            return usage_error("--json and --gpx must use different output paths");
+    std::vector<std::pair<std::string_view, std::filesystem::path>> outputs;
+    if (options.json_path != "-") {
+        outputs.emplace_back("--json", options.json_path);
+    }
+    if (options.gpx_path) {
+        outputs.emplace_back("--gpx", *options.gpx_path);
+    }
+    if (options.isochrones_json_path) {
+        outputs.emplace_back(
+            "--isochrones-json",
+            *options.isochrones_json_path);
+    }
+    if (options.isochrones_gpx_path) {
+        outputs.emplace_back(
+            "--isochrones-gpx",
+            *options.isochrones_gpx_path);
+    }
+    for (std::size_t left = 0U; left < outputs.size(); ++left) {
+        std::error_code left_error;
+        const auto left_path =
+            std::filesystem::absolute(outputs[left].second, left_error)
+                .lexically_normal();
+        if (left_error) {
+            continue;
+        }
+        for (std::size_t right = left + 1U; right < outputs.size(); ++right) {
+            std::error_code right_error;
+            const auto right_path =
+                std::filesystem::absolute(outputs[right].second, right_error)
+                    .lexically_normal();
+            if (!right_error && left_path == right_path) {
+                return usage_error(
+                    std::string{outputs[left].first} + " and " +
+                    std::string{outputs[right].first} +
+                    " must use different output paths");
+            }
         }
     }
     return options;
@@ -448,11 +508,15 @@ int run(const CliOptions& options) {
         polar = std::move(loaded_polar.value());
     }
 
+    sailroute::RoutingOptions routing = options.routing;
+    routing.capture_isochrones =
+        options.isochrones_json_path.has_value() ||
+        options.isochrones_gpx_path.has_value();
     sailroute::RouteRequest request{
         options.start,
         options.destination,
         options.departure,
-        options.routing};
+        routing};
     sailroute::Router router{std::move(weather.value()), std::move(polar)};
     auto route = router.optimize(request);
     if (!route) {
@@ -487,6 +551,28 @@ int run(const CliOptions& options) {
             return report_error("output", gpx.error(), exit_output);
         }
         auto written = write_file(*options.gpx_path, gpx.value());
+        if (!written) {
+            return report_error("output", written.error(), exit_output);
+        }
+    }
+    if (options.isochrones_json_path) {
+        auto json = sailroute::isochrones_to_json(route.value());
+        if (!json) {
+            return report_error("output", json.error(), exit_output);
+        }
+        auto written = write_file(
+            *options.isochrones_json_path,
+            json.value());
+        if (!written) {
+            return report_error("output", written.error(), exit_output);
+        }
+    }
+    if (options.isochrones_gpx_path) {
+        auto gpx = sailroute::isochrones_to_gpx(route.value());
+        if (!gpx) {
+            return report_error("output", gpx.error(), exit_output);
+        }
+        auto written = write_file(*options.isochrones_gpx_path, gpx.value());
         if (!written) {
             return report_error("output", written.error(), exit_output);
         }

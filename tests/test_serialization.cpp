@@ -36,6 +36,21 @@ sailroute::RouteResult sample_route() {
                 .cumulative_distance_nautical_miles = 7.5,
             },
         },
+        .isochrones = {
+            sailroute::Isochrone{
+                .time = departure + std::chrono::minutes{30},
+                .points = {
+                    {11.0, -20.0},
+                    {10.0, -21.0},
+                    {11.0, -21.0},
+                    {10.0, -20.0},
+                },
+            },
+            sailroute::Isochrone{
+                .time = departure + std::chrono::hours{1},
+                .points = {{12.0, -22.0}},
+            },
+        },
         .diagnostics = {
             .expanded_nodes = 10,
             .generated_candidates = 100,
@@ -69,6 +84,49 @@ TEST_CASE("GPX serialization escapes XML and emits timestamped track points") {
     REQUIRE(serialized.value().find("<time>") != std::string::npos);
 }
 
+TEST_CASE("isochrones serialize as timestamped GeoJSON lines") {
+    const auto serialized = sailroute::isochrones_to_json(sample_route());
+    REQUIRE(serialized.has_value());
+    REQUIRE(
+        serialized.value().find("\"type\":\"FeatureCollection\"") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"geometry\":{\"type\":\"LineString\"") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"retainedPointCount\":4") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find(
+            "[-21,10],[-20,10],[-20,11],[-21,11],[-21,10]") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find(
+            "[-22,12],[-22,12]") !=
+        std::string::npos);
+}
+
+TEST_CASE("isochrones serialize as separate timestamped GPX tracks") {
+    const auto serialized = sailroute::isochrones_to_gpx(sample_route());
+    REQUIRE(serialized.has_value());
+    REQUIRE(serialized.value().find("forecast &quot;A&quot; &amp; B") !=
+            std::string::npos);
+    REQUIRE(
+        serialized.value().find(
+            "<name>Sailroute isochrone 2023-11-14T22:43:20Z</name>") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find(
+            "<trkpt lat=\"12\" lon=\"-22\">") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find(
+            "<trkpt lat=\"12\" lon=\"-22\">",
+            serialized.value().find(
+                "<trkpt lat=\"12\" lon=\"-22\">") +
+                1U) != std::string::npos);
+}
+
 TEST_CASE("serialization rejects non-finite route values") {
     auto route = sample_route();
     route.points.front().boat_speed_knots = std::numeric_limits<double>::infinity();
@@ -81,4 +139,13 @@ TEST_CASE("serialization rejects non-finite route values") {
     const auto gpx = sailroute::route_to_gpx(route);
     REQUIRE(!gpx.has_value());
     REQUIRE(gpx.error().code == sailroute::ErrorCode::output_error);
+
+    route = sample_route();
+    route.isochrones.front().points.front().longitude_degrees =
+        std::numeric_limits<double>::quiet_NaN();
+    const auto isochrones_json = sailroute::isochrones_to_json(route);
+    REQUIRE(!isochrones_json.has_value());
+    REQUIRE(
+        isochrones_json.error().code ==
+        sailroute::ErrorCode::output_error);
 }

@@ -1,63 +1,15 @@
 #include "sailroute/serialization.hpp"
 
 #include "sailroute/time.hpp"
+#include "serialization/numeric_encoding.hpp"
 #include "serialization/text_encoding.hpp"
 
-#include <charconv>
 #include <cmath>
-#include <limits>
 #include <string>
 #include <string_view>
 
 namespace sailroute {
 namespace {
-
-bool append_number(std::string& output, double value) {
-    if (!std::isfinite(value)) {
-        return false;
-    }
-    char buffer[64]{};
-    const auto converted = std::to_chars(
-        std::begin(buffer),
-        std::end(buffer),
-        value,
-        std::chars_format::general,
-        std::numeric_limits<double>::max_digits10);
-    if (converted.ec != std::errc{}) {
-        return false;
-    }
-    output.append(buffer, converted.ptr);
-    return true;
-}
-
-bool append_coordinate_number(std::string& output, double value) {
-    if (!std::isfinite(value)) {
-        return false;
-    }
-    if (value == 0.0) {
-        output.push_back('0');
-        return true;
-    }
-    char buffer[64]{};
-    const auto converted = std::to_chars(
-        std::begin(buffer),
-        std::end(buffer),
-        value,
-        std::chars_format::fixed,
-        10);
-    if (converted.ec != std::errc{}) {
-        return false;
-    }
-    char* end = converted.ptr;
-    while (end > buffer && end[-1] == '0') {
-        --end;
-    }
-    if (end > buffer && end[-1] == '.') {
-        --end;
-    }
-    output.append(buffer, end);
-    return true;
-}
 
 Error invalid_numeric_value(std::string_view field) {
     return Error{
@@ -145,26 +97,34 @@ Result<std::string> route_to_gpx(const RouteResult& route) {
 
     for (const RoutePoint& point : route.points) {
         output.append("      <trkpt lat=\"");
-        append_coordinate_number(output, point.position.latitude_degrees);
+        serialization_detail::append_coordinate_number(
+            output,
+            point.position.latitude_degrees);
         output.append("\" lon=\"");
-        append_coordinate_number(output, point.position.longitude_degrees);
+        serialization_detail::append_coordinate_number(
+            output,
+            point.position.longitude_degrees);
         output.append("\">\n");
         append_element(output, "time", format_utc_time(point.time), "        ");
         output.append("        <extensions>\n");
         output.append("          <sailroute:headingDegrees>");
-        append_number(output, point.heading_degrees);
+        serialization_detail::append_number(output, point.heading_degrees);
         output.append("</sailroute:headingDegrees>\n");
         output.append("          <sailroute:boatSpeedKnots>");
-        append_number(output, point.boat_speed_knots);
+        serialization_detail::append_number(output, point.boat_speed_knots);
         output.append("</sailroute:boatSpeedKnots>\n");
         output.append("          <sailroute:trueWindSpeedKnots>");
-        append_number(output, point.true_wind_speed_knots);
+        serialization_detail::append_number(output, point.true_wind_speed_knots);
         output.append("</sailroute:trueWindSpeedKnots>\n");
         output.append("          <sailroute:trueWindDirectionDegrees>");
-        append_number(output, point.true_wind_direction_degrees);
+        serialization_detail::append_number(
+            output,
+            point.true_wind_direction_degrees);
         output.append("</sailroute:trueWindDirectionDegrees>\n");
         output.append("          <sailroute:cumulativeDistanceNauticalMiles>");
-        append_number(output, point.cumulative_distance_nautical_miles);
+        serialization_detail::append_number(
+            output,
+            point.cumulative_distance_nautical_miles);
         output.append("</sailroute:cumulativeDistanceNauticalMiles>\n");
         output.append("        </extensions>\n      </trkpt>\n");
     }
