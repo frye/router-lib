@@ -113,6 +113,7 @@ auto result = router.optimize(
     request,
     [&updates](const sailroute::RoutingProgress& progress) {
         updates.push_back(progress);
+        return sailroute::RoutingProgressDecision::continue_routing;
     });
 auto isochrones_json = sailroute::isochrones_to_json(result.value());
 auto isochrones_gpx = sailroute::isochrones_to_gpx(result.value());
@@ -137,9 +138,17 @@ Callbacks are synchronous, ordered by increasing isochrone time, and invoked on
 the thread that called `Router::optimize`, never on the candidate-expansion
 worker threads. The snapshot reference is valid only during the callback.
 Applications that update another thread, including a UI thread, must copy the
-snapshot into their own event queue and return promptly. The callback is
-notification-only and cannot cancel routing. Exceptions thrown by the callback
-propagate out of `optimize`.
+snapshot into their own event queue and return promptly.
+
+A callback can return `RoutingProgressDecision::continue_routing` or
+`RoutingProgressDecision::cancel`. Cancellation takes effect after the reported
+frontier is complete and before the next search step begins, so it does not
+interrupt candidate expansion already in progress. `optimize` then returns an
+error with `ErrorCode::cancelled`; the last provisional route and cumulative
+diagnostics remain available in the callback snapshot. Existing `void` callbacks
+and explicitly typed `RoutingProgressCallback` values remain supported as
+notification-only callbacks and always continue routing. Exceptions thrown by
+either callback form propagate out of `optimize`.
 
 Progress delivery does not require `capture_isochrones`; that option controls
 only whether isochrones are retained in the final `RouteResult`. Validation

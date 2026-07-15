@@ -137,11 +137,9 @@ private:
     std::filesystem::path path_;
 };
 
-sailroute::RouteResult route_with_workers(
-    const sailroute::Router& router,
+sailroute::RouteRequest routing_request(
     std::size_t worker_count,
-    bool capture_isochrones = true,
-    sailroute::RoutingProgressCallback on_progress = {}) {
+    bool capture_isochrones = true) {
     const auto departure = sailroute::parse_utc_time("2026-07-14T12:00:00Z");
     REQUIRE(departure.has_value());
 
@@ -158,7 +156,16 @@ sailroute::RouteResult route_with_workers(
     request.options.worker_count = worker_count;
     request.options.maximum_route_duration = std::chrono::hours{12};
     request.options.capture_isochrones = capture_isochrones;
+    return request;
+}
 
+sailroute::RouteResult route_with_workers(
+    const sailroute::Router& router,
+    std::size_t worker_count,
+    bool capture_isochrones = true,
+    sailroute::RoutingProgressCallback on_progress = {}) {
+    const sailroute::RouteRequest request =
+        routing_request(worker_count, capture_isochrones);
     auto result = router.optimize(request, on_progress);
     if (!result.has_value()) {
         throw std::runtime_error(result.error().message);
@@ -547,6 +554,56 @@ TEST_CASE("progress callbacks stream deterministic provisional routes and isochr
 
     require_same_route(single, parallel);
     require_same_progress(single_progress, parallel_progress);
+}
+
+TEST_CASE("progress callbacks can cancel before the second routing step") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+
+    std::size_t update_count = 0U;
+    const auto result = router.optimize(
+        routing_request(1U, false),
+        [&update_count](const sailroute::RoutingProgress& progress) {
+            ++update_count;
+            REQUIRE(progress.diagnostics.time_steps == 1U);
+            return sailroute::RoutingProgressDecision::cancel;
+        });
+
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == sailroute::ErrorCode::cancelled);
+    REQUIRE(sailroute::to_string(result.error().code) == "cancelled");
+    REQUIRE(
+        result.error().message ==
+        "routing cancelled after 1 time step and 1 expanded node");
+    REQUIRE(update_count == 1U);
+}
+
+TEST_CASE("progress callbacks can cancel multi-worker routing after multiple updates") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+
+    std::vector<std::size_t> callback_steps;
+    const sailroute::RoutingControlCallback cancel_after_three_updates =
+        [&callback_steps](const sailroute::RoutingProgress& progress) {
+            callback_steps.push_back(progress.diagnostics.time_steps);
+            return callback_steps.size() == 3U
+                ? sailroute::RoutingProgressDecision::cancel
+                : sailroute::RoutingProgressDecision::continue_routing;
+        };
+    const auto result = router.optimize(
+        routing_request(4U, false),
+        cancel_after_three_updates);
+
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == sailroute::ErrorCode::cancelled);
+    REQUIRE(callback_steps.size() == 3U);
+    REQUIRE(callback_steps[0] == 1U);
+    REQUIRE(callback_steps[1] == 2U);
+    REQUIRE(callback_steps[2] == 3U);
 }
 
 TEST_CASE("router produces scheduled points at five-minute intervals") {
