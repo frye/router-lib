@@ -20,6 +20,7 @@ enum class ErrorCode {
     no_route,
     forecast_exhausted,
     output_error,
+    cancelled,
 };
 
 struct Error {

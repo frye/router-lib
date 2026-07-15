@@ -675,18 +675,40 @@ Error exhausted_error(
         "maximum route duration ended before the destination was reached" + suffix};
 }
 
+Error cancelled_error(const RouteDiagnostics& diagnostics) {
+    return Error{
+        ErrorCode::cancelled,
+        "routing cancelled after " + std::to_string(diagnostics.time_steps) +
+            " time steps and " + std::to_string(diagnostics.expanded_nodes) +
+            " expanded nodes"};
+}
+
 }  // namespace
 
 Router::Router(WeatherDataset weather, VesselPolar polar)
     : weather_(std::move(weather)), polar_(std::move(polar)) {}
 
 Result<RouteResult> Router::optimize(const RouteRequest& request) const {
-    return optimize(request, RoutingProgressCallback{});
+    return optimize_controlled(request, RoutingControlCallback{});
 }
 
 Result<RouteResult> Router::optimize(
     const RouteRequest& request,
     const RoutingProgressCallback& on_progress) const {
+    if (!on_progress) {
+        return optimize_controlled(request, RoutingControlCallback{});
+    }
+    return optimize_controlled(
+        request,
+        [&on_progress](const RoutingProgress& progress) {
+            on_progress(progress);
+            return RoutingProgressDecision::continue_routing;
+        });
+}
+
+Result<RouteResult> Router::optimize_controlled(
+    const RouteRequest& request,
+    const RoutingControlCallback& on_progress) const {
     if (const std::optional<Error> validation = validate_request(request);
         validation.has_value()) {
         return *validation;
@@ -913,7 +935,10 @@ Result<RouteResult> Router::optimize(
                 capture_isochrone(nodes, frontier),
                 reconstruct_route(nodes, provisional_route_end),
                 diagnostics};
-            on_progress(progress);
+            const RoutingProgressDecision decision = on_progress(progress);
+            if (decision == RoutingProgressDecision::cancel) {
+                return cancelled_error(diagnostics);
+            }
             if (request.options.capture_isochrones) {
                 isochrones.push_back(std::move(progress.isochrone));
             }
