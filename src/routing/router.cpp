@@ -681,6 +681,12 @@ Router::Router(WeatherDataset weather, VesselPolar polar)
     : weather_(std::move(weather)), polar_(std::move(polar)) {}
 
 Result<RouteResult> Router::optimize(const RouteRequest& request) const {
+    return optimize(request, RoutingProgressCallback{});
+}
+
+Result<RouteResult> Router::optimize(
+    const RouteRequest& request,
+    const RoutingProgressCallback& on_progress) const {
     if (const std::optional<Error> validation = validate_request(request);
         validation.has_value()) {
         return *validation;
@@ -889,14 +895,29 @@ Result<RouteResult> Router::optimize(const RouteRequest& request) const {
         next_frontier.clear();
         next_frontier.reserve(retained.size());
         nodes.reserve(nodes.size() + retained.size());
+        NodeIndex provisional_route_end = no_parent;
+        double provisional_distance = std::numeric_limits<double>::infinity();
         for (const std::size_t candidate_index : retained) {
             Candidate& candidate = candidates[candidate_index];
             nodes.push_back(SearchNode{std::move(candidate.point), candidate.parent});
             next_frontier.push_back(nodes.size() - 1U);
+            if (candidate.distance_to_destination < provisional_distance) {
+                provisional_distance = candidate.distance_to_destination;
+                provisional_route_end = nodes.size() - 1U;
+            }
         }
         diagnostics.retained_candidates += retained.size();
         frontier.swap(next_frontier);
-        if (request.options.capture_isochrones) {
+        if (on_progress) {
+            RoutingProgress progress{
+                capture_isochrone(nodes, frontier),
+                reconstruct_route(nodes, provisional_route_end),
+                diagnostics};
+            on_progress(progress);
+            if (request.options.capture_isochrones) {
+                isochrones.push_back(std::move(progress.isochrone));
+            }
+        } else if (request.options.capture_isochrones) {
             isochrones.push_back(capture_isochrone(nodes, frontier));
         }
     }

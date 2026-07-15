@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -138,7 +139,9 @@ private:
 
 sailroute::RouteResult route_with_workers(
     const sailroute::Router& router,
-    std::size_t worker_count) {
+    std::size_t worker_count,
+    bool capture_isochrones = true,
+    sailroute::RoutingProgressCallback on_progress = {}) {
     const auto departure = sailroute::parse_utc_time("2026-07-14T12:00:00Z");
     REQUIRE(departure.has_value());
 
@@ -154,9 +157,9 @@ sailroute::RouteResult route_with_workers(
     request.options.max_nodes_per_bucket = 3;
     request.options.worker_count = worker_count;
     request.options.maximum_route_duration = std::chrono::hours{12};
-    request.options.capture_isochrones = true;
+    request.options.capture_isochrones = capture_isochrones;
 
-    auto result = router.optimize(request);
+    auto result = router.optimize(request, on_progress);
     if (!result.has_value()) {
         throw std::runtime_error(result.error().message);
     }
@@ -218,6 +221,73 @@ void require_same_route(
                 left_isochrone.points[point_index].longitude_degrees ==
                 right_isochrone.points[point_index].longitude_degrees);
         }
+    }
+}
+
+void require_same_progress(
+    const std::vector<sailroute::RoutingProgress>& left,
+    const std::vector<sailroute::RoutingProgress>& right) {
+    REQUIRE(left.size() == right.size());
+    for (std::size_t index = 0U; index < left.size(); ++index) {
+        const sailroute::RoutingProgress& left_progress = left[index];
+        const sailroute::RoutingProgress& right_progress = right[index];
+        REQUIRE(left_progress.isochrone.time == right_progress.isochrone.time);
+        REQUIRE(
+            left_progress.isochrone.points.size() ==
+            right_progress.isochrone.points.size());
+        for (std::size_t point_index = 0U;
+             point_index < left_progress.isochrone.points.size();
+             ++point_index) {
+            REQUIRE(
+                left_progress.isochrone.points[point_index].latitude_degrees ==
+                right_progress.isochrone.points[point_index].latitude_degrees);
+            REQUIRE(
+                left_progress.isochrone.points[point_index].longitude_degrees ==
+                right_progress.isochrone.points[point_index].longitude_degrees);
+        }
+
+        REQUIRE(
+            left_progress.provisional_route.size() ==
+            right_progress.provisional_route.size());
+        for (std::size_t point_index = 0U;
+             point_index < left_progress.provisional_route.size();
+             ++point_index) {
+            const sailroute::RoutePoint& left_point =
+                left_progress.provisional_route[point_index];
+            const sailroute::RoutePoint& right_point =
+                right_progress.provisional_route[point_index];
+            REQUIRE(
+                left_point.position.latitude_degrees ==
+                right_point.position.latitude_degrees);
+            REQUIRE(
+                left_point.position.longitude_degrees ==
+                right_point.position.longitude_degrees);
+            REQUIRE(left_point.time == right_point.time);
+            REQUIRE(left_point.heading_degrees == right_point.heading_degrees);
+            REQUIRE(left_point.boat_speed_knots == right_point.boat_speed_knots);
+            REQUIRE(
+                left_point.true_wind_speed_knots ==
+                right_point.true_wind_speed_knots);
+            REQUIRE(
+                left_point.true_wind_direction_degrees ==
+                right_point.true_wind_direction_degrees);
+            REQUIRE(
+                left_point.cumulative_distance_nautical_miles ==
+                right_point.cumulative_distance_nautical_miles);
+        }
+
+        REQUIRE(
+            left_progress.diagnostics.expanded_nodes ==
+            right_progress.diagnostics.expanded_nodes);
+        REQUIRE(
+            left_progress.diagnostics.generated_candidates ==
+            right_progress.diagnostics.generated_candidates);
+        REQUIRE(
+            left_progress.diagnostics.retained_candidates ==
+            right_progress.diagnostics.retained_candidates);
+        REQUIRE(
+            left_progress.diagnostics.time_steps ==
+            right_progress.diagnostics.time_steps);
     }
 }
 
@@ -408,6 +478,75 @@ TEST_CASE("parallel candidate expansion is deterministic") {
     require_same_route(single, parallel);
     require_same_route(parallel, repeated);
     require_same_route(single, automatic);
+}
+
+TEST_CASE("progress callbacks stream deterministic provisional routes and isochrones") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+
+    std::vector<sailroute::RoutingProgress> single_progress;
+    const sailroute::RouteResult single = route_with_workers(
+        router,
+        1U,
+        false,
+        [&single_progress](const sailroute::RoutingProgress& progress) {
+            single_progress.push_back(progress);
+        });
+    std::vector<sailroute::RoutingProgress> parallel_progress;
+    const sailroute::RouteResult parallel = route_with_workers(
+        router,
+        4U,
+        false,
+        [&parallel_progress](const sailroute::RoutingProgress& progress) {
+            parallel_progress.push_back(progress);
+        });
+
+    REQUIRE(single.isochrones.empty());
+    REQUIRE(parallel.isochrones.empty());
+    REQUIRE(!single_progress.empty());
+    REQUIRE(single_progress.size() + 1U == single.diagnostics.time_steps);
+
+    sailroute::TimePoint previous_time{};
+    for (std::size_t index = 0U; index < single_progress.size(); ++index) {
+        const sailroute::RoutingProgress& progress = single_progress[index];
+        REQUIRE(progress.diagnostics.time_steps == index + 1U);
+        REQUIRE(!progress.isochrone.points.empty());
+        REQUIRE(!progress.provisional_route.empty());
+        REQUIRE(previous_time == sailroute::TimePoint{} ||
+                progress.isochrone.time > previous_time);
+        previous_time = progress.isochrone.time;
+
+        const sailroute::RoutePoint& route_start =
+            progress.provisional_route.front();
+        const sailroute::RoutePoint& route_end =
+            progress.provisional_route.back();
+        REQUIRE(route_start.position.latitude_degrees == 1.0);
+        REQUIRE(route_start.position.longitude_degrees == 0.5);
+        REQUIRE(route_end.time == progress.isochrone.time);
+
+        sailroute::Coordinate closest = progress.isochrone.points.front();
+        double closest_distance =
+            sailroute::detail::great_circle_distance_nautical_miles(
+                closest,
+                {1.0, 1.0});
+        for (const sailroute::Coordinate point : progress.isochrone.points) {
+            const double distance =
+                sailroute::detail::great_circle_distance_nautical_miles(
+                    point,
+                    {1.0, 1.0});
+            if (distance < closest_distance) {
+                closest = point;
+                closest_distance = distance;
+            }
+        }
+        REQUIRE(route_end.position.latitude_degrees == closest.latitude_degrees);
+        REQUIRE(route_end.position.longitude_degrees == closest.longitude_degrees);
+    }
+
+    require_same_route(single, parallel);
+    require_same_progress(single_progress, parallel_progress);
 }
 
 TEST_CASE("router produces scheduled points at five-minute intervals") {

@@ -82,6 +82,12 @@ struct Isochrone {
     std::vector<Coordinate> points;
 };
 
+struct RoutingProgress {
+    Isochrone isochrone;
+    std::vector<RoutePoint> provisional_route;
+    RouteDiagnostics diagnostics;
+};
+
 struct RouteResult {
     TimePoint departure_time;
     TimePoint arrival_time;
