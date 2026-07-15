@@ -574,6 +574,9 @@ TEST_CASE("progress callbacks can cancel before the second routing step") {
     REQUIRE(!result.has_value());
     REQUIRE(result.error().code == sailroute::ErrorCode::cancelled);
     REQUIRE(sailroute::to_string(result.error().code) == "cancelled");
+    REQUIRE(
+        result.error().message ==
+        "routing cancelled after 1 time step and 1 expanded node");
     REQUIRE(update_count == 1U);
 }
 

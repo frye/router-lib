@@ -34,7 +34,8 @@ public:
     template <typename Callback>
         requires std::same_as<
             std::invoke_result_t<Callback&, const RoutingProgress&>,
-            RoutingProgressDecision>
+            RoutingProgressDecision> &&
+            std::constructible_from<RoutingControlCallback, Callback&&>
     [[nodiscard]] Result<RouteResult> optimize(
         const RouteRequest& request,
         Callback&& on_progress) const {

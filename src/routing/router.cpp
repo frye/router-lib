@@ -679,8 +679,11 @@ Error cancelled_error(const RouteDiagnostics& diagnostics) {
     return Error{
         ErrorCode::cancelled,
         "routing cancelled after " + std::to_string(diagnostics.time_steps) +
-            " time steps and " + std::to_string(diagnostics.expanded_nodes) +
-            " expanded nodes"};
+            (diagnostics.time_steps == 1U ? " time step and " : " time steps and ") +
+            std::to_string(diagnostics.expanded_nodes) +
+            (diagnostics.expanded_nodes == 1U
+                 ? " expanded node"
+                 : " expanded nodes")};
 }
 
 }  // namespace
