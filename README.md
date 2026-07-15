@@ -108,7 +108,12 @@ request.options.routing_intervals = {
     {std::chrono::hours{2}, std::nullopt},
 };
 request.options.capture_isochrones = true;
-auto result = router.optimize(request);
+std::vector<sailroute::RoutingProgress> updates;
+auto result = router.optimize(
+    request,
+    [&updates](const sailroute::RoutingProgress& progress) {
+        updates.push_back(progress);
+    });
 auto isochrones_json = sailroute::isochrones_to_json(result.value());
 auto isochrones_gpx = sailroute::isochrones_to_gpx(result.value());
 ```
@@ -117,6 +122,31 @@ Loaded weather and polar objects are immutable and reusable across route
 requests, avoiding repeated GRIB decoding and polar preprocessing. Isochrone
 capture is disabled by default so route-only callers do not retain the full
 search frontier history.
+
+### Progress callback contract
+
+The optional callback receives one `RoutingProgress` snapshot after each
+completed search step that produces a retained frontier. Each snapshot contains:
+
+- `isochrone`: the retained frontier for that step;
+- `provisional_route`: the route from the departure to the first retained node
+  with the shortest great-circle distance to the destination; and
+- `diagnostics`: cumulative work through that step.
+
+Callbacks are synchronous, ordered by increasing isochrone time, and invoked on
+the thread that called `Router::optimize`, never on the candidate-expansion
+worker threads. The snapshot reference is valid only during the callback.
+Applications that update another thread, including a UI thread, must copy the
+snapshot into their own event queue and return promptly. The callback is
+notification-only and cannot cancel routing. Exceptions thrown by the callback
+propagate out of `optimize`.
+
+Progress delivery does not require `capture_isochrones`; that option controls
+only whether isochrones are retained in the final `RouteResult`. Validation
+failures and requests already within the arrival radius produce no progress
+updates. The callback reports intermediate frontiers only: the consuming
+application must still inspect the `Result<RouteResult>` returned by `optimize`
+for the final route or routing error.
 
 ## Polar formats
 
