@@ -27,6 +27,7 @@ add_library(sailroute STATIC
     src/time.cpp
     src/weather/weather_dataset.cpp
     src/polar/vessel_polar.cpp
+    src/routing/contours.cpp
     src/routing/geodesy.cpp
     src/routing/intervals.cpp
     src/routing/router.cpp
@@ -68,6 +69,7 @@ if(SAILROUTE_BUILD_TESTS)
     enable_testing()
     add_executable(sailroute_tests
         tests/test_main.cpp
+        tests/test_contours.cpp
         tests/test_polar.cpp
         tests/test_routing.cpp
         tests/test_serialization.cpp

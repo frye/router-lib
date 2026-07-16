@@ -56,8 +56,9 @@ Omit `--polar` to use the approximate built-in 45-foot racer-cruiser polar.
 Omit `--json` to write JSON to stdout. Run `sailroute --help` for routing
 resolution controls. Isochrone output is optional and contains the retained
 post-pruning search frontier at each completed routing time step. The JSON
-output is a GeoJSON `FeatureCollection`; the GPX output contains one track per
-frontier.
+output is a GeoJSON `FeatureCollection` of `LineString` or `MultiLineString`
+contours; the GPX output contains one track per frontier and one track segment
+per contour component.
 
 The router retains up to 10 nodes per spatial bucket by default. Increase
 `--max-nodes-per-bucket` to preserve a larger set of alternate paths, or reduce
@@ -156,6 +157,43 @@ failures and requests already within the arrival radius produce no progress
 updates. The callback reports intermediate frontiers only: the consuming
 application must still inspect the `Result<RouteResult>` returned by `optimize`
 for the final route or routing error.
+
+For allocation-sensitive consumers, `Router::optimize_view` exposes the same
+notification and cancellation forms with callback-scoped spans:
+
+```cpp
+request.options.progress.every_n_steps = 2;
+request.options.progress.payload =
+    sailroute::RoutingProgressPayload::retained_points |
+    sailroute::RoutingProgressPayload::display_contours;
+
+auto result = router.optimize_view(
+    request,
+    [](const sailroute::RoutingProgressView& progress) {
+        render_frontier(
+            progress.display_contours.points,
+            progress.display_contours.segments);
+        return sailroute::RoutingProgressDecision::continue_routing;
+    });
+```
+
+The library reuses backing buffers between view callbacks. Every span in a
+`RoutingProgressView` is valid only until that synchronous callback returns;
+copy required data before retaining it or sending it to another thread.
+Callbacks remain ordered, run on the thread that called `optimize_view`, and
+default to every retained step. `every_n_steps` throttles callback delivery
+only: `capture_isochrones` still records every frontier. Payload flags select
+raw retained points, the provisional route, and display contours; unrequested
+payloads have empty spans and are not constructed.
+
+`build_display_contours` is also available independently. It projects points
+around a circular-mean meridian, constructs a deterministic Delaunay
+alpha-shape boundary, preserves disconnected components and open degenerate
+chains, and splits antimeridian crossings instead of drawing wraparound
+chords. Callers can supply `alpha_nautical_miles`; otherwise a deterministic
+scale is derived from the frontier. A `DisplayContourSegment` references a
+range in the flattened point array and marks whether that range closes back to
+its first point.
 
 ## Polar formats
 

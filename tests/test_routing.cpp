@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -354,6 +355,16 @@ TEST_CASE("routing defaults retain a wider configurable frontier") {
         options.routing_intervals[2U].interval ==
         std::chrono::minutes{180});
     REQUIRE(!options.routing_intervals[2U].until_elapsed.has_value());
+    REQUIRE(options.progress.every_n_steps == 1U);
+    REQUIRE(sailroute::has_payload(
+        options.progress.payload,
+        sailroute::RoutingProgressPayload::retained_points));
+    REQUIRE(sailroute::has_payload(
+        options.progress.payload,
+        sailroute::RoutingProgressPayload::provisional_route));
+    REQUIRE(!sailroute::has_payload(
+        options.progress.payload,
+        sailroute::RoutingProgressPayload::display_contours));
 }
 
 TEST_CASE("routing interval schedules select and clamp elapsed-time tiers") {
@@ -604,6 +615,133 @@ TEST_CASE("progress callbacks can cancel multi-worker routing after multiple upd
     REQUIRE(callback_steps[0] == 1U);
     REQUIRE(callback_steps[1] == 2U);
     REQUIRE(callback_steps[2] == 3U);
+}
+
+TEST_CASE("progress views select payloads without changing routing") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    sailroute::RouteRequest request = routing_request(1U, false);
+    request.options.progress.payload =
+        sailroute::RoutingProgressPayload::display_contours;
+
+    std::size_t update_count = 0U;
+    const auto result = router.optimize_view(
+        request,
+        [&update_count](const sailroute::RoutingProgressView& progress) {
+            ++update_count;
+            REQUIRE(progress.retained_points.empty());
+            REQUIRE(progress.provisional_route.empty());
+            REQUIRE(!progress.display_contours.points.empty());
+            REQUIRE(!progress.display_contours.segments.empty());
+            REQUIRE(progress.time != sailroute::TimePoint{});
+        });
+    REQUIRE(result.has_value());
+    REQUIRE(update_count + 1U == result.value().diagnostics.time_steps);
+}
+
+TEST_CASE("progress view cadence throttles callbacks but not isochrone capture") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    sailroute::RouteRequest request = routing_request(1U, true);
+    request.options.progress.every_n_steps = 2U;
+    request.options.progress.payload =
+        sailroute::RoutingProgressPayload::none;
+
+    std::vector<std::size_t> delivered_steps;
+    const auto result = router.optimize_view(
+        request,
+        [&delivered_steps](const sailroute::RoutingProgressView& progress) {
+            REQUIRE(progress.retained_points.empty());
+            REQUIRE(progress.provisional_route.empty());
+            REQUIRE(progress.display_contours.points.empty());
+            REQUIRE(progress.display_contours.segments.empty());
+            delivered_steps.push_back(progress.diagnostics.time_steps);
+        });
+    REQUIRE(result.has_value());
+    REQUIRE(!delivered_steps.empty());
+    for (const std::size_t step : delivered_steps) {
+        REQUIRE(step % 2U == 0U);
+    }
+    REQUIRE(
+        result.value().isochrones.size() + 1U ==
+        result.value().diagnostics.time_steps);
+    REQUIRE(
+        delivered_steps.size() ==
+        (result.value().diagnostics.time_steps - 1U) / 2U);
+}
+
+TEST_CASE("progress views preserve callback-scoped data through explicit copies") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    sailroute::RouteRequest request = routing_request(4U, false);
+
+    std::vector<sailroute::RoutingProgress> copied;
+    const std::thread::id caller_thread = std::this_thread::get_id();
+    const auto result = router.optimize_view(
+        request,
+        [&copied, caller_thread](
+            const sailroute::RoutingProgressView& progress) {
+            REQUIRE(std::this_thread::get_id() == caller_thread);
+            copied.push_back(sailroute::RoutingProgress{
+                sailroute::Isochrone{
+                    progress.time,
+                    std::vector<sailroute::Coordinate>{
+                        progress.retained_points.begin(),
+                        progress.retained_points.end()}},
+                std::vector<sailroute::RoutePoint>{
+                    progress.provisional_route.begin(),
+                    progress.provisional_route.end()},
+                progress.diagnostics});
+        });
+    REQUIRE(result.has_value());
+    REQUIRE(!copied.empty());
+    REQUIRE(copied.back().diagnostics.time_steps == copied.size());
+    REQUIRE(!copied.back().isochrone.points.empty());
+    REQUIRE(!copied.back().provisional_route.empty());
+}
+
+TEST_CASE("progress view callbacks use the existing cancellation decision") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+
+    const auto result = router.optimize_view(
+        routing_request(1U, false),
+        [](const sailroute::RoutingProgressView& progress) {
+            REQUIRE(progress.diagnostics.time_steps == 1U);
+            return sailroute::RoutingProgressDecision::cancel;
+        });
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == sailroute::ErrorCode::cancelled);
+}
+
+TEST_CASE("progress options reject zero cadence and invalid contour alpha") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    sailroute::RouteRequest request = routing_request(1U, false);
+    request.options.progress.every_n_steps = 0U;
+    auto result = router.optimize_view(
+        request,
+        sailroute::RoutingProgressViewCallback{});
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
+
+    request.options.progress.every_n_steps = 1U;
+    request.options.progress.display_contours.alpha_nautical_miles = -1.0;
+    result = router.optimize_view(
+        request,
+        sailroute::RoutingProgressViewCallback{});
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
 }
 
 TEST_CASE("router produces scheduled points at five-minute intervals") {
