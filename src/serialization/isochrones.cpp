@@ -1,12 +1,11 @@
+#include "sailroute/contours.hpp"
 #include "sailroute/serialization.hpp"
 
 #include "sailroute/time.hpp"
 #include "serialization/numeric_encoding.hpp"
 #include "serialization/text_encoding.hpp"
 
-#include <algorithm>
-#include <cmath>
-#include <numbers>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -34,60 +33,43 @@ Result<std::string> validate_isochrones(const RouteResult& route) {
     return std::string{};
 }
 
-double normalized_longitude_delta(double longitude, double origin) noexcept {
-    return std::fmod(longitude - origin + 540.0, 360.0) - 180.0;
-}
-
-std::vector<Coordinate> ordered_closed_points(const Isochrone& isochrone) {
-    double latitude_center = 0.0;
-    double longitude_sine = 0.0;
-    double longitude_cosine = 0.0;
-    for (const Coordinate point : isochrone.points) {
-        latitude_center += point.latitude_degrees;
-        const double longitude_radians =
-            point.longitude_degrees * std::numbers::pi / 180.0;
-        longitude_sine += std::sin(longitude_radians);
-        longitude_cosine += std::cos(longitude_radians);
-    }
-    latitude_center /= static_cast<double>(isochrone.points.size());
-
-    double longitude_center = isochrone.points.front().longitude_degrees;
-    if (std::abs(longitude_sine) > 1.0e-12 ||
-        std::abs(longitude_cosine) > 1.0e-12) {
-        longitude_center =
-            std::atan2(longitude_sine, longitude_cosine) * 180.0 /
-            std::numbers::pi;
-    }
-    const double longitude_scale =
-        std::cos(latitude_center * std::numbers::pi / 180.0);
-    const auto angle_from_center =
-        [latitude_center, longitude_center, longitude_scale](Coordinate point) {
-            const double east =
-                normalized_longitude_delta(
-                    point.longitude_degrees,
-                    longitude_center) *
-                longitude_scale;
-            const double north = point.latitude_degrees - latitude_center;
-            return std::atan2(north, east);
-        };
-
-    std::vector<Coordinate> ordered = isochrone.points;
-    std::stable_sort(
-        ordered.begin(),
-        ordered.end(),
-        [&angle_from_center](Coordinate left, Coordinate right) {
-            return angle_from_center(left) < angle_from_center(right);
-        });
-    ordered.push_back(ordered.front());
-    return ordered;
-}
-
 void append_geojson_coordinate(std::string& output, Coordinate coordinate) {
     output.push_back('[');
     serialization_detail::append_number(output, coordinate.longitude_degrees);
     output.push_back(',');
     serialization_detail::append_number(output, coordinate.latitude_degrees);
     output.push_back(']');
+}
+
+void append_geojson_segment(
+    std::string& output,
+    std::span<const Coordinate> points,
+    bool closed) {
+    output.push_back('[');
+    for (std::size_t index = 0U; index < points.size(); ++index) {
+        if (index != 0U) {
+            output.push_back(',');
+        }
+        append_geojson_coordinate(output, points[index]);
+    }
+    if (closed && !points.empty()) {
+        if (!points.empty()) {
+            output.push_back(',');
+        }
+        append_geojson_coordinate(output, points.front());
+    } else if (points.size() == 1U) {
+        output.push_back(',');
+        append_geojson_coordinate(output, points.front());
+    }
+    output.push_back(']');
+}
+
+std::span<const Coordinate> segment_points(
+    const DisplayContours& contours,
+    const DisplayContourSegment& segment) {
+    return std::span<const Coordinate>{contours.points}.subspan(
+        segment.point_offset,
+        segment.point_count);
 }
 
 void append_gpx_element(
@@ -118,8 +100,11 @@ Result<std::string> isochrones_to_json(const RouteResult& route) {
     output.append("{\n  \"type\":\"FeatureCollection\",\n  \"features\":[");
     for (std::size_t index = 0U; index < route.isochrones.size(); ++index) {
         const Isochrone& isochrone = route.isochrones[index];
-        const std::vector<Coordinate> ordered =
-            ordered_closed_points(isochrone);
+        auto contours_result = build_display_contours(isochrone.points);
+        if (!contours_result) {
+            return invalid_isochrone(contours_result.error().message);
+        }
+        const DisplayContours& contours = contours_result.value();
         if (index != 0U) {
             output.push_back(',');
         }
@@ -129,14 +114,41 @@ Result<std::string> isochrones_to_json(const RouteResult& route) {
             format_utc_time(isochrone.time));
         output.append(",\"retainedPointCount\":");
         output.append(std::to_string(isochrone.points.size()));
-        output.append(
-            "},\"geometry\":{\"type\":\"LineString\",\"coordinates\":[");
-        for (std::size_t point_index = 0U; point_index < ordered.size();
-             ++point_index) {
-            if (point_index != 0U) {
+        output.append("},\"geometry\":{\"type\":");
+        const bool multiple = contours.segments.size() != 1U;
+        output.append(multiple ? "\"MultiLineString\"" : "\"LineString\"");
+        output.append(",\"coordinates\":[");
+        for (std::size_t segment_index = 0U;
+             segment_index < contours.segments.size();
+             ++segment_index) {
+            if (segment_index != 0U) {
                 output.push_back(',');
             }
-            append_geojson_coordinate(output, ordered[point_index]);
+            const DisplayContourSegment& segment =
+                contours.segments[segment_index];
+            if (multiple) {
+                append_geojson_segment(
+                    output,
+                    segment_points(contours, segment),
+                    segment.closed);
+            } else {
+                const auto points = segment_points(contours, segment);
+                for (std::size_t point_index = 0U;
+                     point_index < points.size();
+                     ++point_index) {
+                    if (point_index != 0U) {
+                        output.push_back(',');
+                    }
+                    append_geojson_coordinate(output, points[point_index]);
+                }
+                if (segment.closed && !points.empty()) {
+                    output.push_back(',');
+                    append_geojson_coordinate(output, points.front());
+                } else if (points.size() == 1U) {
+                    output.push_back(',');
+                    append_geojson_coordinate(output, points.front());
+                }
+            }
         }
         output.append("]}}");
     }
@@ -179,8 +191,11 @@ Result<std::string> isochrones_to_gpx(const RouteResult& route) {
 
     for (const Isochrone& isochrone : route.isochrones) {
         const std::string formatted_time = format_utc_time(isochrone.time);
-        const std::vector<Coordinate> ordered =
-            ordered_closed_points(isochrone);
+        auto contours_result = build_display_contours(isochrone.points);
+        if (!contours_result) {
+            return invalid_isochrone(contours_result.error().message);
+        }
+        const DisplayContours& contours = contours_result.value();
         output.append("  <trk>\n");
         append_gpx_element(
             output,
@@ -189,21 +204,40 @@ Result<std::string> isochrones_to_gpx(const RouteResult& route) {
             "    ");
         output.append("    <desc>Retained frontier with ");
         output.append(std::to_string(isochrone.points.size()));
-        output.append(" points</desc>\n    <trkseg>\n");
-        for (const Coordinate point : ordered) {
-            output.append("      <trkpt lat=\"");
-            serialization_detail::append_coordinate_number(
-                output,
-                point.latitude_degrees);
-            output.append("\" lon=\"");
-            serialization_detail::append_coordinate_number(
-                output,
-                point.longitude_degrees);
-            output.append("\">\n");
-            append_gpx_element(output, "time", formatted_time, "        ");
-            output.append("      </trkpt>\n");
+        output.append(" points</desc>\n");
+        for (const DisplayContourSegment& segment : contours.segments) {
+            output.append("    <trkseg>\n");
+            const auto points = segment_points(contours, segment);
+            const std::size_t serialized_count =
+                points.size() +
+                ((segment.closed && !points.empty()) ||
+                         points.size() == 1U
+                     ? 1U
+                     : 0U);
+            for (std::size_t point_index = 0U;
+                 point_index < serialized_count;
+                 ++point_index) {
+                const Coordinate point =
+                    points[point_index % points.size()];
+                output.append("      <trkpt lat=\"");
+                serialization_detail::append_coordinate_number(
+                    output,
+                    point.latitude_degrees);
+                output.append("\" lon=\"");
+                serialization_detail::append_coordinate_number(
+                    output,
+                    point.longitude_degrees);
+                output.append("\">\n");
+                append_gpx_element(
+                    output,
+                    "time",
+                    formatted_time,
+                    "        ");
+                output.append("      </trkpt>\n");
+            }
+            output.append("    </trkseg>\n");
         }
-        output.append("    </trkseg>\n  </trk>\n");
+        output.append("  </trk>\n");
     }
     output.append("</gpx>\n");
     return output;

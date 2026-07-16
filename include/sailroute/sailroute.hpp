@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sailroute/contours.hpp"
 #include "sailroute/error.hpp"
 #include "sailroute/polar.hpp"
 #include "sailroute/router.hpp"

@@ -2,7 +2,9 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -29,6 +31,69 @@ struct RoutingInterval {
     std::optional<std::chrono::minutes> until_elapsed;
 };
 
+struct DisplayContourOptions {
+    // When omitted, the builder derives a deterministic scale from the
+    // triangulation's median circumradius.
+    std::optional<double> alpha_nautical_miles;
+};
+
+struct DisplayContourSegment {
+    // Identifies a contiguous range in DisplayContours::points or
+    // DisplayContourView::points.
+    std::size_t point_offset{};
+    std::size_t point_count{};
+    // Closed segments implicitly connect their final point to their first.
+    bool closed{};
+};
+
+struct DisplayContours {
+    std::vector<Coordinate> points;
+    std::vector<DisplayContourSegment> segments;
+};
+
+struct DisplayContourView {
+    std::span<const Coordinate> points;
+    std::span<const DisplayContourSegment> segments;
+};
+
+enum class RoutingProgressPayload : std::uint8_t {
+    none = 0U,
+    retained_points = 1U << 0U,
+    provisional_route = 1U << 1U,
+    display_contours = 1U << 2U,
+};
+
+constexpr RoutingProgressPayload operator|(
+    RoutingProgressPayload left,
+    RoutingProgressPayload right) noexcept {
+    return static_cast<RoutingProgressPayload>(
+        static_cast<std::uint8_t>(left) |
+        static_cast<std::uint8_t>(right));
+}
+
+constexpr RoutingProgressPayload operator&(
+    RoutingProgressPayload left,
+    RoutingProgressPayload right) noexcept {
+    return static_cast<RoutingProgressPayload>(
+        static_cast<std::uint8_t>(left) &
+        static_cast<std::uint8_t>(right));
+}
+
+[[nodiscard]] constexpr bool has_payload(
+    RoutingProgressPayload payloads,
+    RoutingProgressPayload payload) noexcept {
+    return (payloads & payload) != RoutingProgressPayload::none;
+}
+
+struct RoutingProgressOptions {
+    // Deliver one callback for every Nth retained frontier.
+    std::size_t every_n_steps{1U};
+    RoutingProgressPayload payload{
+        RoutingProgressPayload::retained_points |
+        RoutingProgressPayload::provisional_route};
+    DisplayContourOptions display_contours;
+};
+
 enum class DepartureSource {
     explicit_time,
     current_time,
@@ -51,6 +116,7 @@ struct RoutingOptions {
         {std::chrono::minutes{60}, std::chrono::minutes{1'440}},
         {std::chrono::minutes{180}, std::nullopt},
     };
+    RoutingProgressOptions progress;
 };
 
 struct RouteRequest {
@@ -85,6 +151,14 @@ struct Isochrone {
 struct RoutingProgress {
     Isochrone isochrone;
     std::vector<RoutePoint> provisional_route;
+    RouteDiagnostics diagnostics;
+};
+
+struct RoutingProgressView {
+    TimePoint time;
+    std::span<const Coordinate> retained_points;
+    std::span<const RoutePoint> provisional_route;
+    DisplayContourView display_contours;
     RouteDiagnostics diagnostics;
 };
 

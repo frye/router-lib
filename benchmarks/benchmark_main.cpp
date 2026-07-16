@@ -10,18 +10,61 @@
 
 namespace {
 
+enum class ProgressMode {
+    none,
+    owning,
+    view,
+    view_with_contours,
+};
+
 void benchmark_routing(
     const sailroute::Router& router,
     sailroute::RouteRequest request,
     std::size_t worker_count,
+    ProgressMode progress_mode,
     std::string_view label) {
     constexpr std::size_t iterations = 10U;
     request.options.worker_count = worker_count;
+    if (progress_mode == ProgressMode::view_with_contours) {
+        request.options.progress.payload =
+            sailroute::RoutingProgressPayload::display_contours;
+    }
     volatile std::size_t checksum = 0U;
+    std::size_t delivered_updates = 0U;
 
     const auto start = std::chrono::steady_clock::now();
     for (std::size_t index = 0U; index < iterations; ++index) {
-        auto route = router.optimize(request);
+        auto route = [&]() -> sailroute::Result<sailroute::RouteResult> {
+            switch (progress_mode) {
+                case ProgressMode::none:
+                    return router.optimize(request);
+                case ProgressMode::owning:
+                    return router.optimize(
+                        request,
+                        [&checksum, &delivered_updates](
+                            const sailroute::RoutingProgress& progress) {
+                            ++delivered_updates;
+                            checksum =
+                                checksum +
+                                progress.isochrone.points.size() +
+                                progress.provisional_route.size();
+                        });
+                case ProgressMode::view:
+                case ProgressMode::view_with_contours:
+                    return router.optimize_view(
+                        request,
+                        [&checksum, &delivered_updates](
+                            const sailroute::RoutingProgressView& progress) {
+                            ++delivered_updates;
+                            checksum =
+                                checksum +
+                                progress.retained_points.size() +
+                                progress.provisional_route.size() +
+                                progress.display_contours.points.size();
+                        });
+            }
+            throw std::runtime_error("unknown progress benchmark mode");
+        }();
         if (!route.has_value()) {
             throw std::runtime_error(route.error().message);
         }
@@ -33,7 +76,8 @@ void benchmark_routing(
                                .count();
     std::cout << label << ": " << iterations / seconds << " routes/s ("
               << seconds * 1000.0 / static_cast<double>(iterations)
-              << " ms/route), checksum: " << checksum << '\n';
+              << " ms/route), updates: " << delivered_updates
+              << ", checksum: " << checksum << '\n';
 }
 
 }  // namespace
@@ -84,8 +128,41 @@ int main(int argc, char** argv) {
     request.options.maximum_route_duration = std::chrono::hours{12};
     const sailroute::Router router{weather.value(), polar};
 
-    benchmark_routing(router, request, 1U, "routing single worker");
-    benchmark_routing(router, request, 4U, "routing four workers");
-    benchmark_routing(router, request, 0U, "routing automatic workers");
+    benchmark_routing(
+        router,
+        request,
+        1U,
+        ProgressMode::none,
+        "routing single worker");
+    benchmark_routing(
+        router,
+        request,
+        4U,
+        ProgressMode::none,
+        "routing four workers");
+    benchmark_routing(
+        router,
+        request,
+        0U,
+        ProgressMode::none,
+        "routing automatic workers");
+    benchmark_routing(
+        router,
+        request,
+        1U,
+        ProgressMode::owning,
+        "routing owning progress");
+    benchmark_routing(
+        router,
+        request,
+        1U,
+        ProgressMode::view,
+        "routing progress view");
+    benchmark_routing(
+        router,
+        request,
+        1U,
+        ProgressMode::view_with_contours,
+        "routing progress view with contours");
     return 0;
 }

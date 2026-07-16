@@ -127,6 +127,62 @@ TEST_CASE("isochrones serialize as separate timestamped GPX tracks") {
                 1U) != std::string::npos);
 }
 
+TEST_CASE("isochrones serialize disconnected contours as multiple lines") {
+    auto route = sample_route();
+    route.isochrones = {
+        sailroute::Isochrone{
+            .time = route.departure_time + std::chrono::minutes{30},
+            .points = {
+                {0.0, 0.0},
+                {0.0, 1.0},
+                {1.0, 1.0},
+                {1.0, 0.0},
+                {0.0, 10.0},
+                {0.0, 11.0},
+                {1.0, 11.0},
+                {1.0, 10.0},
+            },
+        },
+    };
+
+    const auto json = sailroute::isochrones_to_json(route);
+    REQUIRE(json.has_value());
+    REQUIRE(
+        json.value().find("\"type\":\"MultiLineString\"") !=
+        std::string::npos);
+
+    const auto gpx = sailroute::isochrones_to_gpx(route);
+    REQUIRE(gpx.has_value());
+    const std::size_t first_segment = gpx.value().find("<trkseg>");
+    REQUIRE(first_segment != std::string::npos);
+    REQUIRE(
+        gpx.value().find("<trkseg>", first_segment + 1U) !=
+        std::string::npos);
+}
+
+TEST_CASE("isochrone serialization splits antimeridian contours") {
+    auto route = sample_route();
+    route.isochrones = {
+        sailroute::Isochrone{
+            .time = route.departure_time + std::chrono::minutes{30},
+            .points = {
+                {-1.0, 179.0},
+                {-1.0, -179.0},
+                {1.0, -179.0},
+                {1.0, 179.0},
+            },
+        },
+    };
+
+    const auto json = sailroute::isochrones_to_json(route);
+    REQUIRE(json.has_value());
+    REQUIRE(
+        json.value().find("\"type\":\"MultiLineString\"") !=
+        std::string::npos);
+    REQUIRE(json.value().find("[180,") != std::string::npos);
+    REQUIRE(json.value().find("[-180,") != std::string::npos);
+}
+
 TEST_CASE("serialization rejects non-finite route values") {
     auto route = sample_route();
     route.points.front().boat_speed_knots = std::numeric_limits<double>::infinity();

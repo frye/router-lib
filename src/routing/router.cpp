@@ -1,5 +1,6 @@
 #include "sailroute/router.hpp"
 
+#include "routing/contours.hpp"
 #include "routing/geodesy.hpp"
 #include "routing/intervals.hpp"
 
@@ -132,6 +133,29 @@ std::optional<Error> validate_request(const RouteRequest& request) {
         return Error{
             ErrorCode::invalid_argument,
             "minimum_boat_speed_knots must be finite and non-negative"};
+    }
+    if (options.progress.every_n_steps == 0U) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "progress every_n_steps must be positive"};
+    }
+    constexpr std::uint8_t known_payloads =
+        static_cast<std::uint8_t>(RoutingProgressPayload::retained_points) |
+        static_cast<std::uint8_t>(RoutingProgressPayload::provisional_route) |
+        static_cast<std::uint8_t>(RoutingProgressPayload::display_contours);
+    if ((static_cast<std::uint8_t>(options.progress.payload) &
+         static_cast<std::uint8_t>(~known_payloads)) != 0U) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "progress payload contains unsupported flags"};
+    }
+    if (options.progress.display_contours.alpha_nautical_miles.has_value() &&
+        (!std::isfinite(
+             *options.progress.display_contours.alpha_nautical_miles) ||
+         *options.progress.display_contours.alpha_nautical_miles <= 0.0)) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "display contour alpha_nautical_miles must be finite and positive"};
     }
     return std::nullopt;
 }
@@ -636,15 +660,23 @@ std::vector<std::size_t> prune_candidates(
     return retained;
 }
 
+void reconstruct_route_into(
+    const std::vector<SearchNode>& nodes,
+    NodeIndex arrival_index,
+    std::vector<RoutePoint>& route) {
+    route.clear();
+    for (NodeIndex index = arrival_index; index != no_parent; index = nodes[index].parent) {
+        route.push_back(nodes[index].point);
+    }
+    std::reverse(route.begin(), route.end());
+}
+
 std::vector<RoutePoint> reconstruct_route(
     const std::vector<SearchNode>& nodes,
     NodeIndex arrival_index) {
-    std::vector<RoutePoint> reversed;
-    for (NodeIndex index = arrival_index; index != no_parent; index = nodes[index].parent) {
-        reversed.push_back(nodes[index].point);
-    }
-    std::reverse(reversed.begin(), reversed.end());
-    return reversed;
+    std::vector<RoutePoint> route;
+    reconstruct_route_into(nodes, arrival_index, route);
+    return route;
 }
 
 Isochrone capture_isochrone(
@@ -657,6 +689,24 @@ Isochrone capture_isochrone(
         isochrone.points.push_back(nodes[index].point.position);
     }
     return isochrone;
+}
+
+struct ProgressScratch {
+    std::vector<Coordinate> retained_points;
+    std::vector<RoutePoint> provisional_route;
+    std::vector<Coordinate> contour_points;
+    std::vector<DisplayContourSegment> contour_segments;
+};
+
+void capture_retained_points(
+    const std::vector<SearchNode>& nodes,
+    const std::vector<NodeIndex>& frontier,
+    std::vector<Coordinate>& points) {
+    points.clear();
+    points.reserve(frontier.size());
+    for (const NodeIndex index : frontier) {
+        points.push_back(nodes[index].point.position);
+    }
 }
 
 Error exhausted_error(
@@ -692,26 +742,65 @@ Router::Router(WeatherDataset weather, VesselPolar polar)
     : weather_(std::move(weather)), polar_(std::move(polar)) {}
 
 Result<RouteResult> Router::optimize(const RouteRequest& request) const {
-    return optimize_controlled(request, RoutingControlCallback{});
+    return optimize_view_controlled(request, RoutingViewControlCallback{});
 }
 
 Result<RouteResult> Router::optimize(
     const RouteRequest& request,
     const RoutingProgressCallback& on_progress) const {
     if (!on_progress) {
-        return optimize_controlled(request, RoutingControlCallback{});
+        return optimize_view_controlled(request, RoutingViewControlCallback{});
     }
-    return optimize_controlled(
-        request,
-        [&on_progress](const RoutingProgress& progress) {
-            on_progress(progress);
-            return RoutingProgressDecision::continue_routing;
-        });
+    return optimize_controlled(request, [&on_progress](const RoutingProgress& progress) {
+        on_progress(progress);
+        return RoutingProgressDecision::continue_routing;
+    });
 }
 
 Result<RouteResult> Router::optimize_controlled(
     const RouteRequest& request,
     const RoutingControlCallback& on_progress) const {
+    if (!on_progress) {
+        return optimize_view_controlled(request, RoutingViewControlCallback{});
+    }
+    RouteRequest owning_request = request;
+    owning_request.options.progress.payload =
+        RoutingProgressPayload::retained_points |
+        RoutingProgressPayload::provisional_route;
+    return optimize_view_controlled(
+        owning_request,
+        [&on_progress](const RoutingProgressView& view) {
+            RoutingProgress progress{
+                Isochrone{
+                    view.time,
+                    std::vector<Coordinate>{
+                        view.retained_points.begin(),
+                        view.retained_points.end()}},
+                std::vector<RoutePoint>{
+                    view.provisional_route.begin(),
+                    view.provisional_route.end()},
+                view.diagnostics};
+            return on_progress(progress);
+        });
+}
+
+Result<RouteResult> Router::optimize_view(
+    const RouteRequest& request,
+    const RoutingProgressViewCallback& on_progress) const {
+    if (!on_progress) {
+        return optimize_view_controlled(request, RoutingViewControlCallback{});
+    }
+    return optimize_view_controlled(
+        request,
+        [&on_progress](const RoutingProgressView& progress) {
+            on_progress(progress);
+            return RoutingProgressDecision::continue_routing;
+        });
+}
+
+Result<RouteResult> Router::optimize_view_controlled(
+    const RouteRequest& request,
+    const RoutingViewControlCallback& on_progress) const {
     if (const std::optional<Error> validation = validate_request(request);
         validation.has_value()) {
         return *validation;
@@ -781,6 +870,7 @@ Result<RouteResult> Router::optimize_controlled(
         std::ceil(360.0 / request.options.heading_step_degrees));
     ExpansionBuffer single_worker_buffer;
     CandidateExpansionWorkers expansion_workers{weather_, polar_, request};
+    ProgressScratch progress_scratch;
 
     while (!frontier.empty()) {
         const TimePoint current_time = nodes[frontier.front()].point.time;
@@ -933,20 +1023,75 @@ Result<RouteResult> Router::optimize_controlled(
         }
         diagnostics.retained_candidates += retained.size();
         frontier.swap(next_frontier);
-        if (on_progress) {
-            RoutingProgress progress{
-                capture_isochrone(nodes, frontier),
-                reconstruct_route(nodes, provisional_route_end),
+        const bool deliver_progress =
+            on_progress &&
+            diagnostics.time_steps %
+                    request.options.progress.every_n_steps ==
+                0U;
+        if (request.options.capture_isochrones) {
+            isochrones.push_back(capture_isochrone(nodes, frontier));
+        }
+        if (deliver_progress) {
+            const RoutingProgressPayload payload =
+                request.options.progress.payload;
+            const bool needs_retained_points =
+                has_payload(
+                    payload,
+                    RoutingProgressPayload::retained_points) ||
+                has_payload(
+                    payload,
+                    RoutingProgressPayload::display_contours);
+            if (needs_retained_points) {
+                capture_retained_points(
+                    nodes,
+                    frontier,
+                    progress_scratch.retained_points);
+            } else {
+                progress_scratch.retained_points.clear();
+            }
+            if (has_payload(
+                    payload,
+                    RoutingProgressPayload::provisional_route)) {
+                reconstruct_route_into(
+                    nodes,
+                    provisional_route_end,
+                    progress_scratch.provisional_route);
+            } else {
+                progress_scratch.provisional_route.clear();
+            }
+            if (has_payload(
+                    payload,
+                    RoutingProgressPayload::display_contours)) {
+                if (const auto error = detail::build_display_contours_into(
+                        progress_scratch.retained_points,
+                        request.options.progress.display_contours,
+                        progress_scratch.contour_points,
+                        progress_scratch.contour_segments);
+                    error.has_value()) {
+                    return *error;
+                }
+            } else {
+                progress_scratch.contour_points.clear();
+                progress_scratch.contour_segments.clear();
+            }
+
+            const RoutingProgressView progress{
+                nodes[frontier.front()].point.time,
+                has_payload(
+                    payload,
+                    RoutingProgressPayload::retained_points)
+                    ? std::span<const Coordinate>{
+                          progress_scratch.retained_points}
+                    : std::span<const Coordinate>{},
+                progress_scratch.provisional_route,
+                DisplayContourView{
+                    progress_scratch.contour_points,
+                    progress_scratch.contour_segments},
                 diagnostics};
             const RoutingProgressDecision decision = on_progress(progress);
             if (decision == RoutingProgressDecision::cancel) {
                 return cancelled_error(diagnostics);
             }
-            if (request.options.capture_isochrones) {
-                isochrones.push_back(std::move(progress.isochrone));
-            }
-        } else if (request.options.capture_isochrones) {
-            isochrones.push_back(capture_isochrone(nodes, frontier));
         }
     }
 
