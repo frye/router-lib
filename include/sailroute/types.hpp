@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -100,6 +101,24 @@ enum class DepartureSource {
     forecast_start_fallback,
 };
 
+struct RoutePoint {
+    Coordinate position;
+    TimePoint time;
+    double heading_degrees{};
+    double boat_speed_knots{};
+    double true_wind_speed_knots{};
+    double true_wind_direction_degrees{};
+    double cumulative_distance_nautical_miles{};
+};
+
+struct RouteSegmentView {
+    const RoutePoint& parent;
+    const RoutePoint& candidate;
+};
+
+using RouteSegmentEligibilityCallback =
+    std::function<bool(const RouteSegmentView&)>;
+
 struct RoutingOptions {
     std::chrono::minutes time_step{30};
     double heading_step_degrees{10.0};
@@ -117,6 +136,9 @@ struct RoutingOptions {
         {std::chrono::minutes{180}, std::nullopt},
     };
     RoutingProgressOptions progress;
+    // Invoked synchronously before retention. The view is valid only for the
+    // callback; true accepts the segment and false rejects it.
+    RouteSegmentEligibilityCallback segment_eligibility;
 };
 
 struct RouteRequest {
@@ -124,16 +146,6 @@ struct RouteRequest {
     Coordinate destination;
     std::optional<TimePoint> departure_time;
     RoutingOptions options;
-};
-
-struct RoutePoint {
-    Coordinate position;
-    TimePoint time;
-    double heading_degrees{};
-    double boat_speed_knots{};
-    double true_wind_speed_knots{};
-    double true_wind_direction_degrees{};
-    double cumulative_distance_nautical_miles{};
 };
 
 struct RouteDiagnostics {
