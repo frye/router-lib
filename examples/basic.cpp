@@ -1,6 +1,7 @@
 #include "sailroute/sailroute.hpp"
 
 #include <iostream>
+#include <utility>
 
 int main() {
     auto weather = sailroute::WeatherDataset::load("forecast.grib");
@@ -24,7 +25,9 @@ int main() {
     }
 
     auto json = sailroute::route_to_json(route.value());
-    if (json) {
-        std::cout << json.value();
+    if (!json) {
+        std::cerr << json.error().message << '\n';
+        return 1;
     }
+    std::cout << json.value();
 }
