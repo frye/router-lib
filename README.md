@@ -26,9 +26,13 @@ with the best forecast-supported partial route and
 `RouteCompletion::forecast_exhausted`. Other incomplete searches, including
 maximum-duration exhaustion, remain routing errors.
 
-## macOS build
+## Requirements and build
 
-Install CMake and ecCodes, then configure and build:
+Building requires CMake 3.20 or newer, a C++20 compiler, and ECMWF ecCodes.
+The build first looks for an ecCodes CMake package and then falls back to
+`pkg-config`.
+
+On macOS, install the dependencies and build with:
 
 ```sh
 brew install cmake eccodes
@@ -37,9 +41,35 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Enable the microbenchmarks with
-`-DSAILROUTE_BUILD_BENCHMARKS=ON`. Enable link-time optimization with
-`-DSAILROUTE_ENABLE_LTO=ON`.
+| CMake option | Default | Purpose |
+| --- | --- | --- |
+| `SAILROUTE_BUILD_TESTS` | `ON` | Build the test executable and CLI tests |
+| `SAILROUTE_BUILD_BENCHMARKS` | `OFF` | Build the microbenchmark executable |
+| `SAILROUTE_ENABLE_LTO` | `OFF` | Enable link-time optimization when supported |
+
+### Install and consume with CMake
+
+Install the library, headers, CLI, and CMake package to a chosen prefix:
+
+```sh
+cmake --install build --prefix "$PWD/install"
+```
+
+Point a consuming project at that prefix, then link the exported target:
+
+```cmake
+find_package(sailroute 0.1 CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE sailroute::sailroute)
+```
+
+```sh
+cmake -S consumer -B consumer/build \
+  -DCMAKE_PREFIX_PATH="$PWD/install"
+```
+
+The package also resolves its Threads and ecCodes dependencies. Include
+`<sailroute/sailroute.hpp>` for the complete public API or include individual
+headers such as `<sailroute/weather.hpp>` and `<sailroute/router.hpp>`.
 
 ## CLI
 
@@ -70,6 +100,10 @@ the completion status so downstream consumers can distinguish partial output.
 The router retains up to 10 nodes per spatial bucket by default. Increase
 `--max-nodes-per-bucket` to preserve a larger set of alternate paths, or reduce
 it when runtime and memory are more important than search breadth.
+
+The CLI returns `0` on success (including a forecast-exhausted partial route),
+`2` for command-line usage errors, `3` for weather or polar input errors, `4`
+for routing errors, and `5` for serialization or file-output errors.
 
 Routing intervals are measured from departure. By default, the router creates
 points every 30 minutes for the first 4 hours, every hour through the first 24
@@ -102,33 +136,37 @@ offshore coordinates for a Race Rocks to Port Angeles demonstration:
 ## C++ API
 
 ```cpp
-auto weather = sailroute::WeatherDataset::load("forecast.grib2");
-auto polar = sailroute::VesselPolar::load("boat.pol");
-sailroute::Router router{weather.value(), polar.value()};
+#include <sailroute/sailroute.hpp>
 
-sailroute::RouteRequest request{
-    .start = {37.7749, -122.4194},
-    .destination = {21.3069, -157.8583},
-};
-request.options.routing_intervals = {
-    {std::chrono::minutes{15}, std::chrono::hours{6}},
-    {std::chrono::minutes{30}, std::chrono::hours{24}},
-    {std::chrono::hours{2}, std::nullopt},
-};
-request.options.capture_isochrones = true;
-std::vector<sailroute::RoutingProgress> updates;
-auto result = router.optimize(
-    request,
-    [&updates](const sailroute::RoutingProgress& progress) {
-        updates.push_back(progress);
-        return sailroute::RoutingProgressDecision::continue_routing;
-    });
-if (result.value().completion ==
-    sailroute::RouteCompletion::forecast_exhausted) {
-    present_partial_route_warning();
+#include <iostream>
+#include <utility>
+
+int main() {
+    auto weather = sailroute::WeatherDataset::load("forecast.grib2");
+    if (!weather) {
+        std::cerr << weather.error().message << '\n';
+        return 1;
+    }
+
+    sailroute::Router router{std::move(weather.value())};
+    sailroute::RouteRequest request{
+        .start = {37.7749, -122.4194},
+        .destination = {21.3069, -157.8583},
+    };
+
+    auto route = router.optimize(request);
+    if (!route) {
+        std::cerr << route.error().message << '\n';
+        return 1;
+    }
+
+    auto json = sailroute::route_to_json(route.value());
+    if (!json) {
+        std::cerr << json.error().message << '\n';
+        return 1;
+    }
+    std::cout << json.value();
 }
-auto isochrones_json = sailroute::isochrones_to_json(result.value());
-auto isochrones_gpx = sailroute::isochrones_to_gpx(result.value());
 ```
 
 Loaded weather and polar objects are immutable and reusable across route
@@ -139,6 +177,73 @@ search frontier history. A successful `RouteResult` has completion
 `points` owns the best route through the final supported frontier,
 `arrival_time` is the final point's time, and diagnostics and requested
 isochrones cover all completed routing steps.
+
+### Error handling
+
+All fallible library operations return `Result<T>`. Test it with `operator bool`
+or `has_value()` before calling `value()`; failures provide an `ErrorCode` and a
+human-readable `message`. `to_string(ErrorCode)` returns a stable symbolic name.
+The library does not use exceptions for expected input, routing, or output
+failures. Exceptions thrown by application callbacks are not caught.
+
+Error categories distinguish invalid arguments, file I/O, GRIB decoding and
+support, incomplete forecasts, invalid polars, coordinates or departures
+outside forecast coverage, unavailable routes, exhausted forecasts, output
+failures, and callback cancellation.
+
+### Weather and polar data
+
+`WeatherDataset::load(path)` decodes all supported wind slices. To reduce
+memory, `load(path, GeographicBounds{south, west, north, east})` retains only
+the interpolation subgrid needed for the requested canonical bounds. Bounds
+may cross the antimeridian by setting west greater than east, but must remain
+inside the source grid. `metadata()` reports the valid-time range, retained
+grid dimensions, global-longitude coverage, and source path.
+
+`WeatherDataset::interpolate(coordinate, time)` performs spatial and temporal
+interpolation and returns eastward and northward wind components in metres per
+second. `Wind::speed_knots()` converts the vector magnitude to knots, and
+`direction_from_degrees()` returns the meteorological direction the wind comes
+from in `[0, 360)`.
+
+`VesselPolar::load(path)` loads a matrix polar; use
+`default_racer_cruiser_45ft()` only for demonstrations. `boat_speed_knots()`
+bilinearly interpolates within the matrix, folds angles to `[0, 180]`, and
+clamps values outside either axis to the nearest edge. Non-finite inputs and
+non-positive true-wind speeds return zero. `source()` identifies the loaded or
+built-in data.
+
+### Routing configuration
+
+`RouteRequest` contains the start, destination, optional departure time, and
+the following `RoutingOptions`:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `time_step` | 30 minutes | Constant step used when `use_routing_intervals` is `false` |
+| `routing_intervals` | `30m@4h, 1h@24h, 3h` | Departure-relative variable step schedule |
+| `use_routing_intervals` | `true` | Select variable intervals instead of `time_step` |
+| `heading_step_degrees` | `10` | Candidate heading spacing in `(0, 180]` |
+| `arrival_radius_nautical_miles` | `2` | Distance at which the destination is reached |
+| `spatial_bucket_nautical_miles` | `10` | Spatial pruning bucket size |
+| `max_nodes_per_bucket` | `10` | Alternate nodes retained in each bucket |
+| `worker_count` | `0` | Expansion workers; zero selects automatically |
+| `maximum_route_duration` | 240 hours | Search horizon from departure |
+| `minimum_boat_speed_knots` | `0.05` | Slower candidates are discarded |
+| `capture_isochrones` | `false` | Retain every completed frontier in `RouteResult` |
+| `progress` | every step, points + route | View callback cadence and payload selection |
+| `segment_eligibility` | empty | Optional synchronous candidate predicate |
+
+Intervals and `time_step` must be at least five minutes. The final interval
+tier must be open-ended, preceding cutoffs must be positive and strictly
+increasing, and `progress.every_n_steps` must be positive. Other numeric
+distances and durations must satisfy the ranges shown above.
+
+`RouteResult::points` owns the selected route, including per-point heading,
+boat speed, true wind, and cumulative distance. `diagnostics` reports expanded
+nodes, generated and retained candidates, and completed time steps.
+`departure_source` records whether departure was explicit, current time, or the
+forecast-start fallback. Use `to_string()` for departure and completion enums.
 
 ### Route segment eligibility contract
 
@@ -250,6 +355,25 @@ scale is derived from the frontier. A `DisplayContourSegment` references a
 range in the flattened point array and marks whether that range closes back to
 its first point.
 
+### Serialization and time utilities
+
+Serialization functions return an in-memory string and report invalid numeric
+data as `ErrorCode::output_error`; callers are responsible for writing files.
+
+| Function | Output |
+| --- | --- |
+| `route_to_json` | Route metadata, diagnostics, and points as JSON |
+| `route_to_gpx` | GPX 1.1 track with route values in `sailroute` extensions |
+| `isochrones_to_json` | GeoJSON `FeatureCollection` of display contours |
+| `isochrones_to_gpx` | GPX 1.1 track per isochrone and segment per component |
+
+Isochrone serializers operate on `RouteResult::isochrones`; set
+`capture_isochrones` before routing or the output collection is empty.
+`parse_utc_time()` accepts exactly `YYYY-MM-DDTHH:MM:SSZ`, and
+`format_utc_time()` emits the same UTC form at whole-second precision.
+Coordinates use latitude/longitude degrees in canonical ranges `[-90, 90]` and
+`[-180, 180]`; `is_valid()` checks both bounds and finiteness.
+
 ## Polar formats
 
 CSV matrix files place true-wind speeds in knots across the first row and
@@ -264,9 +388,11 @@ TWA/TWS,6,10,14,20
 180,4.5,6.4,7.8,8.8
 ```
 
-Expedition-style files may use comma, semicolon, tab, or whitespace delimiters
-and comment lines beginning with `#`, `;`, or `//`. Axes must be strictly
-increasing and all boat speeds must be finite and non-negative.
+Expedition-style files may use comma, semicolon, tab, or whitespace delimiters.
+Full-line comments may begin with `#`, `!`, `%`, `;`, or `//`; inline comments
+may begin with `#`, `!`, or `//`. Axes must be strictly increasing, contain at
+least two values, and all boat speeds must be finite and non-negative. TWA must
+be in `[0, 180]`; TWS and boat speeds are in knots.
 
 ## Portability
 

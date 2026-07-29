@@ -10,6 +10,7 @@
 
 namespace sailroute {
 
+/// Time range, retained grid shape, coverage, and source of loaded weather.
 struct ForecastMetadata {
     TimePoint first_valid_time;
     TimePoint last_valid_time;
@@ -19,6 +20,7 @@ struct ForecastMetadata {
     std::string source;
 };
 
+/// Canonical load bounds; west greater than east crosses the antimeridian.
 struct GeographicBounds {
     double south_latitude_degrees{};
     double west_longitude_degrees{};
@@ -35,12 +37,16 @@ public:
     WeatherDataset& operator=(const WeatherDataset&);
     WeatherDataset& operator=(WeatherDataset&&) noexcept;
 
+    /// Loads every supported wind field in a GRIB1 or GRIB2 file.
     static Result<WeatherDataset> load(const std::filesystem::path& path);
+    /// Loads the interpolation subgrid required by canonical geographic bounds.
     static Result<WeatherDataset> load(
         const std::filesystem::path& path,
         GeographicBounds bounds);
 
+    /// Returns valid times, retained grid dimensions, coverage, and source.
     [[nodiscard]] const ForecastMetadata& metadata() const;
+    /// Interpolates eastward/northward wind in m/s at a coordinate and UTC time.
     [[nodiscard]] Result<Wind> interpolate(Coordinate coordinate, TimePoint time) const;
 
 private:

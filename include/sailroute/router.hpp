@@ -12,27 +12,35 @@
 
 namespace sailroute {
 
+/// Owning, notification-only progress callback.
 using RoutingProgressCallback = std::function<void(const RoutingProgress&)>;
 
+/// Return value for callbacks that can stop an optimization.
 enum class RoutingProgressDecision {
     continue_routing,
     cancel,
 };
 
+/// Owning progress callback with cancellation control.
 using RoutingControlCallback =
     std::function<RoutingProgressDecision(const RoutingProgress&)>;
 
+/// Non-owning, notification-only progress callback.
 using RoutingProgressViewCallback =
     std::function<void(const RoutingProgressView&)>;
 
+/// Non-owning progress callback with cancellation control.
 using RoutingViewControlCallback =
     std::function<RoutingProgressDecision(const RoutingProgressView&)>;
 
 class Router {
 public:
+    /// Takes immutable weather and polar data reusable across optimizations.
     Router(WeatherDataset weather, VesselPolar polar = VesselPolar::default_racer_cruiser_45ft());
 
+    /// Optimizes a route without intermediate progress delivery.
     [[nodiscard]] Result<RouteResult> optimize(const RouteRequest& request) const;
+    /// Optimizes a route with owning, notification-only progress snapshots.
     [[nodiscard]] Result<RouteResult> optimize(
         const RouteRequest& request,
         const RoutingProgressCallback& on_progress) const;
@@ -50,8 +58,9 @@ public:
             RoutingControlCallback{std::forward<Callback>(on_progress)});
     }
 
-    // All spans in RoutingProgressView remain valid only for the synchronous
-    // callback invocation. Copy them before retaining data or crossing threads.
+    /// Optimizes with allocation-efficient callback-scoped progress views.
+    ///
+    /// All spans remain valid only for the synchronous callback invocation.
     [[nodiscard]] Result<RouteResult> optimize_view(
         const RouteRequest& request,
         const RoutingProgressViewCallback& on_progress) const;

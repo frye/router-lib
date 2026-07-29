@@ -12,13 +12,16 @@
 
 namespace sailroute {
 
+/// UTC system-clock time at whole-second precision.
 using TimePoint = std::chrono::sys_seconds;
 
+/// Canonical latitude/longitude coordinates in degrees.
 struct Coordinate {
     double latitude_degrees{};
     double longitude_degrees{};
 };
 
+/// Eastward and northward wind-vector components in metres per second.
 struct Wind {
     double east_mps{};
     double north_mps{};
@@ -27,17 +30,20 @@ struct Wind {
     [[nodiscard]] double direction_from_degrees() const noexcept;
 };
 
+/// One departure-relative tier in a variable routing step schedule.
 struct RoutingInterval {
     std::chrono::minutes interval{};
     std::optional<std::chrono::minutes> until_elapsed;
 };
 
+/// Controls alpha-shape construction for display contours.
 struct DisplayContourOptions {
     // When omitted, the builder derives a deterministic scale from the
     // triangulation's median circumradius.
     std::optional<double> alpha_nautical_miles;
 };
 
+/// References one contiguous component in a flattened display contour.
 struct DisplayContourSegment {
     // Identifies a contiguous range in DisplayContours::points or
     // DisplayContourView::points.
@@ -47,16 +53,19 @@ struct DisplayContourSegment {
     bool closed{};
 };
 
+/// Owning flattened contour coordinates and their component ranges.
 struct DisplayContours {
     std::vector<Coordinate> points;
     std::vector<DisplayContourSegment> segments;
 };
 
+/// Non-owning contour data valid for the enclosing callback invocation.
 struct DisplayContourView {
     std::span<const Coordinate> points;
     std::span<const DisplayContourSegment> segments;
 };
 
+/// Bit flags selecting data populated in RoutingProgressView.
 enum class RoutingProgressPayload : std::uint8_t {
     none = 0U,
     retained_points = 1U << 0U,
@@ -86,6 +95,7 @@ constexpr RoutingProgressPayload operator&(
     return (payloads & payload) != RoutingProgressPayload::none;
 }
 
+/// Controls view callback cadence, payloads, and contour construction.
 struct RoutingProgressOptions {
     // Deliver one callback for every Nth retained frontier.
     std::size_t every_n_steps{1U};
@@ -95,12 +105,14 @@ struct RoutingProgressOptions {
     DisplayContourOptions display_contours;
 };
 
+/// Explains how a route's effective departure time was selected.
 enum class DepartureSource {
     explicit_time,
     current_time,
     forecast_start_fallback,
 };
 
+/// One timestamped point in a selected or provisional route.
 struct RoutePoint {
     Coordinate position;
     TimePoint time;
@@ -111,6 +123,7 @@ struct RoutePoint {
     double cumulative_distance_nautical_miles{};
 };
 
+/// Callback-scoped parent and candidate pair for eligibility decisions.
 struct RouteSegmentView {
     const RoutePoint& parent;
     const RoutePoint& candidate;
@@ -119,11 +132,13 @@ struct RouteSegmentView {
 using RouteSegmentEligibilityCallback =
     std::function<bool(const RouteSegmentView&)>;
 
+/// Indicates whether a successful result reached the requested destination.
 enum class RouteCompletion {
     destination_reached,
     forecast_exhausted,
 };
 
+/// Search resolution, pruning, concurrency, progress, and eligibility controls.
 struct RoutingOptions {
     std::chrono::minutes time_step{30};
     double heading_step_degrees{10.0};
@@ -147,6 +162,7 @@ struct RoutingOptions {
     RouteSegmentEligibilityCallback segment_eligibility;
 };
 
+/// Start, destination, optional departure, and routing configuration.
 struct RouteRequest {
     Coordinate start;
     Coordinate destination;
@@ -154,6 +170,7 @@ struct RouteRequest {
     RoutingOptions options;
 };
 
+/// Cumulative search-work counters.
 struct RouteDiagnostics {
     std::size_t expanded_nodes{};
     std::size_t generated_candidates{};
@@ -161,17 +178,20 @@ struct RouteDiagnostics {
     std::size_t time_steps{};
 };
 
+/// One retained search frontier at a completed routing time step.
 struct Isochrone {
     TimePoint time;
     std::vector<Coordinate> points;
 };
 
+/// Owning progress snapshot used by Router::optimize callbacks.
 struct RoutingProgress {
     Isochrone isochrone;
     std::vector<RoutePoint> provisional_route;
     RouteDiagnostics diagnostics;
 };
 
+/// Callback-scoped progress data used by Router::optimize_view.
 struct RoutingProgressView {
     TimePoint time;
     std::span<const Coordinate> retained_points;
@@ -180,6 +200,7 @@ struct RoutingProgressView {
     RouteDiagnostics diagnostics;
 };
 
+/// Successful complete or forecast-exhausted routing output.
 struct RouteResult {
     TimePoint departure_time;
     // For partial results, this is the time of the final forecast-supported point.
@@ -193,8 +214,11 @@ struct RouteResult {
     RouteCompletion completion{RouteCompletion::destination_reached};
 };
 
+/// Checks coordinate finiteness and canonical latitude/longitude bounds.
 [[nodiscard]] bool is_valid(Coordinate coordinate) noexcept;
+/// Returns the stable snake_case name of a departure source.
 std::string_view to_string(DepartureSource source) noexcept;
+/// Returns the stable snake_case name of a completion state.
 std::string_view to_string(RouteCompletion completion) noexcept;
 
 }  // namespace sailroute
