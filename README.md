@@ -140,6 +140,44 @@ search frontier history. A successful `RouteResult` has completion
 `arrival_time` is the final point's time, and diagnostics and requested
 isochrones cover all completed routing steps.
 
+### Route segment eligibility contract
+
+`RoutingOptions::segment_eligibility` can reject a parent-to-candidate segment
+before it enters retained routing state:
+
+```cpp
+request.options.segment_eligibility =
+    [](const sailroute::RouteSegmentView& segment) {
+        return !crosses_land(
+            segment.parent.position,
+            segment.candidate.position);
+    };
+```
+
+The callback is optional and defaults to accepting every segment. It receives
+the complete candidate `RoutePoint`, including an adjusted endpoint, timestamp,
+and cumulative distance when the segment is shortened upon entering the arrival
+radius. Returning `false` prevents that candidate from being selected as an
+arrival, retained in a frontier, reported through progress, or emitted in the
+final route.
+
+Candidate expansion can remain parallel, but eligibility callbacks are invoked
+synchronously on the thread that called `Router::optimize` or
+`Router::optimize_view`. Within one optimization, each generated candidate is
+presented exactly once in deterministic parent-and-heading expansion order
+before arrival selection and frontier pruning. The callback is therefore never
+concurrent within one optimization, though separate concurrent optimizations
+can invoke shared callback state concurrently. Callers sharing mutable state
+between requests must synchronize it and must return the same decision for the
+same segment and configuration to preserve deterministic results.
+
+The `RouteSegmentView` and its references are valid only until the callback
+returns. Eligibility runs serially for every generated candidate, so predicates
+should return promptly. Exceptions propagate out of the optimization unchanged,
+matching progress callback behavior. If a step generates candidates but rejects
+all of them, optimization returns `ErrorCode::no_route`; rejecting a shortened
+arrival alone does not stop the search when eligible frontier candidates remain.
+
 ### Progress callback contract
 
 The optional callback receives one `RoutingProgress` snapshot after each
