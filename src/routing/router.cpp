@@ -66,8 +66,14 @@ struct Arrival {
     double fraction{};
 };
 
+struct CandidateEvaluation {
+    Candidate candidate;
+    std::optional<double> arrival_fraction;
+};
+
 struct ExpansionBuffer {
     std::vector<Candidate> candidates;
+    std::vector<Arrival> arrivals;
     std::optional<Arrival> best_arrival;
     std::optional<Error> interpolation_error;
     std::exception_ptr exception;
@@ -77,6 +83,7 @@ struct ExpansionBuffer {
 
     void clear() {
         candidates.clear();
+        arrivals.clear();
         best_arrival.reset();
         interpolation_error.reset();
         exception = nullptr;
@@ -269,7 +276,8 @@ void expand_candidate_range(
     TimePoint current_time,
     std::chrono::seconds step,
     double step_hours,
-    std::size_t heading_count) {
+    std::size_t heading_count,
+    bool preserve_all_arrivals) {
     buffer.clear();
     const std::size_t parent_count = end - begin;
     if (parent_count <=
@@ -362,8 +370,10 @@ void expand_candidate_range(
                         request.destination);
 
                 Arrival arrival{std::move(candidate), *fraction};
-                if (!buffer.best_arrival.has_value() ||
-                    better_arrival(arrival, *buffer.best_arrival)) {
+                if (preserve_all_arrivals) {
+                    buffer.arrivals.push_back(std::move(arrival));
+                } else if (!buffer.best_arrival.has_value() ||
+                           better_arrival(arrival, *buffer.best_arrival)) {
                     buffer.best_arrival = std::move(arrival);
                 }
             } else {
@@ -378,8 +388,12 @@ public:
     CandidateExpansionWorkers(
         const WeatherDataset& weather,
         const VesselPolar& polar,
-        const RouteRequest& request)
-        : weather_(weather), polar_(polar), request_(request) {}
+        const RouteRequest& request,
+        bool preserve_all_arrivals)
+        : weather_(weather),
+          polar_(polar),
+          request_(request),
+          preserve_all_arrivals_(preserve_all_arrivals) {}
 
     CandidateExpansionWorkers(const CandidateExpansionWorkers&) = delete;
     CandidateExpansionWorkers& operator=(const CandidateExpansionWorkers&) = delete;
@@ -507,7 +521,8 @@ private:
                 current_time_,
                 step_,
                 step_hours_,
-                heading_count_);
+                heading_count_,
+                preserve_all_arrivals_);
         } catch (...) {
             buffer.clear();
             buffer.exception = std::current_exception();
@@ -545,6 +560,7 @@ private:
     const WeatherDataset& weather_;
     const VesselPolar& polar_;
     const RouteRequest& request_;
+    bool preserve_all_arrivals_{};
     std::vector<ExpansionBuffer> buffers_;
     std::vector<std::thread> threads_;
     std::mutex mutex_;
@@ -681,6 +697,28 @@ std::vector<RoutePoint> reconstruct_route(
     return route;
 }
 
+RouteResult make_route_result(
+    TimePoint departure,
+    DepartureSource departure_source,
+    RouteCompletion completion,
+    const std::string& forecast_source,
+    const std::string& polar_source,
+    std::vector<RoutePoint> points,
+    std::vector<Isochrone> isochrones,
+    const RouteDiagnostics& diagnostics) {
+    RouteResult result;
+    result.departure_time = departure;
+    result.arrival_time = points.back().time;
+    result.departure_source = departure_source;
+    result.completion = completion;
+    result.forecast_source = forecast_source;
+    result.polar_source = polar_source;
+    result.points = std::move(points);
+    result.isochrones = std::move(isochrones);
+    result.diagnostics = diagnostics;
+    return result;
+}
+
 Isochrone capture_isochrone(
     const std::vector<SearchNode>& nodes,
     const std::vector<NodeIndex>& frontier) {
@@ -713,17 +751,10 @@ void capture_retained_points(
     }
 }
 
-Error exhausted_error(
-    bool forecast_limited,
-    const RouteDiagnostics& diagnostics) {
+Error route_duration_exhausted_error(const RouteDiagnostics& diagnostics) {
     const std::string suffix =
         " after " + std::to_string(diagnostics.time_steps) + " time steps and " +
         std::to_string(diagnostics.expanded_nodes) + " expanded nodes";
-    if (forecast_limited) {
-        return Error{
-            ErrorCode::forecast_exhausted,
-            "forecast coverage ended before the destination was reached" + suffix};
-    }
     return Error{
         ErrorCode::no_route,
         "maximum route duration ended before the destination was reached" + suffix};
@@ -858,35 +889,57 @@ Result<RouteResult> Router::optimize_view_controlled(
     if (detail::great_circle_distance_nautical_miles(
             request.start,
             request.destination) <= request.options.arrival_radius_nautical_miles) {
-        RouteResult result;
-        result.departure_time = departure;
-        result.arrival_time = departure;
-        result.departure_source = departure_source;
-        result.forecast_source = metadata.source;
-        result.polar_source = polar_.source();
-        result.points.push_back(nodes.front().point);
-        result.diagnostics = diagnostics;
-        return result;
+        return make_route_result(
+            departure,
+            departure_source,
+            RouteCompletion::destination_reached,
+            metadata.source,
+            polar_.source(),
+            std::vector<RoutePoint>{nodes.front().point},
+            {},
+            diagnostics);
     }
 
     std::vector<NodeIndex> frontier{0U};
     std::vector<Candidate> candidates;
+    std::vector<CandidateEvaluation> candidate_evaluations;
     std::vector<NodeIndex> next_frontier;
     std::vector<Isochrone> isochrones;
 
     const TimePoint horizon_end = departure + request.options.maximum_route_duration;
     const TimePoint route_end = std::min(horizon_end, metadata.last_valid_time);
-    const bool forecast_limited = metadata.last_valid_time <= horizon_end;
+    const bool forecast_limited = metadata.last_valid_time < horizon_end;
     const std::size_t heading_count = static_cast<std::size_t>(
         std::ceil(360.0 / request.options.heading_step_degrees));
     ExpansionBuffer single_worker_buffer;
-    CandidateExpansionWorkers expansion_workers{weather_, polar_, request};
+    const bool has_segment_eligibility =
+        static_cast<bool>(request.options.segment_eligibility);
+    CandidateExpansionWorkers expansion_workers{
+        weather_,
+        polar_,
+        request,
+        has_segment_eligibility};
     ProgressScratch progress_scratch;
+    NodeIndex best_route_end = 0U;
+    auto finish_without_arrival = [&]() -> Result<RouteResult> {
+        if (!forecast_limited) {
+            return route_duration_exhausted_error(diagnostics);
+        }
+        return make_route_result(
+            departure,
+            departure_source,
+            RouteCompletion::forecast_exhausted,
+            metadata.source,
+            polar_.source(),
+            reconstruct_route(nodes, best_route_end),
+            std::move(isochrones),
+            diagnostics);
+    };
 
     while (!frontier.empty()) {
         const TimePoint current_time = nodes[frontier.front()].point.time;
         if (current_time >= route_end) {
-            return exhausted_error(forecast_limited, diagnostics);
+            return finish_without_arrival();
         }
         const auto remaining =
             std::chrono::duration_cast<std::chrono::seconds>(route_end - current_time);
@@ -896,13 +949,16 @@ Result<RouteResult> Router::optimize_view_controlled(
         const auto step =
             detail::routing_step(request.options, elapsed, remaining);
         if (step <= std::chrono::seconds::zero()) {
-            return exhausted_error(forecast_limited, diagnostics);
+            return finish_without_arrival();
         }
 
         ++diagnostics.time_steps;
         candidates.clear();
+        candidate_evaluations.clear();
         std::optional<Arrival> best_arrival;
         std::optional<Error> interpolation_error;
+        std::size_t generated_this_step = 0U;
+        std::size_t eligible_this_step = 0U;
 
         const double step_hours =
             std::chrono::duration<double, std::ratio<3600>>(step).count();
@@ -911,6 +967,7 @@ Result<RouteResult> Router::optimize_view_controlled(
         const auto merge_buffer = [&](const ExpansionBuffer& buffer) {
             diagnostics.expanded_nodes += buffer.expanded_nodes;
             diagnostics.generated_candidates += buffer.generated_candidates;
+            generated_this_step += buffer.generated_candidates;
             if (!interpolation_error.has_value() &&
                 buffer.interpolation_error.has_value()) {
                 interpolation_error = buffer.interpolation_error;
@@ -919,6 +976,22 @@ Result<RouteResult> Router::optimize_view_controlled(
                 (!best_arrival.has_value() ||
                  better_arrival(*buffer.best_arrival, *best_arrival))) {
                 best_arrival = buffer.best_arrival;
+            }
+        };
+        const auto append_for_eligibility = [&candidate_evaluations](
+                                                ExpansionBuffer& buffer) {
+            candidate_evaluations.reserve(
+                candidate_evaluations.size() +
+                buffer.candidates.size() +
+                buffer.arrivals.size());
+            for (Candidate& candidate : buffer.candidates) {
+                candidate_evaluations.push_back(
+                    CandidateEvaluation{std::move(candidate), std::nullopt});
+            }
+            for (Arrival& arrival : buffer.arrivals) {
+                candidate_evaluations.push_back(CandidateEvaluation{
+                    std::move(arrival.candidate),
+                    arrival.fraction});
             }
         };
 
@@ -935,14 +1008,17 @@ Result<RouteResult> Router::optimize_view_controlled(
                 current_time,
                 step,
                 step_hours,
-                heading_count);
+                heading_count,
+                has_segment_eligibility);
             merge_buffer(single_worker_buffer);
             if (single_worker_buffer.non_finite_wind) {
                 return Error{
                     ErrorCode::incomplete_forecast,
                     "forecast interpolation produced non-finite wind"};
             }
-            if (!best_arrival.has_value()) {
+            if (has_segment_eligibility) {
+                append_for_eligibility(single_worker_buffer);
+            } else if (!best_arrival.has_value()) {
                 candidates.insert(
                     candidates.end(),
                     std::make_move_iterator(
@@ -971,7 +1047,11 @@ Result<RouteResult> Router::optimize_view_controlled(
                     ErrorCode::incomplete_forecast,
                     "forecast interpolation produced non-finite wind"};
             }
-            if (!best_arrival.has_value()) {
+            if (has_segment_eligibility) {
+                for (std::size_t index = 0U; index < active_workers; ++index) {
+                    append_for_eligibility(expansion_workers.buffer(index));
+                }
+            } else if (!best_arrival.has_value()) {
                 std::size_t candidate_count = 0U;
                 for (std::size_t index = 0U; index < active_workers; ++index) {
                     candidate_count +=
@@ -989,24 +1069,61 @@ Result<RouteResult> Router::optimize_view_controlled(
             }
         }
 
+        if (has_segment_eligibility) {
+            std::sort(
+                candidate_evaluations.begin(),
+                candidate_evaluations.end(),
+                [](const CandidateEvaluation& left,
+                   const CandidateEvaluation& right) {
+                    return left.candidate.ordinal < right.candidate.ordinal;
+                });
+            for (CandidateEvaluation& evaluation : candidate_evaluations) {
+                const RouteSegmentView segment{
+                    nodes[evaluation.candidate.parent].point,
+                    evaluation.candidate.point};
+                if (!request.options.segment_eligibility(segment)) {
+                    continue;
+                }
+                ++eligible_this_step;
+                if (evaluation.arrival_fraction.has_value()) {
+                    Arrival arrival{
+                        std::move(evaluation.candidate),
+                        *evaluation.arrival_fraction};
+                    if (!best_arrival.has_value() ||
+                        better_arrival(arrival, *best_arrival)) {
+                        best_arrival = std::move(arrival);
+                    }
+                } else {
+                    candidates.push_back(std::move(evaluation.candidate));
+                }
+            }
+        }
+
         if (best_arrival.has_value()) {
             nodes.push_back(SearchNode{
                 std::move(best_arrival->candidate.point),
                 best_arrival->candidate.parent});
             ++diagnostics.retained_candidates;
-            RouteResult result;
-            result.departure_time = departure;
-            result.arrival_time = nodes.back().point.time;
-            result.departure_source = departure_source;
-            result.forecast_source = metadata.source;
-            result.polar_source = polar_.source();
-            result.points = reconstruct_route(nodes, nodes.size() - 1U);
-            result.isochrones = std::move(isochrones);
-            result.diagnostics = diagnostics;
-            return result;
+            return make_route_result(
+                departure,
+                departure_source,
+                RouteCompletion::destination_reached,
+                metadata.source,
+                polar_.source(),
+                reconstruct_route(nodes, nodes.size() - 1U),
+                std::move(isochrones),
+                diagnostics);
         }
 
         if (candidates.empty()) {
+            if (has_segment_eligibility &&
+                generated_this_step > 0U &&
+                eligible_this_step == 0U) {
+                return Error{
+                    ErrorCode::no_route,
+                    "segment eligibility rejected every candidate at routing step " +
+                        std::to_string(diagnostics.time_steps)};
+            }
             if (interpolation_error.has_value()) {
                 return *interpolation_error;
             }
@@ -1034,6 +1151,7 @@ Result<RouteResult> Router::optimize_view_controlled(
         }
         diagnostics.retained_candidates += retained.size();
         frontier.swap(next_frontier);
+        best_route_end = provisional_route_end;
         const bool deliver_progress =
             on_progress &&
             diagnostics.time_steps %

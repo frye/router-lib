@@ -93,7 +93,13 @@ Result<std::string> route_to_gpx(const RouteResult& route) {
     append_element(output, "name", "Sailroute optimized route", "    ");
     output.append("    <desc>Departure source: ");
     serialization_detail::append_xml_text(output, to_string(route.departure_source));
-    output.append("</desc>\n    <trkseg>\n");
+    output.append("</desc>\n    <extensions>\n");
+    append_element(
+        output,
+        "sailroute:completion",
+        to_string(route.completion),
+        "      ");
+    output.append("    </extensions>\n    <trkseg>\n");
 
     for (const RoutePoint& point : route.points) {
         output.append("      <trkpt lat=\"");

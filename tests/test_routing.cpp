@@ -12,6 +12,7 @@
 #include <cmath>
 #include <filesystem>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -30,7 +31,10 @@ void require_codes(int status, const char* operation) {
 
 class RoutingGribFixture {
 public:
-    explicit RoutingGribFixture(long data_date = 20260714, long data_time = 1200)
+    explicit RoutingGribFixture(
+        long data_date = 20260714,
+        long data_time = 1200,
+        long final_forecast_hour = 12)
         : path_(
               std::filesystem::current_path() /
               ("sailroute-routing-" +
@@ -39,8 +43,20 @@ public:
                ".grib")) {
         write_message("10u", 0, 0.0, data_date, data_time, "w");
         write_message("10v", 0, -10.0, data_date, data_time, "a");
-        write_message("10u", 12, 0.0, data_date, data_time, "a");
-        write_message("10v", 12, -10.0, data_date, data_time, "a");
+        write_message(
+            "10u",
+            final_forecast_hour,
+            0.0,
+            data_date,
+            data_time,
+            "a");
+        write_message(
+            "10v",
+            final_forecast_hour,
+            -10.0,
+            data_date,
+            data_time,
+            "a");
     }
 
     ~RoutingGribFixture() {
@@ -180,6 +196,7 @@ void require_same_route(
     REQUIRE(left.departure_time == right.departure_time);
     REQUIRE(left.arrival_time == right.arrival_time);
     REQUIRE(left.departure_source == right.departure_source);
+    REQUIRE(left.completion == right.completion);
     REQUIRE(left.forecast_source == right.forecast_source);
     REQUIRE(left.polar_source == right.polar_source);
     REQUIRE(
@@ -299,6 +316,58 @@ void require_same_progress(
     }
 }
 
+struct SegmentObservation {
+    sailroute::RoutePoint parent;
+    sailroute::RoutePoint candidate;
+};
+
+void require_same_route_point(
+    const sailroute::RoutePoint& left,
+    const sailroute::RoutePoint& right) {
+    REQUIRE(
+        left.position.latitude_degrees ==
+        right.position.latitude_degrees);
+    REQUIRE(
+        left.position.longitude_degrees ==
+        right.position.longitude_degrees);
+    REQUIRE(left.time == right.time);
+    REQUIRE(left.heading_degrees == right.heading_degrees);
+    REQUIRE(left.boat_speed_knots == right.boat_speed_knots);
+    REQUIRE(left.true_wind_speed_knots == right.true_wind_speed_knots);
+    REQUIRE(
+        left.true_wind_direction_degrees ==
+        right.true_wind_direction_degrees);
+    REQUIRE(
+        left.cumulative_distance_nautical_miles ==
+        right.cumulative_distance_nautical_miles);
+}
+
+void require_same_segment_observations(
+    const std::vector<SegmentObservation>& left,
+    const std::vector<SegmentObservation>& right) {
+    REQUIRE(left.size() == right.size());
+    for (std::size_t index = 0U; index < left.size(); ++index) {
+        require_same_route_point(left[index].parent, right[index].parent);
+        require_same_route_point(left[index].candidate, right[index].candidate);
+    }
+}
+
+bool matches_rejected_point(
+    sailroute::Coordinate position,
+    sailroute::TimePoint time,
+    const std::vector<sailroute::RoutePoint>& rejected) {
+    return std::any_of(
+        rejected.begin(),
+        rejected.end(),
+        [position, time](const sailroute::RoutePoint& point) {
+            return point.time == time &&
+                   point.position.latitude_degrees ==
+                       position.latitude_degrees &&
+                   point.position.longitude_degrees ==
+                       position.longitude_degrees;
+        });
+}
+
 }  // namespace
 
 TEST_CASE("coordinates require finite canonical latitude and longitude") {
@@ -330,6 +399,12 @@ TEST_CASE("departure sources have stable names") {
     REQUIRE(
         sailroute::to_string(sailroute::DepartureSource::forecast_start_fallback) ==
         std::string_view{"forecast_start_fallback"});
+    REQUIRE(
+        sailroute::to_string(sailroute::RouteCompletion::destination_reached) ==
+        std::string_view{"destination_reached"});
+    REQUIRE(
+        sailroute::to_string(sailroute::RouteCompletion::forecast_exhausted) ==
+        std::string_view{"forecast_exhausted"});
 }
 
 TEST_CASE("routing defaults retain a wider configurable frontier") {
@@ -365,6 +440,7 @@ TEST_CASE("routing defaults retain a wider configurable frontier") {
     REQUIRE(!sailroute::has_payload(
         options.progress.payload,
         sailroute::RoutingProgressPayload::display_contours));
+    REQUIRE(!options.segment_eligibility);
 }
 
 TEST_CASE("routing interval schedules select and clamp elapsed-time tiers") {
@@ -481,6 +557,9 @@ TEST_CASE("parallel candidate expansion is deterministic") {
     const sailroute::RouteResult repeated = route_with_workers(router, 4U);
     const sailroute::RouteResult automatic = route_with_workers(router, 0U);
 
+    REQUIRE(
+        single.completion ==
+        sailroute::RouteCompletion::destination_reached);
     REQUIRE(single.diagnostics.expanded_nodes > single.diagnostics.time_steps);
     REQUIRE(!single.isochrones.empty());
     std::size_t captured_points = 0U;
@@ -496,6 +575,283 @@ TEST_CASE("parallel candidate expansion is deterministic") {
     require_same_route(single, parallel);
     require_same_route(parallel, repeated);
     require_same_route(single, automatic);
+}
+
+TEST_CASE("accept-all segment eligibility preserves existing routing") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+
+    const sailroute::RouteResult baseline = route_with_workers(router, 4U);
+    sailroute::RouteRequest request = routing_request(4U, true);
+    std::size_t evaluated_segments = 0U;
+    request.options.segment_eligibility =
+        [&evaluated_segments](const sailroute::RouteSegmentView&) {
+            ++evaluated_segments;
+            return true;
+        };
+    const auto constrained = router.optimize(request);
+    REQUIRE(constrained.has_value());
+    REQUIRE(
+        evaluated_segments ==
+        constrained.value().diagnostics.generated_candidates);
+    require_same_route(baseline, constrained.value());
+}
+
+TEST_CASE("rejected segments never enter retained or emitted routing state") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    sailroute::RouteRequest request = routing_request(4U, true);
+
+    std::vector<sailroute::RoutePoint> rejected;
+    request.options.segment_eligibility =
+        [&rejected](const sailroute::RouteSegmentView& segment) {
+            if (segment.candidate.heading_degrees == 180.0) {
+                rejected.push_back(segment.candidate);
+                return false;
+            }
+            return true;
+        };
+    std::vector<sailroute::RoutingProgress> progress_updates;
+    const auto result = router.optimize(
+        request,
+        [&progress_updates](const sailroute::RoutingProgress& progress) {
+            progress_updates.push_back(progress);
+        });
+    REQUIRE(result.has_value());
+    REQUIRE(!rejected.empty());
+    REQUIRE(!progress_updates.empty());
+
+    for (const sailroute::Isochrone& isochrone : result.value().isochrones) {
+        for (const sailroute::Coordinate point : isochrone.points) {
+            REQUIRE(!matches_rejected_point(
+                point,
+                isochrone.time,
+                rejected));
+        }
+    }
+    for (const sailroute::RoutingProgress& progress : progress_updates) {
+        for (const sailroute::Coordinate point : progress.isochrone.points) {
+            REQUIRE(!matches_rejected_point(
+                point,
+                progress.isochrone.time,
+                rejected));
+        }
+        for (const sailroute::RoutePoint& point : progress.provisional_route) {
+            REQUIRE(!matches_rejected_point(
+                point.position,
+                point.time,
+                rejected));
+        }
+    }
+    for (const sailroute::RoutePoint& point : result.value().points) {
+        REQUIRE(!matches_rejected_point(
+            point.position,
+            point.time,
+            rejected));
+    }
+}
+
+TEST_CASE("rejected shortened arrivals fall back to a later routing step") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    const auto departure = sailroute::parse_utc_time("2026-07-14T12:00:00Z");
+    REQUIRE(departure.has_value());
+
+    sailroute::RouteRequest request;
+    request.start = {1.0, 0.5};
+    request.destination = {1.0, 0.7};
+    request.departure_time = departure.value();
+    request.options.routing_intervals = {
+        {std::chrono::minutes{5}, std::nullopt},
+    };
+    request.options.arrival_radius_nautical_miles = 0.5;
+    request.options.spatial_bucket_nautical_miles = 3.0;
+    request.options.max_nodes_per_bucket = 3U;
+    request.options.worker_count = 4U;
+    request.options.maximum_route_duration = std::chrono::hours{12};
+    request.options.capture_isochrones = true;
+
+    std::optional<sailroute::TimePoint> rejected_step;
+    std::vector<SegmentObservation> rejected_arrivals;
+    request.options.segment_eligibility =
+        [&rejected_step, &rejected_arrivals](
+            const sailroute::RouteSegmentView& segment) {
+            const double travelled =
+                segment.candidate.cumulative_distance_nautical_miles -
+                segment.parent.cumulative_distance_nautical_miles;
+            const double full_step_distance =
+                segment.candidate.boat_speed_knots * (5.0 / 60.0);
+            const bool shortened = travelled + 1.0e-9 < full_step_distance;
+            if (!shortened) {
+                return true;
+            }
+            if (!rejected_step.has_value()) {
+                rejected_step = segment.parent.time;
+            }
+            if (segment.parent.time == *rejected_step) {
+                rejected_arrivals.push_back(
+                    SegmentObservation{segment.parent, segment.candidate});
+                return false;
+            }
+            return true;
+        };
+
+    const auto result = router.optimize(request);
+    REQUIRE(result.has_value());
+    REQUIRE(rejected_step.has_value());
+    REQUIRE(!rejected_arrivals.empty());
+    REQUIRE(result.value().arrival_time > *rejected_step + std::chrono::minutes{5});
+    for (const SegmentObservation& segment : rejected_arrivals) {
+        REQUIRE(segment.candidate.time > segment.parent.time);
+        REQUIRE(
+            segment.candidate.time <=
+            segment.parent.time + std::chrono::minutes{5});
+        REQUIRE(
+            segment.candidate.cumulative_distance_nautical_miles -
+                segment.parent.cumulative_distance_nautical_miles <
+            segment.candidate.boat_speed_knots * (5.0 / 60.0));
+        for (const sailroute::RoutePoint& point : result.value().points) {
+            REQUIRE(!matches_rejected_point(
+                point.position,
+                point.time,
+                {segment.candidate}));
+        }
+    }
+}
+
+TEST_CASE("segment eligibility observations are deterministic across workers") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+
+    const auto route_with_eligibility =
+        [&router](
+            std::size_t worker_count,
+            std::vector<SegmentObservation>& observations,
+            std::vector<sailroute::RoutingProgress>& progress_updates) {
+            sailroute::RouteRequest request =
+                routing_request(worker_count, false);
+            request.options.segment_eligibility =
+                [&observations](const sailroute::RouteSegmentView& segment) {
+                    observations.push_back(
+                        SegmentObservation{segment.parent, segment.candidate});
+                    return segment.candidate.heading_degrees != 0.0;
+                };
+            auto result = router.optimize(
+                request,
+                [&progress_updates](
+                    const sailroute::RoutingProgress& progress) {
+                    progress_updates.push_back(progress);
+                });
+            if (!result.has_value()) {
+                throw std::runtime_error(result.error().message);
+            }
+            return std::move(result.value());
+        };
+
+    std::vector<SegmentObservation> single_observations;
+    std::vector<sailroute::RoutingProgress> single_progress;
+    const sailroute::RouteResult single = route_with_eligibility(
+        1U,
+        single_observations,
+        single_progress);
+    std::vector<SegmentObservation> parallel_observations;
+    std::vector<sailroute::RoutingProgress> parallel_progress;
+    const sailroute::RouteResult parallel = route_with_eligibility(
+        4U,
+        parallel_observations,
+        parallel_progress);
+
+    REQUIRE(
+        single_observations.size() ==
+        single.diagnostics.generated_candidates);
+    REQUIRE(
+        parallel_observations.size() ==
+        parallel.diagnostics.generated_candidates);
+    require_same_segment_observations(
+        single_observations,
+        parallel_observations);
+    require_same_progress(single_progress, parallel_progress);
+    require_same_route(single, parallel);
+}
+
+TEST_CASE("segment eligibility runs on the caller thread and propagates exceptions") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    sailroute::RouteRequest request = routing_request(4U, false);
+    const std::thread::id caller_thread = std::this_thread::get_id();
+    bool wrong_thread = false;
+    std::size_t evaluated_segments = 0U;
+    request.options.segment_eligibility =
+        [caller_thread, &wrong_thread, &evaluated_segments](
+            const sailroute::RouteSegmentView&) {
+            wrong_thread =
+                wrong_thread || std::this_thread::get_id() != caller_thread;
+            ++evaluated_segments;
+            if (evaluated_segments == 10U) {
+                throw std::domain_error{"segment eligibility failure"};
+            }
+            return true;
+        };
+
+    bool caught_expected_exception = false;
+    try {
+        static_cast<void>(router.optimize(request));
+    } catch (const std::domain_error& error) {
+        caught_expected_exception =
+            std::string_view{error.what()} == "segment eligibility failure";
+    }
+    REQUIRE(caught_expected_exception);
+    REQUIRE(!wrong_thread);
+    REQUIRE(evaluated_segments == 10U);
+
+    const auto subsequent = router.optimize(routing_request(4U, false));
+    REQUIRE(subsequent.has_value());
+}
+
+TEST_CASE("segment eligibility reports all-rejected candidates distinctly") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+
+    sailroute::RouteRequest rejected_request = routing_request(4U, false);
+    std::size_t evaluated_segments = 0U;
+    rejected_request.options.segment_eligibility =
+        [&evaluated_segments](const sailroute::RouteSegmentView&) {
+            ++evaluated_segments;
+            return false;
+        };
+    const auto rejected = router.optimize(rejected_request);
+    REQUIRE(!rejected.has_value());
+    REQUIRE(rejected.error().code == sailroute::ErrorCode::no_route);
+    REQUIRE(
+        rejected.error().message ==
+        "segment eligibility rejected every candidate at routing step 1");
+    REQUIRE(evaluated_segments > 0U);
+
+    sailroute::RouteRequest no_candidates = routing_request(4U, false);
+    no_candidates.options.minimum_boat_speed_knots = 1'000.0;
+    no_candidates.options.segment_eligibility =
+        [](const sailroute::RouteSegmentView&) {
+            throw std::runtime_error{"must not be invoked"};
+            return false;
+        };
+    const auto speed_limited = router.optimize(no_candidates);
+    REQUIRE(!speed_limited.has_value());
+    REQUIRE(speed_limited.error().code == sailroute::ErrorCode::no_route);
+    REQUIRE(
+        speed_limited.error().message ==
+        "no heading met the minimum boat speed at routing step 1");
 }
 
 TEST_CASE("progress callbacks stream deterministic provisional routes and isochrones") {
@@ -565,6 +921,107 @@ TEST_CASE("progress callbacks stream deterministic provisional routes and isochr
 
     require_same_route(single, parallel);
     require_same_progress(single_progress, parallel_progress);
+}
+
+TEST_CASE("forecast exhaustion returns the best supported partial route") {
+    const RoutingGribFixture fixture{20260714, 1200, 1};
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+
+    sailroute::RouteRequest request = routing_request(1U, true);
+    std::vector<sailroute::RoutePoint> final_callback_route;
+    const auto result = router.optimize_view(
+        request,
+        [&final_callback_route](
+            const sailroute::RoutingProgressView& progress) {
+            final_callback_route.assign(
+                progress.provisional_route.begin(),
+                progress.provisional_route.end());
+        });
+
+    REQUIRE(result.has_value());
+    const sailroute::RouteResult& route = result.value();
+    REQUIRE(
+        route.completion ==
+        sailroute::RouteCompletion::forecast_exhausted);
+    REQUIRE(route.points.size() > 1U);
+    REQUIRE(route.arrival_time == route.points.back().time);
+    REQUIRE(
+        route.arrival_time ==
+        route.departure_time + std::chrono::hours{1});
+    REQUIRE(route.diagnostics.time_steps == 2U);
+    REQUIRE(route.isochrones.size() == 2U);
+    REQUIRE(route.points.size() == final_callback_route.size());
+    for (std::size_t index = 0U; index < route.points.size(); ++index) {
+        REQUIRE(
+            route.points[index].position.latitude_degrees ==
+            final_callback_route[index].position.latitude_degrees);
+        REQUIRE(
+            route.points[index].position.longitude_degrees ==
+            final_callback_route[index].position.longitude_degrees);
+        REQUIRE(route.points[index].time == final_callback_route[index].time);
+    }
+}
+
+TEST_CASE("partial route ownership is independent of callbacks and payloads") {
+    const RoutingGribFixture fixture{20260714, 1200, 1};
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+
+    sailroute::RouteRequest direct_request = routing_request(4U, false);
+    const auto direct = router.optimize(direct_request);
+    REQUIRE(direct.has_value());
+    REQUIRE(direct.value().isochrones.empty());
+
+    sailroute::RouteRequest view_request = routing_request(1U, false);
+    view_request.options.progress.every_n_steps = 100U;
+    view_request.options.progress.payload =
+        sailroute::RoutingProgressPayload::none;
+    std::size_t callback_count = 0U;
+    const auto view = router.optimize_view(
+        view_request,
+        [&callback_count](const sailroute::RoutingProgressView&) {
+            ++callback_count;
+        });
+
+    REQUIRE(view.has_value());
+    REQUIRE(callback_count == 0U);
+    REQUIRE(
+        direct.value().completion ==
+        sailroute::RouteCompletion::forecast_exhausted);
+    require_same_route(direct.value(), view.value());
+}
+
+TEST_CASE("maximum route duration remains an error at the forecast boundary") {
+    {
+        const RoutingGribFixture fixture;
+        const auto weather = sailroute::WeatherDataset::load(fixture.path());
+        REQUIRE(weather.has_value());
+        const sailroute::Router router{weather.value()};
+
+        sailroute::RouteRequest request = routing_request(1U, false);
+        request.options.maximum_route_duration = std::chrono::hours{1};
+        const auto result = router.optimize(request);
+
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == sailroute::ErrorCode::no_route);
+    }
+
+    {
+        const RoutingGribFixture fixture{20260714, 1200, 1};
+        const auto weather = sailroute::WeatherDataset::load(fixture.path());
+        REQUIRE(weather.has_value());
+        const sailroute::Router router{weather.value()};
+
+        sailroute::RouteRequest request = routing_request(1U, false);
+        request.options.maximum_route_duration = std::chrono::hours{1};
+        const auto result = router.optimize(request);
+
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == sailroute::ErrorCode::no_route);
+    }
 }
 
 TEST_CASE("progress callbacks can cancel before the second routing step") {

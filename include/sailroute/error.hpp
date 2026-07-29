@@ -23,13 +23,16 @@ enum class ErrorCode {
     cancelled,
 };
 
+/// A machine-readable error category and human-readable diagnostic.
 struct Error {
     ErrorCode code;
     std::string message;
 };
 
+/// Returns the stable snake_case name of an error category.
 std::string_view to_string(ErrorCode code) noexcept;
 
+/// Value-or-error return type used by all fallible public operations.
 template <typename T>
 class Result {
 public:
