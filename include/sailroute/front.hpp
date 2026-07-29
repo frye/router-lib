@@ -13,8 +13,12 @@ namespace sailroute {
 // The algorithm operates in a local geodesic frame centered on the frontier
 // centroid and oriented toward the destination:
 //
-//   - Only the destination-facing half (points with positive along-track
-//     projection onto the destination bearing) is considered.
+//   - The destination-facing half-space filter keeps points whose along-track
+//     projection onto the destination bearing is non-negative (>= 0).  A
+//     point at the centroid itself (distance zero, along-track == 0) is
+//     therefore retained.  If no point has a strictly positive along-track
+//     value (i.e. the destination lies behind the entire frontier), all points
+//     are retained and the per-band selection picks the least-behind one.
 //   - Points are assigned to cross-track bands of width
 //     band_width_nautical_miles.  The point with the greatest along-track
 //     progress (i.e. closest to the destination along the forward axis) is

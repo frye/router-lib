@@ -66,18 +66,17 @@ TEST_CASE("destination front single point is returned as-is") {
 
 // ── Leading edge: only destination-facing points are selected ─────────────────
 //
-// Frontier: five points spread north-south at the same latitude east of
+// Frontier: five points spread east-west at the same latitude, east of
 // the destination.  The destination is due west so the forward axis is
-// westward.  The two easternmost points (furthest from destination) should
-// be dropped by the half-space / band-best filter; only the westernmost
-// (leading) points are retained.
+// westward.  All five points share the same latitude (cross-track == 0),
+// so they all fall in band 0.  The per-band winner is the one with the
+// greatest along-track progress — i.e. the closest to the destination,
+// which is lon = 2.
 //
 // Layout (longitude increases eastward):
 //   destination at (0, 0)
 //   frontier at lon = 2, 4, 6, 8, 10  (all same lat = 0)
-//   Points at lon = 2 and 4 are in the destination-facing half; 6, 8, 10
-//   are further away.  Each falls in its own cross-track band (all on the
-//   same latitude, so cross-track == 0 → all in band 0).
+//   All points lie on the same latitude → cross-track = 0 → all in band 0.
 //   Per-band best = the one closest to the destination = lon 2.
 TEST_CASE("destination front selects leading-edge point per band") {
     // Five collinear points on same latitude, destination at lat=0,lon=0.

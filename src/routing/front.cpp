@@ -29,7 +29,9 @@ double centroid_longitude(std::span<const Coordinate> points) noexcept {
         sum_sin += std::sin(lon_rad);
     }
     if (sum_cos == 0.0 && sum_sin == 0.0) {
-        return points.front().longitude_degrees;
+        // Unit vectors cancelled exactly (e.g. antipodal symmetric inputs).
+        // Return 0.0 — deterministic and independent of input order.
+        return 0.0;
     }
     return std::atan2(sum_sin, sum_cos) * 180.0 / std::numbers::pi;
 }
