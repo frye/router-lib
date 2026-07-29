@@ -21,6 +21,11 @@ An explicit departure outside forecast coverage is rejected. If departure is
 omitted, the library uses current UTC time when it can be interpolated from the
 forecast, otherwise it uses the forecast's first valid time.
 
+If forecast coverage ends before the destination is reached, routing succeeds
+with the best forecast-supported partial route and
+`RouteCompletion::forecast_exhausted`. Other incomplete searches, including
+maximum-duration exhaustion, remain routing errors.
+
 ## macOS build
 
 Install CMake and ecCodes, then configure and build:
@@ -58,7 +63,9 @@ resolution controls. Isochrone output is optional and contains the retained
 post-pruning search frontier at each completed routing time step. The JSON
 output is a GeoJSON `FeatureCollection` of `LineString` or `MultiLineString`
 contours; the GPX output contains one track per frontier and one track segment
-per contour component.
+per contour component. When the forecast is exhausted, the CLI writes the
+partial route and emits a warning on standard error. Route JSON and GPX include
+the completion status so downstream consumers can distinguish partial output.
 
 The router retains up to 10 nodes per spatial bucket by default. Increase
 `--max-nodes-per-bucket` to preserve a larger set of alternate paths, or reduce
@@ -116,6 +123,10 @@ auto result = router.optimize(
         updates.push_back(progress);
         return sailroute::RoutingProgressDecision::continue_routing;
     });
+if (result.value().completion ==
+    sailroute::RouteCompletion::forecast_exhausted) {
+    present_partial_route_warning();
+}
 auto isochrones_json = sailroute::isochrones_to_json(result.value());
 auto isochrones_gpx = sailroute::isochrones_to_gpx(result.value());
 ```
@@ -123,7 +134,11 @@ auto isochrones_gpx = sailroute::isochrones_to_gpx(result.value());
 Loaded weather and polar objects are immutable and reusable across route
 requests, avoiding repeated GRIB decoding and polar preprocessing. Isochrone
 capture is disabled by default so route-only callers do not retain the full
-search frontier history.
+search frontier history. A successful `RouteResult` has completion
+`destination_reached` or `forecast_exhausted`. For a forecast-exhausted result,
+`points` owns the best route through the final supported frontier,
+`arrival_time` is the final point's time, and diagnostics and requested
+isochrones cover all completed routing steps.
 
 ### Route segment eligibility contract
 
@@ -194,7 +209,9 @@ only whether isochrones are retained in the final `RouteResult`. Validation
 failures and requests already within the arrival radius produce no progress
 updates. The callback reports intermediate frontiers only: the consuming
 application must still inspect the `Result<RouteResult>` returned by `optimize`
-for the final route or routing error.
+for the final complete or forecast-exhausted route, or for a routing error.
+Partial-route ownership does not depend on installing a callback, callback
+cadence, or callback payload selection.
 
 For allocation-sensitive consumers, `Router::optimize_view` exposes the same
 notification and cancellation forms with callback-scoped spans:

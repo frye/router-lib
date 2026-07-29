@@ -119,6 +119,11 @@ struct RouteSegmentView {
 using RouteSegmentEligibilityCallback =
     std::function<bool(const RouteSegmentView&)>;
 
+enum class RouteCompletion {
+    destination_reached,
+    forecast_exhausted,
+};
+
 struct RoutingOptions {
     std::chrono::minutes time_step{30};
     double heading_step_degrees{10.0};
@@ -176,6 +181,7 @@ struct RoutingProgressView {
 
 struct RouteResult {
     TimePoint departure_time;
+    // For partial results, this is the time of the final forecast-supported point.
     TimePoint arrival_time;
     DepartureSource departure_source;
     std::string forecast_source;
@@ -183,9 +189,11 @@ struct RouteResult {
     std::vector<RoutePoint> points;
     std::vector<Isochrone> isochrones;
     RouteDiagnostics diagnostics;
+    RouteCompletion completion{RouteCompletion::destination_reached};
 };
 
 [[nodiscard]] bool is_valid(Coordinate coordinate) noexcept;
 std::string_view to_string(DepartureSource source) noexcept;
+std::string_view to_string(RouteCompletion completion) noexcept;
 
 }  // namespace sailroute
