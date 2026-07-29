@@ -1154,6 +1154,7 @@ TEST_CASE("progress views preserve callback-scoped data through explicit copies"
                 std::vector<sailroute::RoutePoint>{
                     progress.provisional_route.begin(),
                     progress.provisional_route.end()},
+                sailroute::IsochroneFront{},
                 progress.diagnostics});
         });
     REQUIRE(result.has_value());

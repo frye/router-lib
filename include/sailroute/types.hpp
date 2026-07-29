@@ -65,12 +65,36 @@ struct DisplayContourView {
     std::span<const DisplayContourSegment> segments;
 };
 
+// A contiguous segment of the destination-facing isochrone front. Points are
+// ordered port-to-starboard (left to right relative to the destination bearing).
+// Segments are open (not closed); the first and last point are not implicitly
+// connected.
+struct IsochroneFrontSegment {
+    std::size_t point_offset{};
+    std::size_t point_count{};
+};
+
+// Owning result produced by build_destination_front.
+struct IsochroneFront {
+    std::vector<Coordinate> points;
+    std::vector<IsochroneFrontSegment> segments;
+};
+
+// Span-based, callback-lifetime view of a destination front delivered via
+// RoutingProgressView. Spans are valid only for the synchronous callback
+// invocation; copy before retaining or crossing threads.
+struct IsochroneFrontView {
+    std::span<const Coordinate> points;
+    std::span<const IsochroneFrontSegment> segments;
+};
+
 /// Bit flags selecting data populated in RoutingProgressView.
 enum class RoutingProgressPayload : std::uint8_t {
     none = 0U,
     retained_points = 1U << 0U,
     provisional_route = 1U << 1U,
     display_contours = 1U << 2U,
+    destination_front = 1U << 3U,
 };
 
 constexpr RoutingProgressPayload operator|(
@@ -188,6 +212,7 @@ struct Isochrone {
 struct RoutingProgress {
     Isochrone isochrone;
     std::vector<RoutePoint> provisional_route;
+    IsochroneFront destination_front;
     RouteDiagnostics diagnostics;
 };
 
@@ -197,6 +222,7 @@ struct RoutingProgressView {
     std::span<const Coordinate> retained_points;
     std::span<const RoutePoint> provisional_route;
     DisplayContourView display_contours;
+    IsochroneFrontView destination_front;
     RouteDiagnostics diagnostics;
 };
 
