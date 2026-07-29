@@ -2,6 +2,7 @@
 
 #include "sailroute/contours.hpp"
 #include "sailroute/error.hpp"
+#include "sailroute/front.hpp"
 #include "sailroute/polar.hpp"
 #include "sailroute/router.hpp"
 #include "sailroute/serialization.hpp"

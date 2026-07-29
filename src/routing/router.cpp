@@ -1,6 +1,7 @@
 #include "sailroute/router.hpp"
 
 #include "routing/contours.hpp"
+#include "routing/front.hpp"
 #include "routing/geodesy.hpp"
 #include "routing/intervals.hpp"
 
@@ -142,7 +143,8 @@ std::optional<Error> validate_request(const RouteRequest& request) {
     constexpr std::uint8_t known_payloads =
         static_cast<std::uint8_t>(RoutingProgressPayload::retained_points) |
         static_cast<std::uint8_t>(RoutingProgressPayload::provisional_route) |
-        static_cast<std::uint8_t>(RoutingProgressPayload::display_contours);
+        static_cast<std::uint8_t>(RoutingProgressPayload::display_contours) |
+        static_cast<std::uint8_t>(RoutingProgressPayload::destination_front);
     if ((static_cast<std::uint8_t>(options.progress.payload) &
          static_cast<std::uint8_t>(~known_payloads)) != 0U) {
         return Error{
@@ -696,6 +698,8 @@ struct ProgressScratch {
     std::vector<RoutePoint> provisional_route;
     std::vector<Coordinate> contour_points;
     std::vector<DisplayContourSegment> contour_segments;
+    std::vector<Coordinate> front_points;
+    std::vector<IsochroneFrontSegment> front_segments;
 };
 
 void capture_retained_points(
@@ -779,6 +783,13 @@ Result<RouteResult> Router::optimize_controlled(
                 std::vector<RoutePoint>{
                     view.provisional_route.begin(),
                     view.provisional_route.end()},
+                IsochroneFront{
+                    std::vector<Coordinate>{
+                        view.destination_front.points.begin(),
+                        view.destination_front.points.end()},
+                    std::vector<IsochroneFrontSegment>{
+                        view.destination_front.segments.begin(),
+                        view.destination_front.segments.end()}},
                 view.diagnostics};
             return on_progress(progress);
         });
@@ -1040,7 +1051,10 @@ Result<RouteResult> Router::optimize_view_controlled(
                     RoutingProgressPayload::retained_points) ||
                 has_payload(
                     payload,
-                    RoutingProgressPayload::display_contours);
+                    RoutingProgressPayload::display_contours) ||
+                has_payload(
+                    payload,
+                    RoutingProgressPayload::destination_front);
             if (needs_retained_points) {
                 capture_retained_points(
                     nodes,
@@ -1074,6 +1088,22 @@ Result<RouteResult> Router::optimize_view_controlled(
                 progress_scratch.contour_points.clear();
                 progress_scratch.contour_segments.clear();
             }
+            if (has_payload(
+                    payload,
+                    RoutingProgressPayload::destination_front)) {
+                if (const auto error = detail::build_destination_front_into(
+                        progress_scratch.retained_points,
+                        request.destination,
+                        request.options.spatial_bucket_nautical_miles,
+                        progress_scratch.front_points,
+                        progress_scratch.front_segments);
+                    error.has_value()) {
+                    return *error;
+                }
+            } else {
+                progress_scratch.front_points.clear();
+                progress_scratch.front_segments.clear();
+            }
 
             const RoutingProgressView progress{
                 nodes[frontier.front()].point.time,
@@ -1087,6 +1117,9 @@ Result<RouteResult> Router::optimize_view_controlled(
                 DisplayContourView{
                     progress_scratch.contour_points,
                     progress_scratch.contour_segments},
+                IsochroneFrontView{
+                    progress_scratch.front_points,
+                    progress_scratch.front_segments},
                 diagnostics};
             const RoutingProgressDecision decision = on_progress(progress);
             if (decision == RoutingProgressDecision::cancel) {
