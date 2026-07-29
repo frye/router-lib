@@ -141,8 +141,9 @@ struct RoutingOptions {
         {std::chrono::minutes{180}, std::nullopt},
     };
     RoutingProgressOptions progress;
-    // Invoked synchronously before retention. The view is valid only for the
-    // callback; true accepts the segment and false rejects it.
+    // Empty accepts every segment without invocation. Otherwise called
+    // synchronously before retention; true accepts and false rejects.
+    // The view is valid only for the callback.
     RouteSegmentEligibilityCallback segment_eligibility;
 };
 
