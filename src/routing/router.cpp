@@ -679,6 +679,28 @@ std::vector<RoutePoint> reconstruct_route(
     return route;
 }
 
+RouteResult make_route_result(
+    TimePoint departure,
+    DepartureSource departure_source,
+    RouteCompletion completion,
+    const std::string& forecast_source,
+    const std::string& polar_source,
+    std::vector<RoutePoint> points,
+    std::vector<Isochrone> isochrones,
+    const RouteDiagnostics& diagnostics) {
+    RouteResult result;
+    result.departure_time = departure;
+    result.arrival_time = points.back().time;
+    result.departure_source = departure_source;
+    result.completion = completion;
+    result.forecast_source = forecast_source;
+    result.polar_source = polar_source;
+    result.points = std::move(points);
+    result.isochrones = std::move(isochrones);
+    result.diagnostics = diagnostics;
+    return result;
+}
+
 Isochrone capture_isochrone(
     const std::vector<SearchNode>& nodes,
     const std::vector<NodeIndex>& frontier) {
@@ -709,17 +731,10 @@ void capture_retained_points(
     }
 }
 
-Error exhausted_error(
-    bool forecast_limited,
-    const RouteDiagnostics& diagnostics) {
+Error route_duration_exhausted_error(const RouteDiagnostics& diagnostics) {
     const std::string suffix =
         " after " + std::to_string(diagnostics.time_steps) + " time steps and " +
         std::to_string(diagnostics.expanded_nodes) + " expanded nodes";
-    if (forecast_limited) {
-        return Error{
-            ErrorCode::forecast_exhausted,
-            "forecast coverage ended before the destination was reached" + suffix};
-    }
     return Error{
         ErrorCode::no_route,
         "maximum route duration ended before the destination was reached" + suffix};
@@ -847,15 +862,15 @@ Result<RouteResult> Router::optimize_view_controlled(
     if (detail::great_circle_distance_nautical_miles(
             request.start,
             request.destination) <= request.options.arrival_radius_nautical_miles) {
-        RouteResult result;
-        result.departure_time = departure;
-        result.arrival_time = departure;
-        result.departure_source = departure_source;
-        result.forecast_source = metadata.source;
-        result.polar_source = polar_.source();
-        result.points.push_back(nodes.front().point);
-        result.diagnostics = diagnostics;
-        return result;
+        return make_route_result(
+            departure,
+            departure_source,
+            RouteCompletion::destination_reached,
+            metadata.source,
+            polar_.source(),
+            std::vector<RoutePoint>{nodes.front().point},
+            {},
+            diagnostics);
     }
 
     std::vector<NodeIndex> frontier{0U};
@@ -865,17 +880,32 @@ Result<RouteResult> Router::optimize_view_controlled(
 
     const TimePoint horizon_end = departure + request.options.maximum_route_duration;
     const TimePoint route_end = std::min(horizon_end, metadata.last_valid_time);
-    const bool forecast_limited = metadata.last_valid_time <= horizon_end;
+    const bool forecast_limited = metadata.last_valid_time < horizon_end;
     const std::size_t heading_count = static_cast<std::size_t>(
         std::ceil(360.0 / request.options.heading_step_degrees));
     ExpansionBuffer single_worker_buffer;
     CandidateExpansionWorkers expansion_workers{weather_, polar_, request};
     ProgressScratch progress_scratch;
+    NodeIndex best_route_end = 0U;
+    auto finish_without_arrival = [&]() -> Result<RouteResult> {
+        if (!forecast_limited) {
+            return route_duration_exhausted_error(diagnostics);
+        }
+        return make_route_result(
+            departure,
+            departure_source,
+            RouteCompletion::forecast_exhausted,
+            metadata.source,
+            polar_.source(),
+            reconstruct_route(nodes, best_route_end),
+            std::move(isochrones),
+            diagnostics);
+    };
 
     while (!frontier.empty()) {
         const TimePoint current_time = nodes[frontier.front()].point.time;
         if (current_time >= route_end) {
-            return exhausted_error(forecast_limited, diagnostics);
+            return finish_without_arrival();
         }
         const auto remaining =
             std::chrono::duration_cast<std::chrono::seconds>(route_end - current_time);
@@ -885,7 +915,7 @@ Result<RouteResult> Router::optimize_view_controlled(
         const auto step =
             detail::routing_step(request.options, elapsed, remaining);
         if (step <= std::chrono::seconds::zero()) {
-            return exhausted_error(forecast_limited, diagnostics);
+            return finish_without_arrival();
         }
 
         ++diagnostics.time_steps;
@@ -983,16 +1013,15 @@ Result<RouteResult> Router::optimize_view_controlled(
                 std::move(best_arrival->candidate.point),
                 best_arrival->candidate.parent});
             ++diagnostics.retained_candidates;
-            RouteResult result;
-            result.departure_time = departure;
-            result.arrival_time = nodes.back().point.time;
-            result.departure_source = departure_source;
-            result.forecast_source = metadata.source;
-            result.polar_source = polar_.source();
-            result.points = reconstruct_route(nodes, nodes.size() - 1U);
-            result.isochrones = std::move(isochrones);
-            result.diagnostics = diagnostics;
-            return result;
+            return make_route_result(
+                departure,
+                departure_source,
+                RouteCompletion::destination_reached,
+                metadata.source,
+                polar_.source(),
+                reconstruct_route(nodes, nodes.size() - 1U),
+                std::move(isochrones),
+                diagnostics);
         }
 
         if (candidates.empty()) {
@@ -1023,6 +1052,7 @@ Result<RouteResult> Router::optimize_view_controlled(
         }
         diagnostics.retained_candidates += retained.size();
         frontier.swap(next_frontier);
+        best_route_end = provisional_route_end;
         const bool deliver_progress =
             on_progress &&
             diagnostics.time_steps %

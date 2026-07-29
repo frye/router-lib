@@ -49,6 +49,14 @@ std::string_view to_string(DepartureSource source) noexcept {
     return "unknown";
 }
 
+std::string_view to_string(RouteCompletion completion) noexcept {
+    switch (completion) {
+        case RouteCompletion::destination_reached: return "destination_reached";
+        case RouteCompletion::forecast_exhausted: return "forecast_exhausted";
+    }
+    return "unknown";
+}
+
 namespace detail {
 
 double normalize_degrees(double degrees) noexcept {

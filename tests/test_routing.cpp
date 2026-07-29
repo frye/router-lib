@@ -30,7 +30,10 @@ void require_codes(int status, const char* operation) {
 
 class RoutingGribFixture {
 public:
-    explicit RoutingGribFixture(long data_date = 20260714, long data_time = 1200)
+    explicit RoutingGribFixture(
+        long data_date = 20260714,
+        long data_time = 1200,
+        long final_forecast_hour = 12)
         : path_(
               std::filesystem::current_path() /
               ("sailroute-routing-" +
@@ -39,8 +42,20 @@ public:
                ".grib")) {
         write_message("10u", 0, 0.0, data_date, data_time, "w");
         write_message("10v", 0, -10.0, data_date, data_time, "a");
-        write_message("10u", 12, 0.0, data_date, data_time, "a");
-        write_message("10v", 12, -10.0, data_date, data_time, "a");
+        write_message(
+            "10u",
+            final_forecast_hour,
+            0.0,
+            data_date,
+            data_time,
+            "a");
+        write_message(
+            "10v",
+            final_forecast_hour,
+            -10.0,
+            data_date,
+            data_time,
+            "a");
     }
 
     ~RoutingGribFixture() {
@@ -180,6 +195,7 @@ void require_same_route(
     REQUIRE(left.departure_time == right.departure_time);
     REQUIRE(left.arrival_time == right.arrival_time);
     REQUIRE(left.departure_source == right.departure_source);
+    REQUIRE(left.completion == right.completion);
     REQUIRE(left.forecast_source == right.forecast_source);
     REQUIRE(left.polar_source == right.polar_source);
     REQUIRE(
@@ -330,6 +346,12 @@ TEST_CASE("departure sources have stable names") {
     REQUIRE(
         sailroute::to_string(sailroute::DepartureSource::forecast_start_fallback) ==
         std::string_view{"forecast_start_fallback"});
+    REQUIRE(
+        sailroute::to_string(sailroute::RouteCompletion::destination_reached) ==
+        std::string_view{"destination_reached"});
+    REQUIRE(
+        sailroute::to_string(sailroute::RouteCompletion::forecast_exhausted) ==
+        std::string_view{"forecast_exhausted"});
 }
 
 TEST_CASE("routing defaults retain a wider configurable frontier") {
@@ -481,6 +503,9 @@ TEST_CASE("parallel candidate expansion is deterministic") {
     const sailroute::RouteResult repeated = route_with_workers(router, 4U);
     const sailroute::RouteResult automatic = route_with_workers(router, 0U);
 
+    REQUIRE(
+        single.completion ==
+        sailroute::RouteCompletion::destination_reached);
     REQUIRE(single.diagnostics.expanded_nodes > single.diagnostics.time_steps);
     REQUIRE(!single.isochrones.empty());
     std::size_t captured_points = 0U;
@@ -565,6 +590,107 @@ TEST_CASE("progress callbacks stream deterministic provisional routes and isochr
 
     require_same_route(single, parallel);
     require_same_progress(single_progress, parallel_progress);
+}
+
+TEST_CASE("forecast exhaustion returns the best supported partial route") {
+    const RoutingGribFixture fixture{20260714, 1200, 1};
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+
+    sailroute::RouteRequest request = routing_request(1U, true);
+    std::vector<sailroute::RoutePoint> final_callback_route;
+    const auto result = router.optimize_view(
+        request,
+        [&final_callback_route](
+            const sailroute::RoutingProgressView& progress) {
+            final_callback_route.assign(
+                progress.provisional_route.begin(),
+                progress.provisional_route.end());
+        });
+
+    REQUIRE(result.has_value());
+    const sailroute::RouteResult& route = result.value();
+    REQUIRE(
+        route.completion ==
+        sailroute::RouteCompletion::forecast_exhausted);
+    REQUIRE(route.points.size() > 1U);
+    REQUIRE(route.arrival_time == route.points.back().time);
+    REQUIRE(
+        route.arrival_time ==
+        route.departure_time + std::chrono::hours{1});
+    REQUIRE(route.diagnostics.time_steps == 2U);
+    REQUIRE(route.isochrones.size() == 2U);
+    REQUIRE(route.points.size() == final_callback_route.size());
+    for (std::size_t index = 0U; index < route.points.size(); ++index) {
+        REQUIRE(
+            route.points[index].position.latitude_degrees ==
+            final_callback_route[index].position.latitude_degrees);
+        REQUIRE(
+            route.points[index].position.longitude_degrees ==
+            final_callback_route[index].position.longitude_degrees);
+        REQUIRE(route.points[index].time == final_callback_route[index].time);
+    }
+}
+
+TEST_CASE("partial route ownership is independent of callbacks and payloads") {
+    const RoutingGribFixture fixture{20260714, 1200, 1};
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+
+    sailroute::RouteRequest direct_request = routing_request(4U, false);
+    const auto direct = router.optimize(direct_request);
+    REQUIRE(direct.has_value());
+    REQUIRE(direct.value().isochrones.empty());
+
+    sailroute::RouteRequest view_request = routing_request(1U, false);
+    view_request.options.progress.every_n_steps = 100U;
+    view_request.options.progress.payload =
+        sailroute::RoutingProgressPayload::none;
+    std::size_t callback_count = 0U;
+    const auto view = router.optimize_view(
+        view_request,
+        [&callback_count](const sailroute::RoutingProgressView&) {
+            ++callback_count;
+        });
+
+    REQUIRE(view.has_value());
+    REQUIRE(callback_count == 0U);
+    REQUIRE(
+        direct.value().completion ==
+        sailroute::RouteCompletion::forecast_exhausted);
+    require_same_route(direct.value(), view.value());
+}
+
+TEST_CASE("maximum route duration remains an error at the forecast boundary") {
+    {
+        const RoutingGribFixture fixture;
+        const auto weather = sailroute::WeatherDataset::load(fixture.path());
+        REQUIRE(weather.has_value());
+        const sailroute::Router router{weather.value()};
+
+        sailroute::RouteRequest request = routing_request(1U, false);
+        request.options.maximum_route_duration = std::chrono::hours{1};
+        const auto result = router.optimize(request);
+
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == sailroute::ErrorCode::no_route);
+    }
+
+    {
+        const RoutingGribFixture fixture{20260714, 1200, 1};
+        const auto weather = sailroute::WeatherDataset::load(fixture.path());
+        REQUIRE(weather.has_value());
+        const sailroute::Router router{weather.value()};
+
+        sailroute::RouteRequest request = routing_request(1U, false);
+        request.options.maximum_route_duration = std::chrono::hours{1};
+        const auto result = router.optimize(request);
+
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == sailroute::ErrorCode::no_route);
+    }
 }
 
 TEST_CASE("progress callbacks can cancel before the second routing step") {
