@@ -65,6 +65,9 @@ sailroute::RouteResult sample_route() {
 TEST_CASE("JSON serialization escapes metadata and includes route points") {
     const auto serialized = sailroute::route_to_json(sample_route());
     REQUIRE(serialized.has_value());
+    REQUIRE(
+        serialized.value().find("\"completion\":\"destination_reached\"") !=
+        std::string::npos);
     REQUIRE(serialized.value().find("forecast \\\"A\\\" & B") != std::string::npos);
     REQUIRE(serialized.value().find("\"points\":[") != std::string::npos);
     REQUIRE(serialized.value().find("\"expandedNodes\":10") != std::string::npos);
@@ -82,6 +85,28 @@ TEST_CASE("GPX serialization escapes XML and emits timestamped track points") {
         std::string::npos);
     REQUIRE(serialized.value().find("e-") == std::string::npos);
     REQUIRE(serialized.value().find("<time>") != std::string::npos);
+    REQUIRE(
+        serialized.value().find(
+            "<sailroute:completion>destination_reached"
+            "</sailroute:completion>") != std::string::npos);
+}
+
+TEST_CASE("route serialization identifies forecast-exhausted partial results") {
+    auto route = sample_route();
+    route.completion = sailroute::RouteCompletion::forecast_exhausted;
+
+    const auto json = sailroute::route_to_json(route);
+    REQUIRE(json.has_value());
+    REQUIRE(
+        json.value().find("\"completion\":\"forecast_exhausted\"") !=
+        std::string::npos);
+
+    const auto gpx = sailroute::route_to_gpx(route);
+    REQUIRE(gpx.has_value());
+    REQUIRE(
+        gpx.value().find(
+            "<sailroute:completion>forecast_exhausted"
+            "</sailroute:completion>") != std::string::npos);
 }
 
 TEST_CASE("isochrones serialize as timestamped GeoJSON lines") {

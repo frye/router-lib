@@ -659,6 +659,13 @@ int run(const CliOptions& options) {
     if (!route) {
         return report_error("routing", route.error(), exit_routing);
     }
+    if (route.value().completion ==
+        sailroute::RouteCompletion::forecast_exhausted) {
+        std::cerr
+            << "sailroute: warning: forecast coverage ended before the "
+               "destination was reached; writing the best supported partial "
+               "route\n";
+    }
 
     auto json = sailroute::route_to_json(route.value());
     if (!json) {
