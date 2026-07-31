@@ -58,7 +58,7 @@ cmake --install build --prefix "$PWD/install"
 Point a consuming project at that prefix, then link the exported target:
 
 ```cmake
-find_package(sailroute 0.1 CONFIG REQUIRED)
+find_package(sailroute 0.2 CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE sailroute::sailroute)
 ```
 
