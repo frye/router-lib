@@ -83,6 +83,8 @@ struct FrontPoint {
     Coordinate position;
     double along_track{};
     double cross_track{};
+    double bearing_delta{};
+    bool at_centroid{};
     std::int64_t band{};
 };
 
@@ -92,6 +94,7 @@ std::optional<Error> build_destination_front_into(
     std::span<const Coordinate> retained_points,
     Coordinate destination,
     double band_width_nautical_miles,
+    const DestinationFrontOptions& options,
     std::vector<Coordinate>& front_points,
     std::vector<IsochroneFrontSegment>& segments) {
     front_points.clear();
@@ -106,6 +109,13 @@ std::optional<Error> build_destination_front_into(
         return Error{
             ErrorCode::invalid_argument,
             "band_width_nautical_miles must be finite and positive"};
+    }
+    if (!std::isfinite(options.half_angle_degrees) ||
+        options.half_angle_degrees <= 0.0 ||
+        options.half_angle_degrees > 180.0) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "destination front half_angle_degrees must be finite and in (0, 180]"};
     }
 
     for (const Coordinate& p : retained_points) {
@@ -142,31 +152,46 @@ std::optional<Error> build_destination_front_into(
         }
         const double at = along_track_component(bearing, forward_bearing, dist);
         const double ct = signed_cross_track(bearing, forward_bearing, dist);
-        projected.push_back(FrontPoint{p, at, ct, band_index(ct, band_width_nautical_miles)});
+        projected.push_back(FrontPoint{
+            p,
+            at,
+            ct,
+            angular_difference_degrees(bearing, forward_bearing),
+            dist == 0.0,
+            band_index(ct, band_width_nautical_miles)});
     }
 
-    // ── Half-space filter: keep only destination-facing points ─────────────
-    // Points with along_track <= 0 are behind or on the midpoint perpendicular.
-    // Keep >= 0 so a point exactly at the centroid (dist == 0) is retained.
-    // Special case: if ALL points have along_track <= 0 (destination is behind
-    // the whole frontier), retain the best-progress point anyway to avoid
-    // producing an empty front from a valid frontier.
+    // ── Aperture filter: keep only destination-facing points ────────────────
+    // Include exact angular boundaries and the centroid. If no non-centroid
+    // point is strictly inside the aperture, preserve the original fallback by
+    // retaining all points.
     {
-        const bool any_forward = std::any_of(
+        // Absorb only projection-scale roundoff at an inclusive boundary.
+        const double boundary_tolerance =
+            32.0 * std::numeric_limits<double>::epsilon() *
+            options.half_angle_degrees;
+        const bool any_inside = std::any_of(
             projected.begin(),
             projected.end(),
-            [](const FrontPoint& fp) { return fp.along_track > 0.0; });
+            [&options](const FrontPoint& fp) {
+                return !fp.at_centroid &&
+                       fp.bearing_delta < options.half_angle_degrees;
+            });
 
-        if (any_forward) {
+        if (any_inside) {
             projected.erase(
                 std::remove_if(
                     projected.begin(),
                     projected.end(),
-                    [](const FrontPoint& fp) { return fp.along_track < 0.0; }),
+                    [&options, boundary_tolerance](const FrontPoint& fp) {
+                        return !fp.at_centroid &&
+                               fp.bearing_delta >
+                                   options.half_angle_degrees +
+                                       boundary_tolerance;
+                    }),
                 projected.end());
         }
-        // If !any_forward we keep all points and let the per-band selection
-        // pick the least-bad ones.
+        // If !any_inside, per-band selection chooses the best available points.
     }
 
     if (projected.empty()) {
@@ -292,11 +317,24 @@ Result<IsochroneFront> build_destination_front(
     std::span<const Coordinate> retained_points,
     Coordinate destination,
     double band_width_nautical_miles) {
+    return build_destination_front(
+        retained_points,
+        destination,
+        band_width_nautical_miles,
+        DestinationFrontOptions{});
+}
+
+Result<IsochroneFront> build_destination_front(
+    std::span<const Coordinate> retained_points,
+    Coordinate destination,
+    double band_width_nautical_miles,
+    const DestinationFrontOptions& options) {
     IsochroneFront result;
     if (auto error = detail::build_destination_front_into(
             retained_points,
             destination,
             band_width_nautical_miles,
+            options,
             result.points,
             result.segments);
         error.has_value()) {

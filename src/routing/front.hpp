@@ -15,6 +15,7 @@ namespace sailroute::detail {
     std::span<const Coordinate> retained_points,
     Coordinate destination,
     double band_width_nautical_miles,
+    const DestinationFrontOptions& options,
     std::vector<Coordinate>& front_points,
     std::vector<IsochroneFrontSegment>& segments);
 

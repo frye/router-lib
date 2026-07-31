@@ -1,9 +1,12 @@
 #include "sailroute/front.hpp"
 
+#include "../src/routing/geodesy.hpp"
 #include "test_support.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -36,6 +39,41 @@ void require_same_front(
         REQUIRE(left.segments[i].point_offset == right.segments[i].point_offset);
         REQUIRE(left.segments[i].point_count == right.segments[i].point_count);
     }
+}
+
+bool contains_coordinate(
+    const sailroute::IsochroneFront& front,
+    sailroute::Coordinate expected) {
+    return std::any_of(
+        front.points.begin(),
+        front.points.end(),
+        [expected](const sailroute::Coordinate& point) {
+            return point.latitude_degrees == expected.latitude_degrees &&
+                   point.longitude_degrees == expected.longitude_degrees;
+        });
+}
+
+std::vector<sailroute::Coordinate> angular_frontier(
+    double outer_bearing_degrees) {
+    const sailroute::Coordinate centroid{0.0, 0.0};
+    const sailroute::Coordinate outer_starboard =
+        sailroute::detail::destination_point(
+            centroid, outer_bearing_degrees, 180.0);
+    const sailroute::Coordinate outer_port =
+        sailroute::detail::destination_point(
+            centroid, 360.0 - outer_bearing_degrees, 180.0);
+
+    // Symmetric longitudes and the compensating north point keep the computed
+    // frontier centroid at the origin.
+    return {
+        outer_port,
+        sailroute::detail::destination_point(centroid, 270.0, 120.0),
+        sailroute::detail::destination_point(centroid, 270.0, 60.0),
+        {-2.0 * outer_starboard.latitude_degrees, 0.0},
+        sailroute::detail::destination_point(centroid, 90.0, 60.0),
+        sailroute::detail::destination_point(centroid, 90.0, 120.0),
+        outer_starboard,
+    };
 }
 
 // ── Empty / degenerate ────────────────────────────────────────────────────────
@@ -187,6 +225,150 @@ TEST_CASE("destination front is input-order deterministic") {
     require_same_front(forward.value(), backward.value());
 }
 
+TEST_CASE("destination front default options preserve the three-argument result") {
+    const sailroute::Coordinate destination{10.0, 0.0};
+    const std::vector<sailroute::Coordinate> points = angular_frontier(120.0);
+
+    const auto legacy =
+        sailroute::build_destination_front(points, destination, 61.0);
+    const auto configured = sailroute::build_destination_front(
+        points,
+        destination,
+        61.0,
+        sailroute::DestinationFrontOptions{});
+
+    REQUIRE(legacy.has_value());
+    REQUIRE(configured.has_value());
+    require_same_front(legacy.value(), configured.value());
+}
+
+TEST_CASE("destination front configurable aperture includes exact 120 boundaries") {
+    const sailroute::Coordinate destination{10.0, 0.0};
+    const std::vector<sailroute::Coordinate> points = angular_frontier(120.0);
+    const sailroute::Coordinate outer_port = points.front();
+    const sailroute::Coordinate outer_starboard = points.back();
+
+    auto default_front =
+        sailroute::build_destination_front(points, destination, 61.0);
+    auto wide_front = sailroute::build_destination_front(
+        points,
+        destination,
+        61.0,
+        sailroute::DestinationFrontOptions{120.0});
+
+    REQUIRE(default_front.has_value());
+    REQUIRE(wide_front.has_value());
+    REQUIRE(!contains_coordinate(default_front.value(), outer_port));
+    REQUIRE(!contains_coordinate(default_front.value(), outer_starboard));
+    REQUIRE(contains_coordinate(wide_front.value(), outer_port));
+    REQUIRE(contains_coordinate(wide_front.value(), outer_starboard));
+}
+
+TEST_CASE("destination front configurable aperture excludes points outside 120") {
+    const sailroute::Coordinate destination{10.0, 0.0};
+    const std::vector<sailroute::Coordinate> points = angular_frontier(121.0);
+
+    const auto result = sailroute::build_destination_front(
+        points,
+        destination,
+        61.0,
+        sailroute::DestinationFrontOptions{120.0});
+
+    REQUIRE(result.has_value());
+    REQUIRE(!contains_coordinate(result.value(), points.front()));
+    REQUIRE(!contains_coordinate(result.value(), points.back()));
+}
+
+TEST_CASE("configured destination fronts remain deterministic and segmented") {
+    const sailroute::Coordinate destination{10.0, 0.0};
+    const std::vector<sailroute::Coordinate> points = angular_frontier(120.0);
+    std::vector<sailroute::Coordinate> reversed = points;
+    std::reverse(reversed.begin(), reversed.end());
+
+    const auto forward = sailroute::build_destination_front(
+        points,
+        destination,
+        61.0,
+        sailroute::DestinationFrontOptions{120.0});
+    const auto backward = sailroute::build_destination_front(
+        reversed,
+        destination,
+        61.0,
+        sailroute::DestinationFrontOptions{120.0});
+
+    REQUIRE(forward.has_value());
+    REQUIRE(backward.has_value());
+    require_same_front(forward.value(), backward.value());
+    REQUIRE(forward.value().segments.size() == 1U);
+    REQUIRE(
+        forward.value().segments.front().point_count ==
+        forward.value().points.size());
+}
+
+TEST_CASE("destination front retains centroid points inside a populated aperture") {
+    const sailroute::Coordinate centroid{0.0, 0.0};
+    const std::vector<sailroute::Coordinate> points{
+        {1.0, -1.0},
+        {1.0, -0.5},
+        centroid,
+        {-3.0, 0.5},
+        {1.0, 1.0},
+    };
+
+    const auto result = sailroute::build_destination_front(
+        points,
+        sailroute::Coordinate{10.0, 0.0},
+        31.0,
+        sailroute::DestinationFrontOptions{90.0});
+
+    REQUIRE(result.has_value());
+    REQUIRE(contains_coordinate(result.value(), centroid));
+}
+
+TEST_CASE("destination front preserves fallback when no point is inside aperture") {
+    const sailroute::Coordinate centroid{0.0, 0.0};
+    const std::vector<sailroute::Coordinate> points{
+        sailroute::detail::destination_point(centroid, 270.0, 120.0),
+        sailroute::detail::destination_point(centroid, 270.0, 60.0),
+        sailroute::detail::destination_point(centroid, 90.0, 60.0),
+        sailroute::detail::destination_point(centroid, 90.0, 120.0),
+    };
+
+    const auto fallback = sailroute::build_destination_front(
+        points,
+        sailroute::Coordinate{10.0, 0.0},
+        61.0,
+        sailroute::DestinationFrontOptions{45.0});
+    const auto full = sailroute::build_destination_front(
+        points,
+        sailroute::Coordinate{10.0, 0.0},
+        61.0,
+        sailroute::DestinationFrontOptions{180.0});
+
+    REQUIRE(fallback.has_value());
+    REQUIRE(full.has_value());
+    require_same_front(fallback.value(), full.value());
+}
+
+TEST_CASE("destination front filters normally for very narrow valid apertures") {
+    const sailroute::Coordinate forward{1.0, 0.0};
+    const std::vector<sailroute::Coordinate> points{
+        forward,
+        {-0.5, -1.0},
+        {-0.5, 1.0},
+    };
+
+    const auto result = sailroute::build_destination_front(
+        points,
+        sailroute::Coordinate{10.0, 0.0},
+        10.0,
+        sailroute::DestinationFrontOptions{1e-13});
+
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().points.size() == 1U);
+    REQUIRE(contains_coordinate(result.value(), forward));
+}
+
 // ── Tie-break / same-band selection is input-order deterministic ──────────────
 // When two nearby points compete in the same cross-track band, the result is
 // the same regardless of input order.
@@ -301,6 +483,26 @@ TEST_CASE("destination front rejects non-positive band width") {
         0.0);
     REQUIRE(!result.has_value());
     REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
+}
+
+TEST_CASE("destination front rejects invalid half angles") {
+    const std::array<double, 6> invalid_angles{
+        0.0,
+        -1.0,
+        180.0001,
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+    };
+    for (const double half_angle : invalid_angles) {
+        const auto result = sailroute::build_destination_front(
+            std::vector<sailroute::Coordinate>{{0.0, 0.0}},
+            sailroute::Coordinate{5.0, 0.0},
+            10.0,
+            sailroute::DestinationFrontOptions{half_angle});
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
+    }
 }
 
 // ── RoutingProgressPayload integration ────────────────────────────────────────

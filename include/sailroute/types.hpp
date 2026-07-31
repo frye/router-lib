@@ -43,6 +43,12 @@ struct DisplayContourOptions {
     std::optional<double> alpha_nautical_miles;
 };
 
+/// Controls destination-facing isochrone front construction for display.
+struct DestinationFrontOptions {
+    // Angular extent on each side of the centroid-to-destination bearing.
+    double half_angle_degrees{90.0};
+};
+
 /// References one contiguous component in a flattened display contour.
 struct DisplayContourSegment {
     // Identifies a contiguous range in DisplayContours::points or
@@ -127,6 +133,7 @@ struct RoutingProgressOptions {
         RoutingProgressPayload::retained_points |
         RoutingProgressPayload::provisional_route};
     DisplayContourOptions display_contours;
+    DestinationFrontOptions destination_front;
 };
 
 /// Explains how a route's effective departure time was selected.
