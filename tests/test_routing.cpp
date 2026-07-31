@@ -1,3 +1,4 @@
+#include "sailroute/front.hpp"
 #include "sailroute/router.hpp"
 #include "sailroute/time.hpp"
 
@@ -440,6 +441,8 @@ TEST_CASE("routing defaults retain a wider configurable frontier") {
     REQUIRE(!sailroute::has_payload(
         options.progress.payload,
         sailroute::RoutingProgressPayload::display_contours));
+    REQUIRE(
+        options.progress.destination_front.half_angle_degrees == 90.0);
     REQUIRE(!options.segment_eligibility);
 }
 
@@ -1098,6 +1101,78 @@ TEST_CASE("progress views select payloads without changing routing") {
     REQUIRE(update_count + 1U == result.value().diagnostics.time_steps);
 }
 
+TEST_CASE("progress views forward destination front options") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    sailroute::RouteRequest request = routing_request(1U, false);
+    request.options.progress.payload =
+        sailroute::RoutingProgressPayload::retained_points |
+        sailroute::RoutingProgressPayload::destination_front;
+    request.options.progress.destination_front.half_angle_degrees = 120.0;
+
+    std::size_t update_count = 0U;
+    const auto result = router.optimize_view(
+        request,
+        [&request, &update_count](
+            const sailroute::RoutingProgressView& progress) {
+            ++update_count;
+            const auto expected = sailroute::build_destination_front(
+                progress.retained_points,
+                request.destination,
+                request.options.spatial_bucket_nautical_miles,
+                request.options.progress.destination_front);
+            REQUIRE(expected.has_value());
+            REQUIRE(
+                progress.destination_front.points.size() ==
+                expected.value().points.size());
+            REQUIRE(
+                progress.destination_front.segments.size() ==
+                expected.value().segments.size());
+            for (std::size_t index = 0U;
+                 index < expected.value().points.size();
+                 ++index) {
+                REQUIRE(
+                    progress.destination_front.points[index].latitude_degrees ==
+                    expected.value().points[index].latitude_degrees);
+                REQUIRE(
+                    progress.destination_front.points[index].longitude_degrees ==
+                    expected.value().points[index].longitude_degrees);
+            }
+            for (std::size_t index = 0U;
+                 index < expected.value().segments.size();
+                 ++index) {
+                REQUIRE(
+                    progress.destination_front.segments[index].point_offset ==
+                    expected.value().segments[index].point_offset);
+                REQUIRE(
+                    progress.destination_front.segments[index].point_count ==
+                    expected.value().segments[index].point_count);
+            }
+        });
+
+    REQUIRE(result.has_value());
+    REQUIRE(update_count + 1U == result.value().diagnostics.time_steps);
+}
+
+TEST_CASE("destination front aperture does not change routing search") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    sailroute::RouteRequest default_request = routing_request(1U, true);
+    sailroute::RouteRequest wide_request = default_request;
+    wide_request.options.progress.destination_front.half_angle_degrees = 120.0;
+
+    const auto default_result = router.optimize(default_request);
+    const auto wide_result = router.optimize(wide_request);
+
+    REQUIRE(default_result.has_value());
+    REQUIRE(wide_result.has_value());
+    require_same_route(default_result.value(), wide_result.value());
+}
+
 TEST_CASE("progress view cadence throttles callbacks but not isochrone capture") {
     const RoutingGribFixture fixture;
     const auto weather = sailroute::WeatherDataset::load(fixture.path());
@@ -1180,7 +1255,7 @@ TEST_CASE("progress view callbacks use the existing cancellation decision") {
     REQUIRE(result.error().code == sailroute::ErrorCode::cancelled);
 }
 
-TEST_CASE("progress options reject zero cadence and invalid contour alpha") {
+TEST_CASE("progress options reject invalid construction values") {
     const RoutingGribFixture fixture;
     const auto weather = sailroute::WeatherDataset::load(fixture.path());
     REQUIRE(weather.has_value());
@@ -1200,6 +1275,25 @@ TEST_CASE("progress options reject zero cadence and invalid contour alpha") {
         sailroute::RoutingProgressViewCallback{});
     REQUIRE(!result.has_value());
     REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
+
+    request.options.progress.display_contours.alpha_nautical_miles.reset();
+    const std::array<double, 6> invalid_angles{
+        0.0,
+        -1.0,
+        180.0001,
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+    };
+    for (const double half_angle : invalid_angles) {
+        request.options.progress.destination_front.half_angle_degrees =
+            half_angle;
+        result = router.optimize_view(
+            request,
+            sailroute::RoutingProgressViewCallback{});
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
+    }
 }
 
 TEST_CASE("router produces scheduled points at five-minute intervals") {

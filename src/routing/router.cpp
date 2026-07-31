@@ -166,6 +166,14 @@ std::optional<Error> validate_request(const RouteRequest& request) {
             ErrorCode::invalid_argument,
             "display contour alpha_nautical_miles must be finite and positive"};
     }
+    if (!std::isfinite(
+            options.progress.destination_front.half_angle_degrees) ||
+        options.progress.destination_front.half_angle_degrees <= 0.0 ||
+        options.progress.destination_front.half_angle_degrees > 180.0) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "destination front half_angle_degrees must be finite and in (0, 180]"};
+    }
     return std::nullopt;
 }
 
@@ -1213,6 +1221,7 @@ Result<RouteResult> Router::optimize_view_controlled(
                         progress_scratch.retained_points,
                         request.destination,
                         request.options.spatial_bucket_nautical_miles,
+                        request.options.progress.destination_front,
                         progress_scratch.front_points,
                         progress_scratch.front_segments);
                     error.has_value()) {

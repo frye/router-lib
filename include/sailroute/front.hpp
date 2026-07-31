@@ -13,12 +13,11 @@ namespace sailroute {
 // The algorithm operates in a local geodesic frame centered on the frontier
 // centroid and oriented toward the destination:
 //
-//   - The destination-facing half-space filter keeps points whose along-track
-//     projection onto the destination bearing is non-negative (>= 0).  A
-//     point at the centroid itself (distance zero, along-track == 0) is
-//     therefore retained.  If no point has a strictly positive along-track
-//     value (i.e. the destination lies behind the entire frontier), all points
-//     are retained and the per-band selection picks the least-behind one.
+//   - The destination-facing aperture keeps points whose absolute bearing
+//     difference from the destination bearing is no greater than
+//     options.half_angle_degrees. A point at the centroid itself is retained.
+//     If no non-centroid point lies within the aperture, all points are
+//     retained and the per-band selection picks the best available ones.
 //   - Points are assigned to cross-track bands of width
 //     band_width_nautical_miles.  The point with the greatest along-track
 //     progress (i.e. closest to the destination along the forward axis) is
@@ -36,7 +35,16 @@ namespace sailroute {
 // An empty input produces an empty front without error.
 //
 // Returns an error if any input coordinate is invalid or if
-// band_width_nautical_miles is not finite and positive.
+// band_width_nautical_miles is not finite and positive, or if
+// options.half_angle_degrees is not finite and in (0, 180].
+[[nodiscard]] Result<IsochroneFront> build_destination_front(
+    std::span<const Coordinate> retained_points,
+    Coordinate destination,
+    double band_width_nautical_miles,
+    const DestinationFrontOptions& options);
+
+// Builds the same front using the original 90-degree half-angle.
+// This overload preserves the existing public symbol and behavior.
 [[nodiscard]] Result<IsochroneFront> build_destination_front(
     std::span<const Coordinate> retained_points,
     Coordinate destination,
