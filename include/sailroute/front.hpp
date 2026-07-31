@@ -16,8 +16,8 @@ namespace sailroute {
 //   - The destination-facing aperture keeps points whose absolute bearing
 //     difference from the destination bearing is no greater than
 //     options.half_angle_degrees. A point at the centroid itself is retained.
-//     If no non-centroid point lies strictly inside the aperture, all points
-//     are retained and the per-band selection picks the best available ones.
+//     If no non-centroid point lies within the aperture, all points are
+//     retained and the per-band selection picks the best available ones.
 //   - Points are assigned to cross-track bands of width
 //     band_width_nautical_miles.  The point with the greatest along-track
 //     progress (i.e. closest to the destination along the forward axis) is

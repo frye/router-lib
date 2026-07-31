@@ -163,22 +163,23 @@ std::optional<Error> build_destination_front_into(
 
     // ── Aperture filter: keep only destination-facing points ────────────────
     // Include exact angular boundaries and the centroid. If no non-centroid
-    // point is strictly inside the aperture, preserve the original fallback by
-    // retaining all points.
+    // point is within the aperture, preserve the fallback by retaining all
+    // points.
     {
         // Absorb only projection-scale roundoff at an inclusive boundary.
         const double boundary_tolerance =
             32.0 * std::numeric_limits<double>::epsilon() *
             options.half_angle_degrees;
-        const bool any_inside = std::any_of(
+        const bool any_within = std::any_of(
             projected.begin(),
             projected.end(),
-            [&options](const FrontPoint& fp) {
+            [&options, boundary_tolerance](const FrontPoint& fp) {
                 return !fp.at_centroid &&
-                       fp.bearing_delta < options.half_angle_degrees;
+                       fp.bearing_delta <=
+                           options.half_angle_degrees + boundary_tolerance;
             });
 
-        if (any_inside) {
+        if (any_within) {
             projected.erase(
                 std::remove_if(
                     projected.begin(),
@@ -191,7 +192,7 @@ std::optional<Error> build_destination_front_into(
                     }),
                 projected.end());
         }
-        // If !any_inside, per-band selection chooses the best available points.
+        // If !any_within, per-band selection chooses the best available points.
     }
 
     if (projected.empty()) {
