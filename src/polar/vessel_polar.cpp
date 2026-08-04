@@ -466,16 +466,17 @@ Interval find_interval(const std::vector<double>& axis, double value) noexcept {
 // angles and can invent boat speeds the vessel cannot reach. Constraining the
 // slopes keeps the curve monotone on every interval the data is monotone on,
 // so it resolves the polar's peak without inventing a taller one.
-double pchip_slope(
+template <typename ValueAt>
+double pchip_slope_for(
     const double* x,
-    const double* y,
     std::size_t count,
-    std::size_t index) noexcept {
+    std::size_t index,
+    const ValueAt& value_at) noexcept {
     if (count < 2U) {
         return 0.0;
     }
     const auto secant = [&](std::size_t i) {
-        return (y[i + 1U] - y[i]) / (x[i + 1U] - x[i]);
+        return (value_at(i + 1U) - value_at(i)) / (x[i + 1U] - x[i]);
     };
     if (count == 2U) {
         return secant(0U);
@@ -520,6 +521,18 @@ double pchip_slope(
     const double w0 = 2.0 * h1 + h0;
     const double w1 = h1 + 2.0 * h0;
     return (w0 + w1) / (w0 / delta0 + w1 / delta1);
+}
+
+double pchip_slope(
+    const double* x,
+    const double* y,
+    std::size_t count,
+    std::size_t index) noexcept {
+    return pchip_slope_for(
+        x,
+        count,
+        index,
+        [y](std::size_t value_index) noexcept { return y[value_index]; });
 }
 
 double hermite(
@@ -615,14 +628,10 @@ double column_speed(
         return y0 + row.fraction * (y1 - y0);
     }
 
-    std::vector<double> values(rows);
-    for (std::size_t index = 0U; index < rows; ++index) {
-        values[index] = value_at(index);
-    }
     const double slope0 =
-        pchip_slope(wind_angles.data(), values.data(), rows, row.lower);
-    const double slope1 =
-        pchip_slope(wind_angles.data(), values.data(), rows, row.lower + 1U);
+        pchip_slope_for(wind_angles.data(), rows, row.lower, value_at);
+    const double slope1 = pchip_slope_for(
+        wind_angles.data(), rows, row.lower + 1U, value_at);
     return hermite(
         wind_angles[row.lower],
         wind_angles[row.lower + 1U],

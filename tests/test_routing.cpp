@@ -489,6 +489,24 @@ TEST_CASE("routing interval schedules select and clamp elapsed-time tiers") {
         std::chrono::minutes{45});
 }
 
+TEST_CASE("maneuver delay shifts the sailed midpoint time") {
+    REQUIRE(
+        sailroute::detail::sailing_midpoint_offset(
+            std::chrono::hours{3},
+            std::chrono::seconds::zero()) ==
+        std::chrono::minutes{90});
+    REQUIRE(
+        sailroute::detail::sailing_midpoint_offset(
+            std::chrono::hours{3},
+            std::chrono::minutes{30}) ==
+        std::chrono::minutes{105});
+    REQUIRE(
+        sailroute::detail::sailing_midpoint_offset(
+            std::chrono::hours{3},
+            std::chrono::hours{1}) ==
+        std::chrono::hours{2});
+}
+
 TEST_CASE("routing intervals enforce valid tiers and a five-minute minimum") {
     sailroute::RoutingOptions options;
     options.routing_intervals = {
@@ -1332,6 +1350,53 @@ TEST_CASE("bearing-sector pruning rejects invalid sector widths") {
         sailroute::PruningStrategy::destination_distance_grid;
     request.options.pruning_sector_degrees = 0.0;
     REQUIRE(router.optimize(request).has_value());
+}
+
+TEST_CASE("accuracy options reject invalid library values") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    sailroute::RouteRequest request = routing_request(1U, false);
+    const auto require_invalid = [&router](const sailroute::RouteRequest& value) {
+        const auto result = router.optimize(value);
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
+    };
+
+    request.options.maneuver.tack_penalty = std::chrono::seconds{-1};
+    require_invalid(request);
+    request.options.maneuver.tack_penalty = std::chrono::seconds::zero();
+    request.options.maneuver.gybe_penalty = std::chrono::seconds{-1};
+    require_invalid(request);
+    request.options.maneuver.gybe_penalty = std::chrono::seconds::zero();
+
+    for (const double angle :
+         {-1.0,
+          180.0001,
+          std::numeric_limits<double>::quiet_NaN(),
+          std::numeric_limits<double>::infinity(),
+          -std::numeric_limits<double>::infinity()}) {
+        request.options.maneuver.downwind_true_wind_angle_degrees = angle;
+        require_invalid(request);
+    }
+    request.options.maneuver.downwind_true_wind_angle_degrees = 150.0;
+
+    request.options.midpoint_wind_sampling_threshold =
+        std::chrono::minutes{-1};
+    require_invalid(request);
+    request.options.midpoint_wind_sampling_threshold =
+        std::chrono::minutes::zero();
+
+    for (const double wind_speed :
+         {0.0,
+          -1.0,
+          std::numeric_limits<double>::quiet_NaN(),
+          std::numeric_limits<double>::infinity(),
+          -std::numeric_limits<double>::infinity()}) {
+        request.options.maximum_true_wind_speed_knots = wind_speed;
+        require_invalid(request);
+    }
 }
 
 TEST_CASE("router produces scheduled points at five-minute intervals") {

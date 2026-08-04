@@ -18,4 +18,10 @@ inline constexpr std::chrono::minutes minimum_routing_interval{5};
     std::chrono::seconds elapsed,
     std::chrono::seconds remaining) noexcept;
 
+[[nodiscard]] inline constexpr std::chrono::seconds sailing_midpoint_offset(
+    std::chrono::seconds step,
+    std::chrono::seconds maneuver_delay) noexcept {
+    return maneuver_delay + (step - maneuver_delay) / 2;
+}
+
 }  // namespace sailroute::detail

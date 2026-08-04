@@ -101,6 +101,26 @@ struct ExpansionBuffer {
     }
 };
 
+struct MidpointWeatherSamplers {
+    WeatherSampler unpenalized;
+    WeatherSampler tack;
+    WeatherSampler gybe;
+
+    [[nodiscard]] const WeatherSampler& for_delay(
+        std::chrono::seconds delay,
+        const ManeuverPenalties& penalties) const noexcept {
+        if (delay > std::chrono::seconds::zero() &&
+            delay == penalties.tack_penalty) {
+            return tack;
+        }
+        if (delay > std::chrono::seconds::zero() &&
+            delay == penalties.gybe_penalty) {
+            return gybe;
+        }
+        return unpenalized;
+    }
+};
+
 std::optional<Error> validate_request(const RouteRequest& request) {
     if (!is_valid(request.start)) {
         return Error{
@@ -149,6 +169,33 @@ std::optional<Error> validate_request(const RouteRequest& request) {
         return Error{
             ErrorCode::invalid_argument,
             "minimum_boat_speed_knots must be finite and non-negative"};
+    }
+    if (options.maneuver.tack_penalty < std::chrono::seconds::zero() ||
+        options.maneuver.gybe_penalty < std::chrono::seconds::zero()) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "maneuver penalties must be non-negative"};
+    }
+    if (!std::isfinite(
+            options.maneuver.downwind_true_wind_angle_degrees) ||
+        options.maneuver.downwind_true_wind_angle_degrees < 0.0 ||
+        options.maneuver.downwind_true_wind_angle_degrees > 180.0) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "downwind_true_wind_angle_degrees must be finite and in [0, 180]"};
+    }
+    if (options.midpoint_wind_sampling_threshold <
+        std::chrono::minutes::zero()) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "midpoint_wind_sampling_threshold must be non-negative"};
+    }
+    if (options.maximum_true_wind_speed_knots.has_value() &&
+        (!std::isfinite(*options.maximum_true_wind_speed_knots) ||
+         *options.maximum_true_wind_speed_knots <= 0.0)) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "maximum_true_wind_speed_knots must be finite and positive"};
     }
     if (options.progress.every_n_steps == 0U) {
         return Error{
@@ -368,7 +415,7 @@ constexpr std::size_t maximum_augmented_headings = 5U;
 void expand_candidate_range(
     ExpansionBuffer& buffer,
     const WeatherSampler& weather,
-    const WeatherSampler* midpoint_weather,
+    const MidpointWeatherSamplers* midpoint_weather,
     const VesselPolar& polar,
     const RouteRequest& request,
     const std::vector<SearchNode>& nodes,
@@ -491,20 +538,22 @@ void expand_candidate_range(
             // A tack or gybe eats into the step before any distance is made.
             double penalty_seconds = 0.0;
             double usable_hours = step_hours;
+            std::chrono::seconds maneuver_delay{};
             if (penalise_maneuvers) {
-                const std::chrono::seconds penalty = maneuver_penalty(
+                maneuver_delay = maneuver_penalty(
                     options.maneuver,
                     parent_board,
                     parent_angle,
                     board_for(heading, wind_direction),
                     candidate_angle);
-                if (penalty > std::chrono::seconds::zero()) {
-                    if (penalty >= step) {
+                if (maneuver_delay > std::chrono::seconds::zero()) {
+                    if (maneuver_delay >= step) {
                         continue;
                     }
-                    penalty_seconds = static_cast<double>(penalty.count());
+                    penalty_seconds =
+                        static_cast<double>(maneuver_delay.count());
                     usable_hours = std::chrono::duration<double, std::ratio<3600>>(
-                                       step - penalty)
+                                       step - maneuver_delay)
                                        .count();
                 }
             }
@@ -518,7 +567,10 @@ void expand_candidate_range(
                     geometry.origin,
                     heading,
                     boat_speed * usable_hours * 0.5);
-                const auto midpoint_wind = midpoint_weather->sample(midpoint);
+                const auto midpoint_wind =
+                    midpoint_weather
+                        ->for_delay(maneuver_delay, options.maneuver)
+                        .sample(midpoint);
                 if (midpoint_wind) {
                     const double midpoint_speed = midpoint_wind.value().speed_knots();
                     const double midpoint_direction =
@@ -661,7 +713,7 @@ public:
     void expand(
         std::size_t active_workers,
         const WeatherSampler& sampler,
-        const WeatherSampler* midpoint_sampler,
+        const MidpointWeatherSamplers* midpoint_sampler,
         const std::vector<SearchNode>& nodes,
         const std::vector<NodeIndex>& frontier,
         TimePoint current_time,
@@ -784,7 +836,7 @@ private:
     }
 
     WeatherSampler sampler_;
-    const WeatherSampler* midpoint_sampler_{nullptr};
+    const MidpointWeatherSamplers* midpoint_sampler_{nullptr};
     const VesselPolar& polar_;
     const RouteRequest& request_;
     bool preserve_all_arrivals_{};
@@ -1298,17 +1350,58 @@ Result<RouteResult> Router::optimize_view_controlled(
         }
         const WeatherSampler& sampler = sampler_result.value();
 
-        // Midpoint sampling needs the wind halfway through the step as well as
-        // halfway along the segment, so resolve a second time bracket once.
-        std::optional<WeatherSampler> midpoint_sampler_storage;
-        const WeatherSampler* midpoint_sampler = nullptr;
+        // A maneuver consumes time before sailing starts, so its sailed midpoint
+        // occurs later than the unpenalized midpoint. Resolve the three possible
+        // time brackets once per step rather than once per candidate.
+        std::optional<MidpointWeatherSamplers> midpoint_sampler_storage;
+        const MidpointWeatherSamplers* midpoint_sampler = nullptr;
         if (request.options.wind_sampling == WindSampling::midpoint &&
             step >= request.options.midpoint_wind_sampling_threshold) {
-            auto midpoint_result = weather_.sampler_at(current_time + step / 2);
-            if (!midpoint_result) {
-                return midpoint_result.error();
+            const auto sampler_for_delay =
+                [&](std::chrono::seconds delay) -> Result<WeatherSampler> {
+                return weather_.sampler_at(
+                    current_time +
+                    detail::sailing_midpoint_offset(step, delay));
+            };
+            auto unpenalized = sampler_for_delay(std::chrono::seconds::zero());
+            if (!unpenalized) {
+                return unpenalized.error();
             }
-            midpoint_sampler_storage = std::move(midpoint_result.value());
+            midpoint_sampler_storage = MidpointWeatherSamplers{
+                unpenalized.value(),
+                unpenalized.value(),
+                unpenalized.value()};
+            const auto resolve_penalized =
+                [&](std::chrono::seconds delay,
+                    WeatherSampler& destination) -> std::optional<Error> {
+                if (delay <= std::chrono::seconds::zero() || delay >= step) {
+                    return std::nullopt;
+                }
+                auto result = sampler_for_delay(delay);
+                if (!result) {
+                    return result.error();
+                }
+                destination = std::move(result.value());
+                return std::nullopt;
+            };
+            if (auto error = resolve_penalized(
+                    request.options.maneuver.tack_penalty,
+                    midpoint_sampler_storage->tack);
+                error.has_value()) {
+                return *error;
+            }
+            if (request.options.maneuver.gybe_penalty ==
+                request.options.maneuver.tack_penalty) {
+                midpoint_sampler_storage->gybe =
+                    midpoint_sampler_storage->tack;
+            } else {
+                if (auto error = resolve_penalized(
+                        request.options.maneuver.gybe_penalty,
+                        midpoint_sampler_storage->gybe);
+                    error.has_value()) {
+                    return *error;
+                }
+            }
             midpoint_sampler = &midpoint_sampler_storage.value();
         }
 
