@@ -4,7 +4,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <numbers>
+#include <numeric>
+#include <vector>
 
 namespace {
 
@@ -40,8 +44,89 @@ TEST_CASE("geodesic lattice construction is deterministic with expected counts")
             const Coordinate right = second.value().coordinate(cell);
             REQUIRE(left.latitude_degrees == right.latitude_degrees);
             REQUIRE(left.longitude_degrees == right.longitude_degrees);
-            REQUIRE(first.value().neighbors(cell).size() == second.value().neighbors(cell).size());
+            const auto left_neighbors = first.value().neighbors(cell);
+            const auto right_neighbors = second.value().neighbors(cell);
+            REQUIRE(left_neighbors.size() == right_neighbors.size());
+            REQUIRE(std::equal(
+                left_neighbors.begin(),
+                left_neighbors.end(),
+                right_neighbors.begin(),
+                right_neighbors.end()));
         }
+    }
+}
+
+TEST_CASE("geodesic lattice lookup is independent of deterministic query order") {
+    constexpr std::size_t sample_count = 1024U;
+    std::vector<Coordinate> samples{
+        {0.0, 0.0},
+        {0.0, 180.0},
+        {0.0, -180.0},
+        {90.0, 137.0},
+        {-90.0, -61.0},
+    };
+    samples.reserve(sample_count);
+    std::uint64_t state = 0x4d595df4d0f33173ULL;
+    while (samples.size() < sample_count) {
+        state = state * 6'364'136'223'846'793'005ULL +
+                1'442'695'040'888'963'407ULL;
+        const double z =
+            2.0 * static_cast<double>(state >> 11U) /
+                static_cast<double>(std::uint64_t{1U} << 53U) -
+            1.0;
+        state = state * 6'364'136'223'846'793'005ULL +
+                1'442'695'040'888'963'407ULL;
+        const double longitude =
+            360.0 * static_cast<double>(state >> 11U) /
+                static_cast<double>(std::uint64_t{1U} << 53U) -
+            180.0;
+        samples.push_back(Coordinate{
+            std::asin(std::clamp(z, -1.0, 1.0)) * 180.0 / std::numbers::pi,
+            longitude});
+    }
+
+    const auto first = GeodesicLattice::create(4U);
+    const auto repeated = GeodesicLattice::create(4U);
+    REQUIRE(first.has_value());
+    REQUIRE(repeated.has_value());
+
+    std::vector<GeodesicLattice::CellIndex> expected;
+    expected.reserve(samples.size());
+    for (const Coordinate sample : samples) {
+        const auto cell = first.value().nearest_cell(sample);
+        REQUIRE(cell.has_value());
+        expected.push_back(cell.value());
+    }
+
+    std::vector<std::size_t> order(samples.size());
+    std::iota(order.begin(), order.end(), 0U);
+    std::uint32_t shuffle_state = 0x5a17c9e3U;
+    for (std::size_t remaining = order.size(); remaining > 1U; --remaining) {
+        shuffle_state = shuffle_state * 1'664'525U + 1'013'904'223U;
+        const std::size_t other = shuffle_state % remaining;
+        std::swap(order[remaining - 1U], order[other]);
+    }
+    for (const std::size_t index : order) {
+        const auto actual = repeated.value().nearest_cell(samples[index]);
+        REQUIRE(actual.has_value());
+        REQUIRE(actual.value() == expected[index]);
+        const Coordinate first_coordinate =
+            first.value().coordinate(expected[index]);
+        const Coordinate repeated_coordinate =
+            repeated.value().coordinate(actual.value());
+        REQUIRE(
+            first_coordinate.latitude_degrees ==
+            repeated_coordinate.latitude_degrees);
+        REQUIRE(
+            first_coordinate.longitude_degrees ==
+            repeated_coordinate.longitude_degrees);
+        const auto first_neighbors = first.value().neighbors(expected[index]);
+        const auto repeated_neighbors = repeated.value().neighbors(actual.value());
+        REQUIRE(std::equal(
+            first_neighbors.begin(),
+            first_neighbors.end(),
+            repeated_neighbors.begin(),
+            repeated_neighbors.end()));
     }
 }
 

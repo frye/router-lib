@@ -99,6 +99,9 @@ std::optional<Error> build_destination_front_impl(
     std::vector<IsochroneFrontSegment>& segments) {
     front_points.clear();
     segments.clear();
+    const bool enhanced =
+        explicit_anchor.has_value() ||
+        options.mode == DestinationFrontMode::eligible_pre_prune;
 
     if (!is_valid(destination)) {
         return Error{
@@ -118,7 +121,7 @@ std::optional<Error> build_destination_front_impl(
             "destination front half_angle_degrees must be finite and in (0, 180]"};
     }
 
-    if (options.minimum_secondary_segment_points == 0U) {
+    if (enhanced && options.minimum_secondary_segment_points == 0U) {
         return Error{
             ErrorCode::invalid_argument,
             "destination front minimum_secondary_segment_points must be positive"};
@@ -253,7 +256,7 @@ std::optional<Error> build_destination_front_impl(
                 ErrorCode::invalid_argument,
                 "destination front anchor must be present in candidate_points"};
         }
-    } else {
+    } else if (enhanced) {
         anchor_it = std::min_element(
             projected.begin(),
             projected.end(),
@@ -264,11 +267,19 @@ std::optional<Error> build_destination_front_impl(
                            right.distance_to_destination;
                 }
                 return std::tie(
-                           left.position.latitude_degrees,
-                           left.position.longitude_degrees) <
+                          left.position.latitude_degrees,
+                          left.position.longitude_degrees) <
                        std::tie(
                            right.position.latitude_degrees,
                            right.position.longitude_degrees);
+            });
+    } else {
+        anchor_it = std::min_element(
+            projected.begin(),
+            projected.end(),
+            [](const FrontPoint& left, const FrontPoint& right) {
+                return left.distance_to_destination <
+                    right.distance_to_destination;
             });
     }
     const std::int64_t anchor_band = anchor_it->band;
@@ -277,12 +288,13 @@ std::optional<Error> build_destination_front_impl(
     std::sort(
         projected.begin(),
         projected.end(),
-        [](const FrontPoint& left, const FrontPoint& right) {
+        [enhanced](const FrontPoint& left, const FrontPoint& right) {
             if (left.band != right.band) {
                 return left.band < right.band;
             }
-            if (left.distance_to_destination !=
-                right.distance_to_destination) {
+            if (enhanced &&
+                left.distance_to_destination !=
+                    right.distance_to_destination) {
                 return left.distance_to_destination <
                        right.distance_to_destination;
             }
@@ -306,7 +318,7 @@ std::optional<Error> build_destination_front_impl(
             band_winners.push_back(fp);
         }
     }
-    if (explicit_anchor.has_value()) {
+    if (enhanced && explicit_anchor.has_value()) {
         const auto anchored = std::find_if(
             projected.begin(),
             projected.end(),
@@ -343,7 +355,8 @@ std::optional<Error> build_destination_front_impl(
             anchor_position >= run_begin && anchor_position < run_end;
         const bool retain =
             contains_anchor ||
-            (options.segment_policy ==
+            (enhanced &&
+             options.segment_policy ==
                  DestinationFrontSegmentPolicy::all_meaningful_components &&
              run_end - run_begin >=
                  options.minimum_secondary_segment_points);

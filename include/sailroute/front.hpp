@@ -7,10 +7,10 @@
 
 namespace sailroute {
 
-// Builds a destination-facing equal-time reachable front from candidate points.
-// Router progress uses every eligible pre-prune candidate and anchors the
-// principal component to its provisional retained route. This standalone API
-// derives that anchor as the input point closest to the destination.
+// Builds a destination-facing equal-time reachable front from retained points.
+// The default mode preserves the v0.3 principal-component algorithm. The
+// eligible_pre_prune mode enables the Stage 2 anchor/component rules; Router
+// supplies the pre-prune population and explicit anchor for that mode.
 //
 // The algorithm operates in a local geodesic frame centered on the frontier
 // centroid and oriented toward the destination:
@@ -26,8 +26,8 @@ namespace sailroute {
 //     selected per band; ties are broken lexicographically by (latitude,
 //     longitude) for determinism.
 //   - The principal contiguous band run contains the derived provisional point.
-//     When segment_policy is all_meaningful_components, other runs with at least
-//     minimum_secondary_segment_points are retained as separate open segments.
+//     In eligible_pre_prune mode, segment_policy may retain additional runs with
+//     at least minimum_secondary_segment_points as separate open segments.
 //   - The trimmed set is ordered port-to-starboard (ascending cross-track
 //     offset, equivalently ascending band index).
 //   - Antimeridian crossings between adjacent ordered points produce a new
