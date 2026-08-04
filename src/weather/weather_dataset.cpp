@@ -47,8 +47,8 @@ struct DecodedField {
 };
 
 struct PendingTimeSlice {
-    std::optional<DecodedField> east;
-    std::optional<DecodedField> north;
+    std::vector<DecodedField> east;
+    std::vector<DecodedField> north;
 };
 
 [[nodiscard]] std::optional<Error> validate_bounds(
@@ -767,6 +767,220 @@ struct CropWindow {
     return component == WindComponent::east ? "U" : "V";
 }
 
+/// Signed shortest circular longitude difference (lhs - rhs) in (-180, 180].
+[[nodiscard]] double signed_longitude_difference(double lhs, double rhs) noexcept {
+    double difference = normalize_longitude(lhs) - normalize_longitude(rhs);
+    while (difference > kLongitudePeriod / 2.0) {
+        difference -= kLongitudePeriod;
+    }
+    while (difference <= -kLongitudePeriod / 2.0) {
+        difference += kLongitudePeriod;
+    }
+    return difference;
+}
+
+/// Two mosaic cell values conflict only when both are finite and disagree.
+[[nodiscard]] bool values_conflict(double existing, double incoming) noexcept {
+    if (!std::isfinite(existing) || !std::isfinite(incoming)) {
+        return false;
+    }
+    const double tolerance =
+        1.0e-6 * std::max({1.0, std::abs(existing), std::abs(incoming)});
+    return std::abs(existing - incoming) > tolerance;
+}
+
+/// Rounds a lattice displacement to an integer number of steps, or reports
+/// misalignment when the displacement is not a whole multiple of the step.
+[[nodiscard]] Result<long> lattice_offset(
+    double displacement,
+    double step,
+    std::string_view axis) {
+    const double quotient = displacement / step;
+    const auto rounded = std::llround(quotient);
+    const double tolerance = 1.0e-6 * std::max(1.0, std::abs(quotient));
+    if (std::abs(quotient - static_cast<double>(rounded)) > tolerance) {
+        return Error{
+            ErrorCode::unsupported_grib,
+            std::string{"10 m wind tiles are misaligned along "} +
+                std::string{axis} + "; tile origins are not a whole grid step apart"};
+    }
+    return static_cast<long>(rounded);
+}
+
+/// Combines every decoded tile for one valid time and wind component into a
+/// single regular_ll field. A lone tile is returned unchanged (fast path).
+/// Compatible tiles are validated for shared resolution and lattice alignment,
+/// assembled into their union grid, deduplicated across shared edges, and
+/// rejected when they leave gaps, conflict, or exceed a single hemisphere arc.
+[[nodiscard]] Result<DecodedField> assemble_component(
+    std::vector<DecodedField> tiles,
+    WindComponent component) {
+    if (tiles.size() == 1U) {
+        return std::move(tiles.front());
+    }
+
+    const std::string name = component_name(component);
+    const Grid& reference = tiles.front().grid;
+    const double latitude_step = reference.latitude_step_degrees;
+    const double longitude_step = reference.longitude_step_degrees;
+
+    for (const DecodedField& tile : tiles) {
+        if (tile.grid.global_longitude_coverage) {
+            return Error{
+                ErrorCode::unsupported_grib,
+                "cannot mosaic 10 m " + name +
+                    " wind tiles when a tile already spans the full globe"};
+        }
+        if (!nearly_equal(tile.grid.latitude_step_degrees, latitude_step,
+                          latitude_step) ||
+            !nearly_equal(tile.grid.longitude_step_degrees, longitude_step,
+                          longitude_step)) {
+            return Error{
+                ErrorCode::unsupported_grib,
+                "10 m " + name +
+                    " wind tiles use inconsistent grid resolution and cannot be mosaicked"};
+        }
+    }
+
+    const double period_quotient = kLongitudePeriod / longitude_step;
+    const auto period_steps = std::llround(period_quotient);
+    const bool longitude_is_periodic =
+        std::abs(period_quotient - static_cast<double>(period_steps)) <
+        1.0e-6 * std::max(1.0, period_quotient);
+
+    // Latitude offsets are linear; longitude offsets are placed on the shared
+    // lattice relative to the first tile using the signed shortest arc so that
+    // antimeridian-spanning collections stay contiguous.
+    const double south_anchor = reference.south_latitude_degrees;
+    const double west_anchor = reference.west_longitude_degrees;
+    std::vector<long> row_offsets;
+    std::vector<long> column_offsets;
+    row_offsets.reserve(tiles.size());
+    column_offsets.reserve(tiles.size());
+
+    long min_row = 0;
+    long min_column = 0;
+    for (const DecodedField& tile : tiles) {
+        auto row_result = lattice_offset(
+            tile.grid.south_latitude_degrees - south_anchor,
+            latitude_step,
+            "latitude");
+        if (!row_result) {
+            return row_result.error();
+        }
+        auto column_result = lattice_offset(
+            signed_longitude_difference(
+                tile.grid.west_longitude_degrees, west_anchor),
+            longitude_step,
+            "longitude");
+        if (!column_result) {
+            return column_result.error();
+        }
+        min_row = std::min(min_row, row_result.value());
+        min_column = std::min(min_column, column_result.value());
+        row_offsets.push_back(row_result.value());
+        column_offsets.push_back(column_result.value());
+    }
+
+    long union_rows = 0;
+    long union_columns = 0;
+    for (std::size_t index = 0; index < tiles.size(); ++index) {
+        row_offsets[index] -= min_row;
+        column_offsets[index] -= min_column;
+        union_rows = std::max(
+            union_rows,
+            row_offsets[index] +
+                static_cast<long>(tiles[index].grid.latitude_count));
+        union_columns = std::max(
+            union_columns,
+            column_offsets[index] +
+                static_cast<long>(tiles[index].grid.longitude_count));
+    }
+
+    if (longitude_is_periodic && union_columns > period_steps) {
+        return Error{
+            ErrorCode::unsupported_grib,
+            "10 m " + name +
+                " wind tiles overlap the antimeridian ambiguously; mosaic exceeds a full circle"};
+    }
+    if (!longitude_is_periodic &&
+        static_cast<double>(union_columns) * longitude_step >
+            kLongitudePeriod + 1.0e-6) {
+        return Error{
+            ErrorCode::unsupported_grib,
+            "10 m " + name + " wind tiles span more than a full circle of longitude"};
+    }
+
+    const auto rows = static_cast<std::size_t>(union_rows);
+    const auto columns = static_cast<std::size_t>(union_columns);
+    if (rows == 0U || columns == 0U ||
+        rows > std::numeric_limits<std::size_t>::max() / columns) {
+        return Error{
+            ErrorCode::grib_decode,
+            "mosaicked 10 m " + name + " wind grid dimensions overflow addressable memory"};
+    }
+
+    const std::size_t cell_count = rows * columns;
+    std::vector<double> mosaic(
+        cell_count, std::numeric_limits<double>::quiet_NaN());
+    std::vector<char> covered(cell_count, 0);
+
+    for (std::size_t index = 0; index < tiles.size(); ++index) {
+        const DecodedField& tile = tiles[index];
+        const auto row_base = static_cast<std::size_t>(row_offsets[index]);
+        const auto column_base = static_cast<std::size_t>(column_offsets[index]);
+        for (std::size_t j = 0; j < tile.grid.latitude_count; ++j) {
+            for (std::size_t i = 0; i < tile.grid.longitude_count; ++i) {
+                const std::size_t cell =
+                    (row_base + j) * columns + (column_base + i);
+                const double value =
+                    tile.values[j * tile.grid.longitude_count + i];
+                if (covered[cell] != 0) {
+                    if (values_conflict(mosaic[cell], value)) {
+                        return Error{
+                            ErrorCode::grib_decode,
+                            "10 m " + name +
+                                " wind tiles disagree where they overlap"};
+                    }
+                    if (!std::isfinite(mosaic[cell])) {
+                        mosaic[cell] = value;
+                    }
+                } else {
+                    covered[cell] = 1;
+                    mosaic[cell] = value;
+                }
+            }
+        }
+    }
+
+    for (const char cell_covered : covered) {
+        if (cell_covered == 0) {
+            return Error{
+                ErrorCode::incomplete_forecast,
+                "10 m " + name +
+                    " wind tiles leave an uncovered gap; the mosaic is not rectangular"};
+        }
+    }
+
+    const double mosaic_west = normalize_longitude(
+        west_anchor + static_cast<double>(min_column) * longitude_step);
+    const double mosaic_south =
+        south_anchor + static_cast<double>(min_row) * latitude_step;
+    const bool global_coverage =
+        longitude_is_periodic && union_columns == period_steps;
+
+    Grid mosaic_grid{
+        columns,
+        rows,
+        mosaic_west,
+        mosaic_south,
+        longitude_step,
+        latitude_step,
+        global_coverage,
+        false};
+    return DecodedField{mosaic_grid, std::move(mosaic)};
+}
+
 struct SpatialBracket {
     std::size_t latitude0{};
     std::size_t latitude1{};
@@ -1059,26 +1273,11 @@ Result<WeatherDataset> WeatherDataset::load_impl(
         if (!field_result) {
             return field_result.error();
         }
-        if (bounds) {
-            field_result = crop_field(
-                std::move(field_result.value()),
-                *bounds);
-            if (!field_result) {
-                return field_result.error();
-            }
-        }
 
         PendingTimeSlice& slice = pending[time_result.value()];
-        std::optional<DecodedField>& destination =
+        std::vector<DecodedField>& destination =
             *component == WindComponent::east ? slice.east : slice.north;
-        if (destination) {
-            return Error{
-                ErrorCode::incomplete_forecast,
-                "ambiguous forecast: multiple 10 m " +
-                    component_name(*component) +
-                    " wind messages share one valid time"};
-        }
-        destination = std::move(field_result.value());
+        destination.push_back(std::move(field_result.value()));
     }
 
     if (decode_status != CODES_SUCCESS) {
@@ -1098,54 +1297,94 @@ Result<WeatherDataset> WeatherDataset::load_impl(
             "forecast contains no supported 10 m U/V wind messages"};
     }
 
+    // Mosaic every valid time's tiles into a single U and V field, then apply
+    // the requested crop to the completed mosaic. Assembling before cropping is
+    // what lets a collection of adjacent tiles satisfy bounds that no single
+    // tile covers on its own.
+    struct AssembledSlice {
+        TimePoint time;
+        DecodedField east;
+        DecodedField north;
+    };
+    std::vector<AssembledSlice> assembled;
+    assembled.reserve(pending.size());
     std::optional<Grid> common_grid;
-    for (const auto& [time, slice] : pending) {
-        static_cast<void>(time);
-        if (!slice.east || !slice.north) {
+    for (auto& [time, slice] : pending) {
+        if (slice.east.empty() || slice.north.empty()) {
             return Error{
                 ErrorCode::incomplete_forecast,
                 "forecast does not contain paired 10 m U/V wind messages at every valid time"};
         }
-        if (!matching_grid(slice.east->grid, slice.north->grid)) {
+
+        auto east_result =
+            assemble_component(std::move(slice.east), WindComponent::east);
+        if (!east_result) {
+            return east_result.error();
+        }
+        auto north_result =
+            assemble_component(std::move(slice.north), WindComponent::north);
+        if (!north_result) {
+            return north_result.error();
+        }
+
+        if (!matching_grid(east_result.value().grid, north_result.value().grid)) {
             return Error{
                 ErrorCode::incomplete_forecast,
                 "paired 10 m U/V wind messages use different grids"};
         }
+
+        if (bounds) {
+            east_result = crop_field(std::move(east_result.value()), *bounds);
+            if (!east_result) {
+                return east_result.error();
+            }
+            north_result = crop_field(std::move(north_result.value()), *bounds);
+            if (!north_result) {
+                return north_result.error();
+            }
+        }
+
         if (!common_grid) {
-            common_grid = slice.east->grid;
-        } else if (!matching_grid(*common_grid, slice.east->grid)) {
+            common_grid = east_result.value().grid;
+        } else if (!matching_grid(*common_grid, east_result.value().grid)) {
             return Error{
                 ErrorCode::incomplete_forecast,
                 "10 m wind grid changes between forecast valid times"};
         }
+
+        assembled.push_back(
+            AssembledSlice{
+                time,
+                std::move(east_result.value()),
+                std::move(north_result.value())});
     }
 
     const Grid grid = *common_grid;
     const std::size_t plane_size =
         grid.longitude_count * grid.latitude_count;
-    if (pending.size() > std::numeric_limits<std::size_t>::max() / plane_size) {
+    if (assembled.size() > std::numeric_limits<std::size_t>::max() / plane_size) {
         return Error{
             ErrorCode::grib_decode,
             "decoded forecast dimensions overflow addressable memory"};
     }
-    const std::size_t total_size = pending.size() * plane_size;
+    const std::size_t total_size = assembled.size() * plane_size;
 
     auto impl = std::make_shared<Impl>();
     impl->grid = grid;
     impl->bounds = bounds;
-    impl->times.reserve(pending.size());
+    impl->times.reserve(assembled.size());
     impl->east_values.reserve(total_size);
     impl->north_values.reserve(total_size);
-    for (auto& [time, slice] : pending) {
-        impl->times.push_back(time);
+    for (AssembledSlice& slice : assembled) {
+        impl->times.push_back(slice.time);
         impl->east_values.insert(
             impl->east_values.end(),
-            std::make_move_iterator(slice.east->values.begin()),
-            std::make_move_iterator(slice.east->values.end()));
+            std::make_move_iterator(slice.east.values.begin()),
+            std::make_move_iterator(slice.east.values.end()));
         impl->north_values.insert(
             impl->north_values.end(),
-            std::make_move_iterator(slice.north->values.begin()),
-            std::make_move_iterator(slice.north->values.end()));
+            std::make_move_iterator(slice.north.values.begin()),
+            std::make_move_iterator(slice.north.values.end()));
     }
 
     impl->metadata = ForecastMetadata{
