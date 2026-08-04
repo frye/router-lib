@@ -235,9 +235,13 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
 
     EnvironmentSamples applied = samples;
     double sailing_seconds = distance / solution->ground_speed_knots * 3600.0;
-    if (options.wind_sampling == WindSampling::midpoint &&
+    const bool midpoint_wind =
+        options.wind_sampling == WindSampling::midpoint &&
         std::chrono::duration<double>(sailing_seconds) >=
-            options.midpoint_wind_sampling_threshold) {
+            options.midpoint_wind_sampling_threshold;
+    const bool midpoint_environment = environment_active &&
+        environment.sampling == EnvironmentSampling::midpoint;
+    if (midpoint_wind || midpoint_environment) {
         const Coordinate midpoint =
             destination_point(parent.position, ground_course, distance * 0.5);
         const TimePoint midpoint_time =
@@ -245,12 +249,18 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
             std::chrono::seconds{
                 static_cast<std::chrono::seconds::rep>(
                     std::ceil(sailing_seconds * 0.5))};
-        auto midpoint_wind = weather.interpolate(midpoint, midpoint_time);
-        if (!midpoint_wind) {
-            return midpoint_wind.error();
+        double refined_wind_speed = wind_speed;
+        double refined_wind_from = wind_from;
+        if (midpoint_wind) {
+            auto sampled_wind = weather.interpolate(midpoint, midpoint_time);
+            if (!sampled_wind) {
+                return sampled_wind.error();
+            }
+            refined_wind_speed = sampled_wind.value().speed_knots();
+            refined_wind_from =
+                sampled_wind.value().direction_from_degrees();
         }
-        if (environment_active &&
-            environment.sampling == EnvironmentSampling::midpoint) {
+        if (midpoint_environment) {
             EnvironmentSampleResult sampled = sample_environment(
                 environment, midpoint, midpoint_time, diagnostics);
             if (sampled.outcome == EnvironmentOutcome::failed) {
@@ -262,9 +272,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
             applied = sampled.samples;
         }
         const std::optional<LegSolution> refined = solve(
-            midpoint_wind.value().speed_knots(),
-            midpoint_wind.value().direction_from_degrees(),
-            applied);
+            refined_wind_speed, refined_wind_from, applied);
         if (solve_error.has_value()) {
             return *solve_error;
         }

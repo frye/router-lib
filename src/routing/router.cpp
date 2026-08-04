@@ -694,21 +694,16 @@ void expand_candidate_range(
                 ground = detail::ground_velocity(heading, boat_speed, current);
             }
 
-            // Second-order (midpoint) integration: re-evaluate boat speed with
-            // the wind halfway along the provisional segment in both space and
-            // time. If that point has no forecast the first-order speed stands,
-            // so enabling this never makes a route unreachable.
-            if (midpoint_weather != nullptr) {
+            // Second-order integration can refine wind, environment, or both at
+            // the provisional segment midpoint.
+            const bool midpoint_environment = environment_active &&
+                environment.sampling == EnvironmentSampling::midpoint;
+            if (midpoint_weather != nullptr || midpoint_environment) {
                 const Coordinate midpoint = detail::destination_point_from(
                     geometry.origin,
                     ground.course_degrees,
                     ground.speed_knots * usable_hours * 0.5);
-                const auto midpoint_wind =
-                    midpoint_weather
-                        ->for_delay(maneuver_delay, options.maneuver)
-                        .sample(midpoint);
-                if (environment_active &&
-                    environment.sampling == EnvironmentSampling::midpoint) {
+                if (midpoint_environment) {
                     detail::EnvironmentSampleResult sampled =
                         detail::sample_environment(
                             environment,
@@ -732,25 +727,34 @@ void expand_candidate_range(
                     current = sampled.samples.current;
                     wave = sampled.samples.wave;
                 }
-                if (midpoint_wind) {
-                    const double midpoint_speed = midpoint_wind.value().speed_knots();
-                    const double midpoint_direction =
-                        midpoint_wind.value().direction_from_degrees();
-                    if (std::isfinite(midpoint_speed) &&
-                        std::isfinite(midpoint_direction) &&
-                        (!options.maximum_true_wind_speed_knots.has_value() ||
-                         midpoint_speed <= *options.maximum_true_wind_speed_knots)) {
-                        const PolarSlice midpoint_slice = polar.slice_at(
-                            midpoint_speed, options.polar_angle_interpolation);
-                        const double midpoint_angle =
-                            true_wind_angle(heading, midpoint_direction);
-                        const double refined = midpoint_slice.speed_knots(
-                            midpoint_angle);
-                        if (std::isfinite(refined)) {
-                            flat_water_speed = refined;
-                            boat_speed = refined;
-                            performance_wind_speed = midpoint_speed;
-                            performance_wind_angle = midpoint_angle;
+                if (midpoint_weather != nullptr) {
+                    const auto midpoint_wind =
+                        midpoint_weather
+                            ->for_delay(maneuver_delay, options.maneuver)
+                            .sample(midpoint);
+                    if (midpoint_wind) {
+                        const double midpoint_speed =
+                            midpoint_wind.value().speed_knots();
+                        const double midpoint_direction =
+                            midpoint_wind.value().direction_from_degrees();
+                        if (std::isfinite(midpoint_speed) &&
+                            std::isfinite(midpoint_direction) &&
+                            (!options.maximum_true_wind_speed_knots.has_value() ||
+                             midpoint_speed <=
+                                 *options.maximum_true_wind_speed_knots)) {
+                            const PolarSlice midpoint_slice = polar.slice_at(
+                                midpoint_speed,
+                                options.polar_angle_interpolation);
+                            const double midpoint_angle =
+                                true_wind_angle(heading, midpoint_direction);
+                            const double refined = midpoint_slice.speed_knots(
+                                midpoint_angle);
+                            if (std::isfinite(refined)) {
+                                flat_water_speed = refined;
+                                boat_speed = refined;
+                                performance_wind_speed = midpoint_speed;
+                                performance_wind_angle = midpoint_angle;
+                            }
                         }
                     }
                 }

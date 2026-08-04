@@ -769,23 +769,30 @@ TEST_CASE("midpoint environment sampling stays deterministic") {
     const WeatherDataset weather = load_weather(fixture);
     const auto polar = sailroute::VesselPolar::default_racer_cruiser_45ft();
 
-    RoutingEnvironment environment =
+    RoutingEnvironment segment_start_environment =
         current_environment(CurrentVector{1.0, 0.0});
-    environment.sampling = sailroute::EnvironmentSampling::midpoint;
-    const Router router{weather, polar, environment};
+    RoutingEnvironment midpoint_environment = segment_start_environment;
+    midpoint_environment.sampling = sailroute::EnvironmentSampling::midpoint;
+    const Router segment_start_router{
+        weather, polar, segment_start_environment};
+    const Router midpoint_router{weather, polar, midpoint_environment};
 
-    RouteRequest request = base_request();
-    request.options.wind_sampling = sailroute::WindSampling::midpoint;
-    const RouteResult first = route_or_throw(router, request);
-    const RouteResult second = route_or_throw(router, request);
-    require_identical_route(first, second);
-    REQUIRE(
-        first.environment->sampling == sailroute::EnvironmentSampling::midpoint);
-    // Midpoint sampling asks the provider a second time per candidate, so the
-    // sample count outgrows the one-per-parent segment-start count.
-    REQUIRE(
-        first.environment_diagnostics->current_samples >
-        first.diagnostics.expanded_nodes);
+    for (const RoutingSolver solver :
+         {RoutingSolver::isochrone_beam,
+          RoutingSolver::time_dependent_lattice}) {
+        const RouteRequest request = base_request(1U, solver);
+        const RouteResult baseline =
+            route_or_throw(segment_start_router, request);
+        const RouteResult first = route_or_throw(midpoint_router, request);
+        const RouteResult second = route_or_throw(midpoint_router, request);
+        require_identical_route(first, second);
+        REQUIRE(
+            first.environment->sampling ==
+            sailroute::EnvironmentSampling::midpoint);
+        REQUIRE(
+            first.environment_diagnostics->current_samples >
+            baseline.environment_diagnostics->current_samples);
+    }
 }
 
 TEST_CASE("midpoint sea-state evaluation uses midpoint wind inputs") {
