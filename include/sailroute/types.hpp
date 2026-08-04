@@ -184,7 +184,76 @@ enum class DepartureSource {
     forecast_start_fallback,
 };
 
+/// Identity and attribution for one environmental provider, model, or dataset.
+struct ProviderMetadata {
+    /// Stable implementation name, for example `uniform_current_field`.
+    std::string name;
+    /// Human-readable attribution of the underlying data or formula.
+    std::string source;
+    /// Dataset or model revision, free-form but stable for a given input.
+    std::string revision;
+};
+
+/// What to do when a configured environmental provider has no usable sample.
+///
+/// Missing safety-relevant data is never silently reinterpreted as zero
+/// current, calm sea, or open water.
+enum class MissingDataPolicy {
+    /// Fail the whole optimization with an explicit error.
+    fail_route,
+    /// Drop the affected transition, as if it were infeasible.
+    reject_transition,
+};
+
+/// Whether touching an exclusion zone's boundary counts as entering it.
+enum class ExclusionBoundaryPolicy {
+    /// Contact with the boundary is a violation. This is the safe default.
+    boundary_excluded,
+    /// Only the strict interior is a violation.
+    boundary_allowed,
+};
+
+/// Where along a transition the environment is sampled.
+enum class EnvironmentSampling {
+    /// One sample at the segment start, held for the whole transition.
+    segment_start,
+    /// A second sample at the midpoint of the provisional segment, matching
+    /// what `WindSampling::midpoint` does for wind.
+    midpoint,
+};
+
+/// Optional per-point audit of the environment applied to reach a route point.
+///
+/// Present only when current or wave data was applied. It records what the route
+/// point's own fields cannot: `RoutePoint::heading_degrees` and
+/// `RoutePoint::boat_speed_knots` stay water-relative, so the ground track is
+/// only recoverable from the values below.
+struct RoutePointEnvironment {
+    /// Speed made good over the ground on the segment ending at this point.
+    double speed_over_ground_knots{};
+    /// Ground course of that segment, degrees true.
+    double course_over_ground_degrees{};
+    /// Current applied when translating water velocity into ground velocity.
+    double current_east_knots{};
+    double current_north_knots{};
+    /// Flat-water polar speed before any sea-state derating, knots.
+    double flat_water_speed_knots{};
+    /// Sea state applied by the performance model.
+    double significant_wave_height_metres{};
+    double wave_period_seconds{};
+    /// Angle between the water-frame heading and the direction the waves
+    /// travel toward: 0 is a following sea and 180 a head sea.
+    double relative_wave_angle_degrees{};
+    /// Identify which optional components supplied the values above.
+    bool current_applied{};
+    bool wave_applied{};
+};
+
 /// One timestamped point in a selected or provisional route.
+///
+/// `heading_degrees` and `boat_speed_knots` are water-relative even when a
+/// current provider is configured; `environment` carries the corresponding
+/// ground motion.
 struct RoutePoint {
     Coordinate position;
     TimePoint time;
@@ -193,6 +262,7 @@ struct RoutePoint {
     double true_wind_speed_knots{};
     double true_wind_direction_degrees{};
     double cumulative_distance_nautical_miles{};
+    std::optional<RoutePointEnvironment> environment;
 };
 
 /// Callback-scoped parent and candidate pair for eligibility decisions.
@@ -344,6 +414,49 @@ struct RouteDiagnostics {
     std::size_t time_steps{};
 };
 
+/// Cumulative environmental sampling, evaluation, and rejection counters.
+///
+/// Present only when a Stage 3 environment was configured. Counters are sums,
+/// so they are identical for any worker count or provider input order.
+struct EnvironmentDiagnostics {
+    std::size_t current_samples{};
+    std::size_t current_rejections{};
+    std::size_t wave_samples{};
+    std::size_t wave_rejections{};
+    std::size_t sea_state_evaluations{};
+    std::size_t land_checks{};
+    std::size_t land_distance_queries{};
+    std::size_t land_rejections{};
+    std::size_t exclusion_checks{};
+    std::size_t exclusion_geometry_tests{};
+    std::size_t exclusion_rejections{};
+};
+
+/// Which environmental sources, models, and policies a route actually applied.
+///
+/// Present only when a Stage 3 environment was configured.
+struct RouteEnvironmentMetadata {
+    std::optional<ProviderMetadata> current_provider;
+    std::optional<ProviderMetadata> wave_provider;
+    std::optional<ProviderMetadata> sea_state_model;
+    std::optional<ProviderMetadata> landmask;
+    std::optional<ProviderMetadata> exclusions;
+    MissingDataPolicy current_policy{MissingDataPolicy::fail_route};
+    MissingDataPolicy wave_policy{MissingDataPolicy::fail_route};
+    MissingDataPolicy land_policy{MissingDataPolicy::fail_route};
+    EnvironmentSampling sampling{EnvironmentSampling::segment_start};
+    /// Landmask node spacing, interpolation error bound, and configured
+    /// clearance, all nautical miles. Zero when no landmask is configured.
+    double land_resolution_nautical_miles{};
+    double land_interpolation_error_nautical_miles{};
+    double land_clearance_nautical_miles{};
+    ExclusionBoundaryPolicy exclusion_boundary_policy{
+        ExclusionBoundaryPolicy::boundary_excluded};
+    std::size_t exclusion_zone_count{};
+    /// Highest revision across the configured zones, zero when unconfigured.
+    std::uint64_t exclusion_revision{};
+};
+
 /// Why the accepted coarse incumbent was retained after refinement.
 enum class LatticeRefinementFallbackReason {
     none,
@@ -425,6 +538,9 @@ struct RouteResult {
     RouteDiagnostics diagnostics;
     RouteCompletion completion{RouteCompletion::destination_reached};
     std::optional<LatticeRouteDiagnostics> lattice_diagnostics;
+    /// Present only when a Stage 3 environment was configured.
+    std::optional<EnvironmentDiagnostics> environment_diagnostics;
+    std::optional<RouteEnvironmentMetadata> environment;
 };
 
 /// Checks coordinate finiteness and canonical latitude/longitude bounds.
@@ -435,5 +551,11 @@ std::string_view to_string(DepartureSource source) noexcept;
 std::string_view to_string(RouteCompletion completion) noexcept;
 /// Returns the stable snake_case name of a routing solver.
 std::string_view to_string(RoutingSolver solver) noexcept;
+/// Returns the stable snake_case name of a missing-data policy.
+std::string_view to_string(MissingDataPolicy policy) noexcept;
+/// Returns the stable snake_case name of an exclusion boundary policy.
+std::string_view to_string(ExclusionBoundaryPolicy policy) noexcept;
+/// Returns the stable snake_case name of an environment sampling mode.
+std::string_view to_string(EnvironmentSampling sampling) noexcept;
 
 }  // namespace sailroute

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sailroute/environment.hpp"
 #include "sailroute/error.hpp"
 #include "sailroute/polar.hpp"
 #include "sailroute/types.hpp"
@@ -37,6 +38,18 @@ class Router {
 public:
     /// Takes immutable weather and polar data reusable across optimizations.
     Router(WeatherDataset weather, VesselPolar polar = VesselPolar::default_racer_cruiser_45ft());
+
+    /// Additionally takes an immutable Stage 3 environment.
+    ///
+    /// An environment with no configured provider behaves exactly like the
+    /// two-argument constructor, including bit-identical route arithmetic.
+    Router(
+        WeatherDataset weather,
+        VesselPolar polar,
+        RoutingEnvironment environment);
+
+    /// Returns the environment this router applies, empty when unconfigured.
+    [[nodiscard]] const RoutingEnvironment& environment() const noexcept;
 
     /// Optimizes a route without intermediate progress delivery.
     [[nodiscard]] Result<RouteResult> optimize(const RouteRequest& request) const;
@@ -88,6 +101,7 @@ private:
 
     WeatherDataset weather_;
     VesselPolar polar_;
+    RoutingEnvironment environment_;
 };
 
 }  // namespace sailroute

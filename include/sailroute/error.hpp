@@ -21,6 +21,8 @@ enum class ErrorCode {
     forecast_exhausted,
     output_error,
     cancelled,
+    invalid_environment,
+    environment_data_unavailable,
 };
 
 /// A machine-readable error category and human-readable diagnostic.

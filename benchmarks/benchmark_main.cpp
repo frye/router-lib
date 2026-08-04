@@ -1,3 +1,4 @@
+#include "sailroute/environment.hpp"
 #include "sailroute/router.hpp"
 #include "sailroute/time.hpp"
 
@@ -16,7 +17,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
 #ifndef SAILROUTE_BASELINE_REVISION
 #define SAILROUTE_BASELINE_REVISION "unknown"
 #endif
@@ -206,6 +206,163 @@ void report_route_quality(
                  << " nm";
     }
     std::cout << '\n' << std::defaultfloat;
+}
+
+// Stage 3 environment overhead. Providers are built to cover the whole leg and
+// to leave the route legal, so the reported cost is the cost of the physics
+// rather than the cost of failing every candidate.
+struct EnvironmentFootprint {
+    double south_latitude_degrees{};
+    double north_latitude_degrees{};
+    double west_longitude_degrees{};
+    double east_longitude_degrees{};
+};
+
+sailroute::EnvironmentGridSpec footprint_grid(
+    const EnvironmentFootprint& footprint,
+    std::size_t samples) {
+    sailroute::EnvironmentGridSpec spec;
+    spec.south_latitude_degrees = std::max(-89.0, footprint.south_latitude_degrees - 2.0);
+    spec.west_longitude_degrees = footprint.west_longitude_degrees - 2.0;
+    const double north = std::min(89.0, footprint.north_latitude_degrees + 2.0);
+    const double east = footprint.east_longitude_degrees + 2.0;
+    spec.latitude_count = samples;
+    spec.longitude_count = samples;
+    spec.latitude_step_degrees =
+        std::max(1.0e-3, (north - spec.south_latitude_degrees) /
+                             static_cast<double>(samples - 1U));
+    spec.longitude_step_degrees =
+        std::max(1.0e-3, (east - spec.west_longitude_degrees) /
+                             static_cast<double>(samples - 1U));
+    return spec;
+}
+
+sailroute::SignedDistanceLandmask open_water_landmask(
+    const EnvironmentFootprint& footprint,
+    std::size_t samples) {
+    const sailroute::EnvironmentGridSpec spec = footprint_grid(footprint, samples);
+    sailroute::LandmaskMetadata metadata;
+    metadata.provider = sailroute::ProviderMetadata{
+        "benchmark_open_water", "synthetic benchmark mask", "1"};
+    metadata.resolution_nautical_miles =
+        spec.latitude_step_degrees * 60.0;
+    metadata.interpolation_error_nautical_miles = 0.0;
+    auto mask = sailroute::SignedDistanceLandmask::create(
+        spec,
+        std::vector<double>(spec.latitude_count * spec.longitude_count, 5'000.0),
+        metadata);
+    if (!mask.has_value()) {
+        throw std::runtime_error(mask.error().message);
+    }
+    return std::move(mask.value());
+}
+
+sailroute::ExclusionZoneSet benchmark_zones(
+    const EnvironmentFootprint& footprint,
+    std::size_t count) {
+    std::vector<sailroute::ExclusionZone> zones;
+    zones.reserve(count);
+    const double latitude = footprint.south_latitude_degrees - 5.0;
+    for (std::size_t index = 0U; index < count; ++index) {
+        const double west = footprint.west_longitude_degrees +
+            static_cast<double>(index) * 0.5;
+        sailroute::ExclusionZone zone;
+        zone.identifier = "benchmark-" + std::to_string(index);
+        zone.source = "synthetic benchmark zone";
+        zone.revision = 1U;
+        zone.polygons.push_back(sailroute::ExclusionPolygon{
+            sailroute::ExclusionRing{{
+                sailroute::Coordinate{latitude - 0.5, west},
+                sailroute::Coordinate{latitude - 0.5, west + 0.4},
+                sailroute::Coordinate{latitude, west + 0.4},
+                sailroute::Coordinate{latitude, west},
+            }},
+            {}});
+        zones.push_back(std::move(zone));
+    }
+    auto set = sailroute::ExclusionZoneSet::create(
+        std::move(zones),
+        sailroute::ProviderMetadata{
+            "benchmark_zones", "synthetic benchmark zones", "1"});
+    if (!set.has_value()) {
+        throw std::runtime_error(set.error().message);
+    }
+    return std::move(set.value());
+}
+
+void report_environment(
+    const sailroute::WeatherDataset& weather,
+    const sailroute::VesselPolar& polar,
+    const sailroute::RoutingEnvironment& environment,
+    const sailroute::RouteRequest& request,
+    std::string_view label,
+    double baseline_milliseconds,
+    double baseline_hours) {
+    const sailroute::Router router{weather, polar, environment};
+    const auto start = std::chrono::steady_clock::now();
+    auto route = router.optimize(request);
+    const double milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    std::cout << "  " << std::left << std::setw(28) << label << std::right;
+    if (!route.has_value()) {
+        std::cout << "  no route (" << route.error().message << ")\n";
+        return;
+    }
+    const double hours = std::chrono::duration<double, std::ratio<3600>>(
+                             route.value().arrival_time -
+                             route.value().departure_time)
+                             .count();
+    std::cout << "  " << std::fixed << std::setprecision(4) << std::setw(9)
+              << hours << " h";
+    if (baseline_hours > 0.0) {
+        std::cout << "  arrival delta " << std::showpos << std::setprecision(4)
+                  << std::setw(9) << hours - baseline_hours << " h"
+                  << std::noshowpos;
+    } else {
+        std::cout << "                          ";
+    }
+    std::cout << "  " << std::setprecision(1) << std::setw(8) << milliseconds
+              << " ms";
+    if (baseline_milliseconds > 0.0) {
+        std::cout << "  overhead " << std::setprecision(1) << std::setw(7)
+                  << (milliseconds / baseline_milliseconds - 1.0) * 100.0 << "%";
+    } else {
+        std::cout << "                  ";
+    }
+    if (route.value().environment_diagnostics.has_value()) {
+        const sailroute::EnvironmentDiagnostics& counters =
+            *route.value().environment_diagnostics;
+        std::cout << "  current " << counters.current_samples << '/'
+                  << counters.current_rejections << "  wave "
+                  << counters.wave_samples << '/' << counters.sea_state_evaluations
+                  << "  land " << counters.land_checks << '/'
+                  << counters.land_distance_queries << '/'
+                  << counters.land_rejections << "  zones "
+                  << counters.exclusion_checks << '/'
+                  << counters.exclusion_geometry_tests << '/'
+                  << counters.exclusion_rejections;
+    }
+    std::cout << '\n' << std::defaultfloat;
+}
+
+double measure_baseline(
+    const sailroute::Router& router,
+    const sailroute::RouteRequest& request,
+    double& hours) {
+    const auto start = std::chrono::steady_clock::now();
+    auto route = router.optimize(request);
+    const double milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    hours = route.has_value()
+        ? std::chrono::duration<double, std::ratio<3600>>(
+              route.value().arrival_time - route.value().departure_time)
+              .count()
+        : 0.0;
+    return milliseconds;
 }
 
 }  // namespace
@@ -443,5 +600,110 @@ int main(int argc, char** argv) {
         variant.options.maneuver.gybe_penalty = std::chrono::seconds{30};
         report_route_quality(router, variant, "all accuracy options");
     }
+
+    std::cout << "\nStage 3 environment overhead\n";
+    const EnvironmentFootprint footprint{south, north, west, east};
+    double baseline_hours = 0.0;
+    const double baseline_milliseconds =
+        measure_baseline(router, request, baseline_hours);
+    std::cout << "  " << std::left << std::setw(28) << "no providers"
+              << std::right << "  " << std::fixed << std::setprecision(4)
+              << std::setw(9) << baseline_hours << " h"
+              << "                          " << std::setprecision(1)
+              << std::setw(8) << baseline_milliseconds << " ms\n"
+              << std::defaultfloat;
+
+    auto current = sailroute::make_uniform_current_provider(
+        sailroute::CurrentVector{0.6, -0.3},
+        sailroute::ProviderMetadata{
+            "benchmark_current", "synthetic benchmark current", "1"});
+    auto waves = sailroute::make_uniform_wave_provider(
+        sailroute::WaveState{2.0, 9.0, 210.0},
+        sailroute::ProviderMetadata{
+            "benchmark_wave", "synthetic benchmark sea state", "1"});
+    auto model = sailroute::make_wave_height_derating_model();
+    if (!current.has_value() || !waves.has_value() || !model.has_value()) {
+        std::cerr << "unable to build benchmark providers\n";
+        return 1;
+    }
+
+    sailroute::RoutingEnvironment currents_only;
+    currents_only.currents.provider = current.value();
+    report_environment(
+        weather.value(),
+        polar,
+        currents_only,
+        request,
+        "currents",
+        baseline_milliseconds,
+        baseline_hours);
+
+    sailroute::RoutingEnvironment waves_only;
+    waves_only.waves.provider = waves.value();
+    waves_only.waves.model = model.value();
+    report_environment(
+        weather.value(),
+        polar,
+        waves_only,
+        request,
+        "sea-state derating",
+        baseline_milliseconds,
+        baseline_hours);
+
+    sailroute::RoutingEnvironment land_only;
+    land_only.land.landmask = open_water_landmask(footprint, 256U);
+    land_only.land.missing_data_policy =
+        sailroute::MissingDataPolicy::reject_transition;
+    report_environment(
+        weather.value(),
+        polar,
+        land_only,
+        request,
+        "landmask",
+        baseline_milliseconds,
+        baseline_hours);
+
+    for (const std::size_t zone_count : {4U, 32U, 128U}) {
+        sailroute::RoutingEnvironment zones_only;
+        zones_only.exclusions.zones = benchmark_zones(footprint, zone_count);
+        report_environment(
+            weather.value(),
+            polar,
+            zones_only,
+            request,
+            "exclusions x" + std::to_string(zone_count),
+            baseline_milliseconds,
+            baseline_hours);
+    }
+
+    sailroute::RoutingEnvironment combined;
+    combined.currents.provider = current.value();
+    combined.waves.provider = waves.value();
+    combined.waves.model = model.value();
+    combined.land.landmask = land_only.land.landmask;
+    combined.land.missing_data_policy =
+        sailroute::MissingDataPolicy::reject_transition;
+    combined.exclusions.zones = benchmark_zones(footprint, 32U);
+    report_environment(
+        weather.value(),
+        polar,
+        combined,
+        request,
+        "all providers",
+        baseline_milliseconds,
+        baseline_hours);
+
+    sailroute::RoutingEnvironment combined_midpoint = combined;
+    combined_midpoint.sampling = sailroute::EnvironmentSampling::midpoint;
+    sailroute::RouteRequest midpoint_request = request;
+    midpoint_request.options.wind_sampling = sailroute::WindSampling::midpoint;
+    report_environment(
+        weather.value(),
+        polar,
+        combined_midpoint,
+        midpoint_request,
+        "all providers, midpoint",
+        baseline_milliseconds,
+        baseline_hours);
     return 0;
 }

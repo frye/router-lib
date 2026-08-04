@@ -1,6 +1,7 @@
 #include "sailroute/router.hpp"
 
 #include "routing/contours.hpp"
+#include "routing/environment_context.hpp"
 #include "routing/front.hpp"
 #include "routing/geodesy.hpp"
 #include "routing/intervals.hpp"
@@ -88,6 +89,11 @@ struct ExpansionBuffer {
     std::vector<double> headings;
     std::optional<Arrival> best_arrival;
     std::optional<Error> interpolation_error;
+    // A provider or model failure under a fail_route policy. Recorded rather
+    // than thrown so every worker finishes and the reported error is the one
+    // from the lowest worker index, independent of scheduling.
+    std::optional<Error> environment_error;
+    EnvironmentDiagnostics environment;
     std::exception_ptr exception;
     std::size_t expanded_nodes{};
     std::size_t generated_candidates{};
@@ -98,6 +104,8 @@ struct ExpansionBuffer {
         arrivals.clear();
         best_arrival.reset();
         interpolation_error.reset();
+        environment_error.reset();
+        environment = EnvironmentDiagnostics{};
         exception = nullptr;
         expanded_nodes = 0U;
         generated_candidates = 0U;
@@ -426,6 +434,7 @@ void expand_candidate_range(
     const WeatherSampler& weather,
     const MidpointWeatherSamplers* midpoint_weather,
     const VesselPolar& polar,
+    const RoutingEnvironment& environment,
     const RouteRequest& request,
     const std::vector<SearchNode>& nodes,
     const std::vector<NodeIndex>& frontier,
@@ -461,6 +470,12 @@ void expand_candidate_range(
     }
 
     const bool penalise_maneuvers = options.maneuver.active();
+    const bool environment_active = environment.active();
+    const bool environment_fields_active =
+        environment.currents.configured() || environment.waves.configured();
+    // A degenerate environment sample, reused so the no-provider path keeps
+    // reading zero current and no waves without any branch in the inner loop.
+    const detail::EnvironmentSamples no_environment{};
 
     for (std::size_t frontier_index = begin; frontier_index < end;
          ++frontier_index) {
@@ -487,6 +502,41 @@ void expand_candidate_range(
         const double wind_speed = evaluated_wind.value()->speed_knots;
         const double wind_direction =
             evaluated_wind.value()->direction_from_degrees;
+
+        // The environment is a function of position and time, not heading, so
+        // it is sampled once per parent alongside the wind.
+        const detail::EnvironmentSamples* parent_samples = &no_environment;
+        detail::EnvironmentSamples sampled_environment;
+        if (environment_fields_active) {
+            detail::EnvironmentSampleResult sampled = detail::sample_environment(
+                environment,
+                parent.point.position,
+                parent.point.time,
+                buffer.environment);
+            if (sampled.outcome == detail::EnvironmentOutcome::failed) {
+                if (!buffer.environment_error.has_value()) {
+                    buffer.environment_error = *sampled.error;
+                }
+                return;
+            }
+            if (sampled.outcome == detail::EnvironmentOutcome::rejected) {
+                continue;
+            }
+            sampled_environment = sampled.samples;
+            parent_samples = &sampled_environment;
+        }
+        // Hoisted so the per-heading loop below reads locals rather than
+        // reloading through a pointer the compiler cannot prove is unaliased.
+        const bool parent_has_current = parent_samples->has_current;
+        const bool parent_has_wave = parent_samples->has_wave;
+        const CurrentVector parent_current = parent_samples->current;
+        const WaveState parent_wave = parent_samples->wave;
+        // Declared outside the heading loop so the no-provider path never
+        // touches them; they are only refreshed when an environment exists.
+        bool has_current = false;
+        bool has_wave = false;
+        CurrentVector current{};
+        WaveState wave{};
 
         const ParentGeometry geometry =
             prepare_parent(parent.point.position, request.destination);
@@ -547,7 +597,44 @@ void expand_candidate_range(
             if (!initial_boat_speed.has_value()) {
                 continue;
             }
+            double performance_wind_speed = wind_speed;
+            double performance_wind_angle = candidate_angle;
             double boat_speed = *initial_boat_speed;
+
+            // Everything from here to the ground translation below stays in the
+            // water frame, which is the frame the polar and the apparent wind
+            // are defined in.
+            double flat_water_speed = boat_speed;
+            double relative_wave_angle = 0.0;
+            if (environment_fields_active) {
+                has_current = parent_has_current;
+                has_wave = parent_has_wave;
+                current = parent_current;
+                wave = parent_wave;
+            }
+            if (has_wave) {
+                relative_wave_angle = detail::relative_wave_angle_degrees(
+                    heading, wave.direction_from_degrees);
+                Result<double> derated = detail::apply_sea_state(
+                    environment,
+                    flat_water_speed,
+                    wind_speed,
+                    candidate_angle,
+                    heading,
+                    wave,
+                    buffer.environment);
+                if (!derated) {
+                    if (!buffer.environment_error.has_value()) {
+                        buffer.environment_error = derated.error();
+                    }
+                    return;
+                }
+                boat_speed = derated.value();
+                if (!std::isfinite(boat_speed) || boat_speed <= 0.0 ||
+                    boat_speed < options.minimum_boat_speed_knots) {
+                    continue;
+                }
+            }
 
             // A tack or gybe eats into the step before any distance is made.
             double penalty_seconds = 0.0;
@@ -575,48 +662,115 @@ void expand_candidate_range(
                 }
             }
 
-            // Second-order (midpoint) integration: re-evaluate boat speed with
-            // the wind halfway along the provisional segment in both space and
-            // time. If that point has no forecast the first-order speed stands,
-            // so enabling this never makes a route unreachable.
-            if (midpoint_weather != nullptr) {
+            // The vessel moves through the water; only here is that velocity
+            // translated into the ground frame the search advances positions in.
+            detail::GroundVelocity ground{heading, boat_speed};
+            if (has_current) {
+                ground = detail::ground_velocity(heading, boat_speed, current);
+            }
+
+            // Second-order integration can refine wind, environment, or both at
+            // the provisional segment midpoint.
+            const bool midpoint_environment = environment_fields_active &&
+                environment.sampling == EnvironmentSampling::midpoint;
+            if (midpoint_weather != nullptr || midpoint_environment) {
                 const Coordinate midpoint = detail::destination_point_from(
                     geometry.origin,
-                    heading,
-                    boat_speed * usable_hours * 0.5);
-                const auto midpoint_wind =
-                    midpoint_weather
-                        ->for_delay(maneuver_delay, options.maneuver)
-                        .sample(midpoint);
-                if (midpoint_wind) {
-                    const double midpoint_speed = midpoint_wind.value().speed_knots();
-                    const double midpoint_direction =
-                        midpoint_wind.value().direction_from_degrees();
-                    if (std::isfinite(midpoint_speed) &&
-                        std::isfinite(midpoint_direction) &&
-                        (!options.maximum_true_wind_speed_knots.has_value() ||
-                         midpoint_speed <= *options.maximum_true_wind_speed_knots)) {
-                        const PolarSlice midpoint_slice = polar.slice_at(
-                            midpoint_speed, options.polar_angle_interpolation);
-                        const double refined = midpoint_slice.speed_knots(
-                            detail::angular_difference_degrees(
-                                heading,
-                                midpoint_direction));
-                        if (std::isfinite(refined)) {
-                            boat_speed = refined;
+                    ground.course_degrees,
+                    ground.speed_knots * usable_hours * 0.5);
+                if (midpoint_environment) {
+                    detail::EnvironmentSampleResult sampled =
+                        detail::sample_environment(
+                            environment,
+                            midpoint,
+                            current_time +
+                                detail::sailing_midpoint_offset(
+                                    step, maneuver_delay),
+                            buffer.environment);
+                    if (sampled.outcome == detail::EnvironmentOutcome::failed) {
+                        if (!buffer.environment_error.has_value()) {
+                            buffer.environment_error = *sampled.error;
+                        }
+                        return;
+                    }
+                    if (sampled.outcome ==
+                        detail::EnvironmentOutcome::rejected) {
+                        continue;
+                    }
+                    has_current = sampled.samples.has_current;
+                    has_wave = sampled.samples.has_wave;
+                    current = sampled.samples.current;
+                    wave = sampled.samples.wave;
+                }
+                if (midpoint_weather != nullptr) {
+                    const auto midpoint_wind =
+                        midpoint_weather
+                            ->for_delay(maneuver_delay, options.maneuver)
+                            .sample(midpoint);
+                    if (midpoint_wind) {
+                        const double midpoint_speed =
+                            midpoint_wind.value().speed_knots();
+                        const double midpoint_direction =
+                            midpoint_wind.value().direction_from_degrees();
+                        if (std::isfinite(midpoint_speed) &&
+                            std::isfinite(midpoint_direction) &&
+                            (!options.maximum_true_wind_speed_knots.has_value() ||
+                             midpoint_speed <=
+                                 *options.maximum_true_wind_speed_knots)) {
+                            const PolarSlice midpoint_slice = polar.slice_at(
+                                midpoint_speed,
+                                options.polar_angle_interpolation);
+                            const double midpoint_angle =
+                                detail::angular_difference_degrees(
+                                    heading, midpoint_direction);
+                            const auto refined = detail::boat_speed_for_angle(
+                                midpoint_slice,
+                                options,
+                                midpoint_angle);
+                            if (refined.has_value()) {
+                                flat_water_speed = *refined;
+                                boat_speed = *refined;
+                                performance_wind_speed = midpoint_speed;
+                                performance_wind_angle = midpoint_angle;
+                            }
                         }
                     }
                 }
-                if (boat_speed <= 0.0 ||
+                if (has_wave) {
+                    relative_wave_angle = detail::relative_wave_angle_degrees(
+                        heading, wave.direction_from_degrees);
+                    Result<double> derated = detail::apply_sea_state(
+                        environment,
+                        flat_water_speed,
+                        performance_wind_speed,
+                        performance_wind_angle,
+                        heading,
+                        wave,
+                        buffer.environment);
+                    if (!derated) {
+                        if (!buffer.environment_error.has_value()) {
+                            buffer.environment_error = derated.error();
+                        }
+                        return;
+                    }
+                    boat_speed = derated.value();
+                }
+                if (!std::isfinite(boat_speed) || boat_speed <= 0.0 ||
                     boat_speed < options.minimum_boat_speed_knots) {
                     continue;
                 }
+                ground = has_current
+                    ? detail::ground_velocity(heading, boat_speed, current)
+                    : detail::GroundVelocity{heading, boat_speed};
             }
 
-            const double segment_distance = boat_speed * usable_hours;
+            if (!(ground.speed_knots > 0.0)) {
+                continue;
+            }
+            const double segment_distance = ground.speed_knots * usable_hours;
             const Coordinate position = detail::destination_point_from(
                 geometry.origin,
-                heading,
+                ground.course_degrees,
                 segment_distance);
             Candidate candidate{
                 RoutePoint{
@@ -627,7 +781,8 @@ void expand_candidate_range(
                     wind_speed,
                     wind_direction,
                     parent.point.cumulative_distance_nautical_miles +
-                        segment_distance},
+                        segment_distance,
+                    std::nullopt},
                 parent_index,
                 detail::great_circle_distance_nautical_miles(
                     position,
@@ -637,7 +792,7 @@ void expand_candidate_range(
 
             const std::optional<double> fraction = arrival_fraction(
                 geometry,
-                heading,
+                ground.course_degrees,
                 segment_distance,
                 request.destination,
                 options.arrival_radius_nautical_miles);
@@ -653,7 +808,7 @@ void expand_candidate_range(
                                 *fraction))};
                 candidate.point.position = detail::destination_point_from(
                     geometry.origin,
-                    heading,
+                    ground.course_degrees,
                     travelled);
                 candidate.point.time = current_time + elapsed_seconds;
                 candidate.point.cumulative_distance_nautical_miles =
@@ -662,7 +817,47 @@ void expand_candidate_range(
                     detail::great_circle_distance_nautical_miles(
                         candidate.point.position,
                         request.destination);
+            }
 
+            if (has_current || has_wave) {
+                RoutePointEnvironment audit;
+                audit.speed_over_ground_knots = ground.speed_knots;
+                audit.course_over_ground_degrees = ground.course_degrees;
+                audit.current_east_knots = current.east_knots;
+                audit.current_north_knots = current.north_knots;
+                audit.flat_water_speed_knots = flat_water_speed;
+                audit.significant_wave_height_metres =
+                    wave.significant_height_metres;
+                audit.wave_period_seconds = wave.peak_period_seconds;
+                audit.relative_wave_angle_degrees = relative_wave_angle;
+                audit.current_applied = has_current;
+                audit.wave_applied = has_wave;
+                candidate.point.environment = audit;
+            }
+
+            if (environment_active) {
+                // Land and exclusion rejection happens before retention, so a
+                // rejected transition never reaches progress output either.
+                const detail::SegmentCheckResult check =
+                    detail::check_segment_geometry(
+                        environment,
+                        parent.point.position,
+                        parent.point.time,
+                        candidate.point.position,
+                        candidate.point.time,
+                        buffer.environment);
+                if (check.outcome == detail::EnvironmentOutcome::failed) {
+                    if (!buffer.environment_error.has_value()) {
+                        buffer.environment_error = *check.error;
+                    }
+                    return;
+                }
+                if (check.outcome == detail::EnvironmentOutcome::rejected) {
+                    continue;
+                }
+            }
+
+            if (fraction.has_value()) {
                 Arrival arrival{std::move(candidate), *fraction};
                 if (preserve_all_arrivals) {
                     buffer.arrivals.push_back(std::move(arrival));
@@ -681,9 +876,11 @@ class CandidateExpansionWorkers {
 public:
     CandidateExpansionWorkers(
         const VesselPolar& polar,
+        const RoutingEnvironment& environment,
         const RouteRequest& request,
         bool preserve_all_arrivals)
         : polar_(polar),
+          environment_(environment),
           request_(request),
           preserve_all_arrivals_(preserve_all_arrivals) {}
 
@@ -810,6 +1007,7 @@ private:
                 sampler_,
                 midpoint_sampler_,
                 polar_,
+                environment_,
                 request_,
                 *nodes_,
                 *frontier_,
@@ -857,6 +1055,7 @@ private:
     WeatherSampler sampler_;
     const MidpointWeatherSamplers* midpoint_sampler_{nullptr};
     const VesselPolar& polar_;
+    const RoutingEnvironment& environment_;
     const RouteRequest& request_;
     bool preserve_all_arrivals_{};
     std::vector<ExpansionBuffer> buffers_;
@@ -1104,7 +1303,9 @@ RouteResult make_route_result(
     const std::string& polar_source,
     std::vector<RoutePoint> points,
     std::vector<Isochrone> isochrones,
-    const RouteDiagnostics& diagnostics) {
+    const RouteDiagnostics& diagnostics,
+    const RoutingEnvironment& environment,
+    const EnvironmentDiagnostics& environment_diagnostics) {
     RouteResult result;
     result.departure_time = departure;
     result.arrival_time = points.back().time;
@@ -1115,6 +1316,10 @@ RouteResult make_route_result(
     result.points = std::move(points);
     result.isochrones = std::move(isochrones);
     result.diagnostics = diagnostics;
+    if (environment.active()) {
+        result.environment_diagnostics = environment_diagnostics;
+        result.environment = describe_environment(environment);
+    }
     return result;
 }
 
@@ -1175,6 +1380,18 @@ Error cancelled_error(const RouteDiagnostics& diagnostics) {
 
 Router::Router(WeatherDataset weather, VesselPolar polar)
     : weather_(std::move(weather)), polar_(std::move(polar)) {}
+
+Router::Router(
+    WeatherDataset weather,
+    VesselPolar polar,
+    RoutingEnvironment environment)
+    : weather_(std::move(weather)),
+      polar_(std::move(polar)),
+      environment_(std::move(environment)) {}
+
+const RoutingEnvironment& Router::environment() const noexcept {
+    return environment_;
+}
 
 Result<RouteResult> Router::optimize(const RouteRequest& request) const {
     return optimize_view_controlled(request, RoutingViewControlCallback{});
@@ -1252,6 +1469,11 @@ Result<RouteResult> Router::optimize_view_controlled(
         validation.has_value()) {
         return *validation;
     }
+    if (const std::optional<Error> validation =
+            validate_environment(environment_);
+        validation.has_value()) {
+        return *validation;
+    }
 
     const ForecastMetadata& metadata = weather_.metadata();
     const auto selected_departure = select_departure(request, metadata);
@@ -1280,6 +1502,7 @@ Result<RouteResult> Router::optimize_view_controlled(
         return detail::optimize_lattice_route(
             weather_,
             polar_,
+            environment_,
             request,
             departure,
             departure_source,
@@ -1287,6 +1510,7 @@ Result<RouteResult> Router::optimize_view_controlled(
     }
 
     RouteDiagnostics diagnostics;
+    EnvironmentDiagnostics environment_diagnostics;
     std::vector<SearchNode> nodes;
     nodes.reserve(1024);
     PruneScratch prune_scratch;
@@ -1298,7 +1522,8 @@ Result<RouteResult> Router::optimize_view_controlled(
             0.0,
             start_wind.value().speed_knots(),
             start_wind.value().direction_from_degrees(),
-            0.0},
+            0.0,
+            std::nullopt},
         no_parent});
 
     if (detail::great_circle_distance_nautical_miles(
@@ -1312,7 +1537,9 @@ Result<RouteResult> Router::optimize_view_controlled(
             polar_.source(),
             std::vector<RoutePoint>{nodes.front().point},
             {},
-            diagnostics);
+            diagnostics,
+            environment_,
+            environment_diagnostics);
     }
 
     std::vector<NodeIndex> frontier{0U};
@@ -1331,6 +1558,7 @@ Result<RouteResult> Router::optimize_view_controlled(
         static_cast<bool>(request.options.segment_eligibility);
     CandidateExpansionWorkers expansion_workers{
         polar_,
+        environment_,
         request,
         has_segment_eligibility};
     ProgressScratch progress_scratch;
@@ -1347,7 +1575,9 @@ Result<RouteResult> Router::optimize_view_controlled(
             polar_.source(),
             reconstruct_route(nodes, best_route_end),
             std::move(isochrones),
-            diagnostics);
+            diagnostics,
+            environment_,
+            environment_diagnostics);
     };
 
     while (!frontier.empty()) {
@@ -1371,6 +1601,7 @@ Result<RouteResult> Router::optimize_view_controlled(
         candidate_evaluations.clear();
         std::optional<Arrival> best_arrival;
         std::optional<Error> interpolation_error;
+        std::optional<Error> environment_error;
         std::size_t generated_this_step = 0U;
         std::size_t eligible_this_step = 0U;
 
@@ -1445,6 +1676,13 @@ Result<RouteResult> Router::optimize_view_controlled(
             diagnostics.expanded_nodes += buffer.expanded_nodes;
             diagnostics.generated_candidates += buffer.generated_candidates;
             generated_this_step += buffer.generated_candidates;
+            detail::merge(environment_diagnostics, buffer.environment);
+            // Buffers merge in worker-index order, so the surfaced error is the
+            // same whichever worker happened to finish first.
+            if (!environment_error.has_value() &&
+                buffer.environment_error.has_value()) {
+                environment_error = buffer.environment_error;
+            }
             if (!interpolation_error.has_value() &&
                 buffer.interpolation_error.has_value()) {
                 interpolation_error = buffer.interpolation_error;
@@ -1478,6 +1716,7 @@ Result<RouteResult> Router::optimize_view_controlled(
                 sampler,
                 midpoint_sampler,
                 polar_,
+                environment_,
                 request,
                 nodes,
                 frontier,
@@ -1489,6 +1728,9 @@ Result<RouteResult> Router::optimize_view_controlled(
                 heading_count,
                 has_segment_eligibility);
             merge_buffer(single_worker_buffer);
+            if (environment_error.has_value()) {
+                return *environment_error;
+            }
             if (single_worker_buffer.non_finite_wind) {
                 return Error{
                     ErrorCode::incomplete_forecast,
@@ -1521,6 +1763,9 @@ Result<RouteResult> Router::optimize_view_controlled(
                 merge_buffer(buffer);
                 non_finite_wind =
                     non_finite_wind || buffer.non_finite_wind;
+            }
+            if (environment_error.has_value()) {
+                return *environment_error;
             }
             if (non_finite_wind) {
                 return Error{
@@ -1592,7 +1837,9 @@ Result<RouteResult> Router::optimize_view_controlled(
                 polar_.source(),
                 reconstruct_route(nodes, nodes.size() - 1U),
                 std::move(isochrones),
-                diagnostics);
+                diagnostics,
+                environment_,
+                environment_diagnostics);
         }
 
         if (candidates.empty()) {

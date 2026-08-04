@@ -136,6 +136,41 @@ TEST_CASE("JSON conditionally includes lattice diagnostics") {
         std::string::npos);
 }
 
+TEST_CASE("JSON omits details for unconfigured environment providers") {
+    auto route = sample_route();
+    route.environment = sailroute::RouteEnvironmentMetadata{};
+    route.environment->current_provider =
+        sailroute::ProviderMetadata{"current", "unit test", "1"};
+
+    const auto serialized = sailroute::route_to_json(route);
+    REQUIRE(serialized.has_value());
+    REQUIRE(
+        serialized.value().find("\"currentProvider\":{\"name\":\"current\"") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"landmask\":null") != std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"exclusions\":null") != std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"landResolutionNauticalMiles\"") ==
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"landInterpolationErrorNauticalMiles\"") ==
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"landClearanceNauticalMiles\"") ==
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"exclusionBoundaryPolicy\"") ==
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"exclusionZoneCount\"") ==
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"exclusionRevision\"") ==
+        std::string::npos);
+}
+
 TEST_CASE("GPX serialization escapes XML and emits timestamped track points") {
     auto route = sample_route();
     route.points.front().position = {0.0000001, -0.0000001};
@@ -291,6 +326,14 @@ TEST_CASE("serialization rejects non-finite route values") {
 
     route = sample_route();
     route.points.front().position.latitude_degrees = 91.0;
+    const auto invalid_coordinate_json = sailroute::route_to_json(route);
+    REQUIRE(!invalid_coordinate_json.has_value());
+    REQUIRE(
+        invalid_coordinate_json.error().code ==
+        sailroute::ErrorCode::output_error);
+    REQUIRE(
+        invalid_coordinate_json.error().message.find("[-90, 90]") !=
+        std::string::npos);
     const auto gpx = sailroute::route_to_gpx(route);
     REQUIRE(!gpx.has_value());
     REQUIRE(gpx.error().code == sailroute::ErrorCode::output_error);
@@ -303,4 +346,37 @@ TEST_CASE("serialization rejects non-finite route values") {
     REQUIRE(
         isochrones_json.error().code ==
         sailroute::ErrorCode::output_error);
+
+    route = sample_route();
+    route.points.front().environment = sailroute::RoutePointEnvironment{};
+    route.points.front().environment->current_applied = true;
+    route.points.front().environment->current_east_knots =
+        std::numeric_limits<double>::infinity();
+    const auto current_json = sailroute::route_to_json(route);
+    REQUIRE(!current_json.has_value());
+    REQUIRE(
+        current_json.error().message.find("current_east_knots") !=
+        std::string::npos);
+    const auto current_gpx = sailroute::route_to_gpx(route);
+    REQUIRE(!current_gpx.has_value());
+    REQUIRE(
+        current_gpx.error().message.find("current_east_knots") !=
+        std::string::npos);
+
+    route = sample_route();
+    route.environment = sailroute::RouteEnvironmentMetadata{};
+    route.environment->landmask =
+        sailroute::ProviderMetadata{"land", "unit test", "1"};
+    route.environment->land_resolution_nautical_miles =
+        std::numeric_limits<double>::infinity();
+    const auto environment_json = sailroute::route_to_json(route);
+    REQUIRE(!environment_json.has_value());
+    REQUIRE(
+        environment_json.error().message.find(
+            "land_resolution_nautical_miles") != std::string::npos);
+    const auto environment_gpx = sailroute::route_to_gpx(route);
+    REQUIRE(!environment_gpx.has_value());
+    REQUIRE(
+        environment_gpx.error().message.find(
+            "land_resolution_nautical_miles") != std::string::npos);
 }

@@ -18,6 +18,9 @@ std::string_view to_string(ErrorCode code) noexcept {
         case ErrorCode::cancelled: return "cancelled";
         case ErrorCode::forecast_exhausted: return "forecast_exhausted";
         case ErrorCode::output_error: return "output_error";
+        case ErrorCode::invalid_environment: return "invalid_environment";
+        case ErrorCode::environment_data_unavailable:
+            return "environment_data_unavailable";
     }
     return "unknown";
 }
