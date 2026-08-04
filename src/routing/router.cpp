@@ -407,11 +407,6 @@ bool better_arrival(const Arrival& left, const Arrival& right) noexcept {
     return left.candidate.ordinal < right.candidate.ordinal;
 }
 
-// Extra headings appended per node when heading augmentation is enabled: the
-// bearing to the destination plus both boards of the upwind and downwind
-// velocity-made-good optima.
-constexpr std::size_t maximum_augmented_headings = 5U;
-
 void expand_candidate_range(
     ExpansionBuffer& buffer,
     const WeatherSampler& weather,
@@ -429,8 +424,19 @@ void expand_candidate_range(
     bool preserve_all_arrivals) {
     buffer.clear();
     const RoutingOptions& options = request.options;
+    const bool augment_bearing =
+        options.heading_augmentation == HeadingAugmentation::destination_bearing ||
+        options.heading_augmentation ==
+            HeadingAugmentation::destination_bearing_and_velocity_made_good;
+    const bool augment_velocity_made_good =
+        options.heading_augmentation == HeadingAugmentation::velocity_made_good ||
+        options.heading_augmentation ==
+            HeadingAugmentation::destination_bearing_and_velocity_made_good;
+    const std::size_t augmented_heading_count =
+        (augment_bearing ? 1U : 0U) +
+        (augment_velocity_made_good ? 4U : 0U);
     const std::size_t headings_per_parent =
-        heading_count + maximum_augmented_headings;
+        heading_count + augmented_heading_count;
     const std::size_t parent_count = end - begin;
     if (parent_count <=
         std::numeric_limits<std::size_t>::max() / headings_per_parent) {
@@ -441,14 +447,6 @@ void expand_candidate_range(
     }
 
     const bool penalise_maneuvers = options.maneuver.active();
-    const bool augment_bearing =
-        options.heading_augmentation == HeadingAugmentation::destination_bearing ||
-        options.heading_augmentation ==
-            HeadingAugmentation::destination_bearing_and_velocity_made_good;
-    const bool augment_velocity_made_good =
-        options.heading_augmentation == HeadingAugmentation::velocity_made_good ||
-        options.heading_augmentation ==
-            HeadingAugmentation::destination_bearing_and_velocity_made_good;
 
     for (std::size_t frontier_index = begin; frontier_index < end;
          ++frontier_index) {
