@@ -169,6 +169,79 @@ enum class RouteCompletion {
     forecast_exhausted,
 };
 
+/// Time deducted from a step when a candidate heading changes tack or gybe.
+///
+/// A sailboat loses time and distance through every tack and gybe, but an
+/// isochrone search has no memory of which board a node is on, so it will
+/// happily zigzag for free and report an arrival no real boat can match. When
+/// any penalty is non-zero the search tracks the board each node is sailing and
+/// charges these costs, and pruning keeps the best candidate on each board so a
+/// marginally-closer wrong-tack candidate no longer displaces a faster one.
+///
+/// All penalties default to zero, which reproduces the unpenalised search.
+struct ManeuverPenalties {
+    std::chrono::seconds tack_penalty{0};
+    std::chrono::seconds gybe_penalty{0};
+    /// A true wind angle at or below this counts as upwind, so a board change
+    /// is a tack.
+    double upwind_true_wind_angle_degrees{90.0};
+    /// A true wind angle at or above this counts as downwind, so a board change
+    /// is a gybe. Between the two thresholds a board change is charged as a tack.
+    double downwind_true_wind_angle_degrees{150.0};
+
+    [[nodiscard]] bool active() const noexcept {
+        return tack_penalty > std::chrono::seconds::zero() ||
+            gybe_penalty > std::chrono::seconds::zero();
+    }
+};
+
+/// Extra headings evaluated per node beyond the fixed heading grid.
+enum class HeadingAugmentation {
+    /// Only multiples of `heading_step_degrees`, measured from 0 degrees true.
+    none,
+    /// Also the great-circle bearing to the destination.
+    destination_bearing,
+    /// Also the headings that maximise upwind and downwind velocity made good.
+    velocity_made_good,
+    /// Both of the above.
+    destination_bearing_and_velocity_made_good,
+};
+
+/// Where along a step the wind used to advance a candidate is sampled.
+enum class WindSampling {
+    /// One sample at the segment start, held for the whole step.
+    segment_start,
+    /// A second sample at the midpoint of a provisional segment, which raises
+    /// the integration from first to second order.
+    midpoint,
+};
+
+/// How boat speed is interpolated between the polar's true wind angle rows.
+enum class PolarAngleInterpolation {
+    /// Straight lines between rows.
+    linear,
+    /// Monotone cubic (PCHIP) through the rows, which resolves the polar's
+    /// peaks without the overshoot an unconstrained spline would introduce.
+    monotone_cubic,
+};
+
+/// What to do when the true wind speed exceeds the polar's last column.
+enum class AbovePolarRangePolicy {
+    /// Hold the polar's highest tabulated wind speed.
+    clamp,
+    /// Treat the vessel as unable to sail, which removes the candidate.
+    no_speed,
+};
+
+/// Which candidates a pruning pass keeps as the frontier advances.
+enum class PruningStrategy {
+    /// Grid buckets in destination-relative east/north nautical miles.
+    destination_distance_grid,
+    /// Sectors of bearing from the destination, which stay proportional to
+    /// range and so preserve wide-angle diversity further out.
+    bearing_sectors,
+};
+
 /// Search resolution, pruning, concurrency, progress, and eligibility controls.
 struct RoutingOptions {
     std::chrono::minutes time_step{30};
@@ -187,6 +260,25 @@ struct RoutingOptions {
         {std::chrono::minutes{180}, std::nullopt},
     };
     RoutingProgressOptions progress;
+
+    // Accuracy controls. Every default below reproduces the search exactly as it
+    // behaved before these options existed.
+    ManeuverPenalties maneuver;
+    HeadingAugmentation heading_augmentation{HeadingAugmentation::none};
+    WindSampling wind_sampling{WindSampling::segment_start};
+    /// Skips midpoint sampling for steps shorter than this, where the extra
+    /// interpolation buys little. Zero applies it to every step.
+    std::chrono::minutes midpoint_wind_sampling_threshold{0};
+    PolarAngleInterpolation polar_angle_interpolation{
+        PolarAngleInterpolation::linear};
+    /// Wind speed above which the vessel is treated as unable to sail, modelling
+    /// a storm limit the polar itself does not express. Unset imposes no limit.
+    std::optional<double> maximum_true_wind_speed_knots;
+    AbovePolarRangePolicy above_polar_range{AbovePolarRangePolicy::clamp};
+    PruningStrategy pruning_strategy{PruningStrategy::destination_distance_grid};
+    /// Angular width of a bearing sector, used only by `bearing_sectors`.
+    double pruning_sector_degrees{2.0};
+
     // Empty accepts every segment without invocation. Otherwise called
     // synchronously before retention; true accepts and false rejects.
     // The view is valid only for the callback.

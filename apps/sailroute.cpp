@@ -59,6 +59,18 @@ void print_help(std::ostream& output) {
         "  --arrival-radius-nm N               Arrival radius (> 0)\n"
         "  --spatial-bucket-nm N               Spatial pruning bucket size (> 0)\n"
         "  --max-nodes-per-bucket N            Nodes retained per bucket (> 0)\n"
+        "  --tack-penalty-seconds N            Time lost to a tack (default 0)\n"
+        "  --gybe-penalty-seconds N            Time lost to a gybe (default 0)\n"
+        "  --upwind-twa-degrees N              Upwind TWA threshold (default 90)\n"
+        "  --downwind-twa-degrees N            Downwind TWA threshold (default 150)\n"
+        "  --heading-augmentation MODE         none|destination-bearing|vmg|both\n"
+        "  --wind-sampling MODE                segment-start|midpoint\n"
+        "  --midpoint-wind-threshold-minutes N Minimum step for midpoint sampling\n"
+        "  --polar-angle-interpolation MODE    linear|monotone-cubic\n"
+        "  --maximum-wind-speed-knots N        Wind speed the vessel will not sail in\n"
+        "  --above-polar-range MODE            clamp|no-speed\n"
+        "  --pruning-strategy MODE             distance-grid|bearing-sectors\n"
+        "  --pruning-sector-degrees N          Sector width for bearing-sectors\n"
         "  --worker-count N                    Worker threads (0 selects automatic)\n"
         "  --maximum-route-duration-hours N    Maximum route duration (> 0)\n"
         "  --minimum-boat-speed-knots N        Minimum usable speed (>= 0)\n"
@@ -243,6 +255,18 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
     bool workers_seen = false;
     bool max_duration_seen = false;
     bool minimum_speed_seen = false;
+    bool tack_penalty_seen = false;
+    bool gybe_penalty_seen = false;
+    bool upwind_threshold_seen = false;
+    bool downwind_threshold_seen = false;
+    bool heading_augmentation_seen = false;
+    bool wind_sampling_seen = false;
+    bool midpoint_threshold_seen = false;
+    bool polar_interpolation_seen = false;
+    bool maximum_wind_speed_seen = false;
+    bool above_polar_range_seen = false;
+    bool pruning_strategy_seen = false;
+    bool pruning_sector_seen = false;
 
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument{argv[index]};
@@ -482,6 +506,207 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
                 return usage_error("--max-nodes-per-bucket must be a positive integer");
             }
             options.routing.max_nodes_per_bucket = static_cast<std::size_t>(parsed);
+        } else if (
+            argument == "--tack-penalty-seconds" ||
+            argument == "--gybe-penalty-seconds") {
+            const bool is_tack = argument == "--tack-penalty-seconds";
+            if (const auto duplicate = reject_duplicate(
+                    is_tack ? tack_penalty_seen : gybe_penalty_seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            unsigned long long parsed = 0;
+            using Rep = std::chrono::seconds::rep;
+            if (!parse_unsigned(value.value(), parsed) ||
+                parsed > static_cast<unsigned long long>(
+                             std::numeric_limits<Rep>::max())) {
+                return usage_error(
+                    std::string{argument} + " must be a non-negative integer");
+            }
+            const std::chrono::seconds penalty{static_cast<Rep>(parsed)};
+            if (is_tack) {
+                options.routing.maneuver.tack_penalty = penalty;
+            } else {
+                options.routing.maneuver.gybe_penalty = penalty;
+            }
+        } else if (
+            argument == "--upwind-twa-degrees" ||
+            argument == "--downwind-twa-degrees") {
+            const bool is_upwind = argument == "--upwind-twa-degrees";
+            if (const auto duplicate = reject_duplicate(
+                    is_upwind ? upwind_threshold_seen : downwind_threshold_seen,
+                    argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            double parsed = 0.0;
+            if (!parse_double(value.value(), parsed) || parsed < 0.0 ||
+                parsed > 180.0) {
+                return usage_error(std::string{argument} + " must be in [0,180]");
+            }
+            if (is_upwind) {
+                options.routing.maneuver.upwind_true_wind_angle_degrees = parsed;
+            } else {
+                options.routing.maneuver.downwind_true_wind_angle_degrees = parsed;
+            }
+        } else if (argument == "--heading-augmentation") {
+            if (const auto duplicate =
+                    reject_duplicate(heading_augmentation_seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            const std::string_view text = value.value();
+            if (text == "none") {
+                options.routing.heading_augmentation =
+                    sailroute::HeadingAugmentation::none;
+            } else if (text == "destination-bearing") {
+                options.routing.heading_augmentation =
+                    sailroute::HeadingAugmentation::destination_bearing;
+            } else if (text == "vmg") {
+                options.routing.heading_augmentation =
+                    sailroute::HeadingAugmentation::velocity_made_good;
+            } else if (text == "both") {
+                options.routing.heading_augmentation = sailroute::
+                    HeadingAugmentation::destination_bearing_and_velocity_made_good;
+            } else {
+                return usage_error(
+                    "--heading-augmentation must be none, destination-bearing, "
+                    "vmg, or both");
+            }
+        } else if (argument == "--wind-sampling") {
+            if (const auto duplicate = reject_duplicate(wind_sampling_seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            const std::string_view text = value.value();
+            if (text == "segment-start") {
+                options.routing.wind_sampling = sailroute::WindSampling::segment_start;
+            } else if (text == "midpoint") {
+                options.routing.wind_sampling = sailroute::WindSampling::midpoint;
+            } else {
+                return usage_error(
+                    "--wind-sampling must be segment-start or midpoint");
+            }
+        } else if (argument == "--midpoint-wind-threshold-minutes") {
+            if (const auto duplicate =
+                    reject_duplicate(midpoint_threshold_seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            unsigned long long parsed = 0;
+            using Rep = std::chrono::minutes::rep;
+            if (!parse_unsigned(value.value(), parsed) ||
+                parsed > static_cast<unsigned long long>(
+                             std::numeric_limits<Rep>::max())) {
+                return usage_error(
+                    std::string{argument} + " must be a non-negative integer");
+            }
+            options.routing.midpoint_wind_sampling_threshold =
+                std::chrono::minutes{static_cast<Rep>(parsed)};
+        } else if (argument == "--polar-angle-interpolation") {
+            if (const auto duplicate =
+                    reject_duplicate(polar_interpolation_seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            const std::string_view text = value.value();
+            if (text == "linear") {
+                options.routing.polar_angle_interpolation =
+                    sailroute::PolarAngleInterpolation::linear;
+            } else if (text == "monotone-cubic") {
+                options.routing.polar_angle_interpolation =
+                    sailroute::PolarAngleInterpolation::monotone_cubic;
+            } else {
+                return usage_error(
+                    "--polar-angle-interpolation must be linear or monotone-cubic");
+            }
+        } else if (argument == "--maximum-wind-speed-knots") {
+            if (const auto duplicate =
+                    reject_duplicate(maximum_wind_speed_seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            double parsed = 0.0;
+            if (!parse_double(value.value(), parsed) || parsed <= 0.0) {
+                return usage_error(
+                    std::string{argument} + " must be greater than zero");
+            }
+            options.routing.maximum_true_wind_speed_knots = parsed;
+        } else if (argument == "--above-polar-range") {
+            if (const auto duplicate =
+                    reject_duplicate(above_polar_range_seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            const std::string_view text = value.value();
+            if (text == "clamp") {
+                options.routing.above_polar_range =
+                    sailroute::AbovePolarRangePolicy::clamp;
+            } else if (text == "no-speed") {
+                options.routing.above_polar_range =
+                    sailroute::AbovePolarRangePolicy::no_speed;
+            } else {
+                return usage_error("--above-polar-range must be clamp or no-speed");
+            }
+        } else if (argument == "--pruning-strategy") {
+            if (const auto duplicate =
+                    reject_duplicate(pruning_strategy_seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            const std::string_view text = value.value();
+            if (text == "distance-grid") {
+                options.routing.pruning_strategy =
+                    sailroute::PruningStrategy::destination_distance_grid;
+            } else if (text == "bearing-sectors") {
+                options.routing.pruning_strategy =
+                    sailroute::PruningStrategy::bearing_sectors;
+            } else {
+                return usage_error(
+                    "--pruning-strategy must be distance-grid or bearing-sectors");
+            }
+        } else if (argument == "--pruning-sector-degrees") {
+            if (const auto duplicate =
+                    reject_duplicate(pruning_sector_seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            double parsed = 0.0;
+            if (!parse_double(value.value(), parsed) || parsed <= 0.0 ||
+                parsed > 180.0) {
+                return usage_error(std::string{argument} + " must be in (0,180]");
+            }
+            options.routing.pruning_sector_degrees = parsed;
         } else if (is_option(argument, "--worker-count", "--workers")) {
             if (const auto duplicate = reject_duplicate(workers_seen, "--worker-count")) {
                 return *duplicate;

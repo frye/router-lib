@@ -128,3 +128,107 @@ TEST_CASE("sample First 44-class polar loads") {
     REQUIRE(loaded.value().boat_speed_knots(12.0, 45.0) > 7.0);
     REQUIRE(loaded.value().boat_speed_knots(20.0, 135.0) > 10.0);
 }
+
+TEST_CASE("monotone cubic polar interpolation passes through tabulated rows") {
+    const PolarFixture fixture{
+        "test_polar_pchip.csv",
+        "TWA/TWS,0,10\n"
+        "0,0,0\n"
+        "40,0,5\n"
+        "60,0,7\n"
+        "90,0,8\n"
+        "120,0,9\n"
+        "150,0,6\n"
+        "180,0,4\n"};
+
+    const auto loaded = sailroute::VesselPolar::load(fixture.path());
+    REQUIRE(loaded.has_value());
+    const sailroute::PolarSlice cubic = loaded.value().slice_at(
+        10.0, sailroute::PolarAngleInterpolation::monotone_cubic);
+    REQUIRE(cubic.valid());
+
+    // Interpolation must reproduce every tabulated row exactly.
+    REQUIRE_NEAR(cubic.speed_knots(40.0), 5.0, 1e-12);
+    REQUIRE_NEAR(cubic.speed_knots(90.0), 8.0, 1e-12);
+    REQUIRE_NEAR(cubic.speed_knots(120.0), 9.0, 1e-12);
+    REQUIRE_NEAR(cubic.speed_knots(180.0), 4.0, 1e-12);
+}
+
+TEST_CASE("monotone cubic polar interpolation does not overshoot") {
+    const PolarFixture fixture{
+        "test_polar_pchip_shape.csv",
+        "TWA/TWS,0,10\n"
+        "0,0,0\n"
+        "40,0,5\n"
+        "60,0,7\n"
+        "90,0,8\n"
+        "120,0,9\n"
+        "150,0,6\n"
+        "180,0,4\n"};
+
+    const auto loaded = sailroute::VesselPolar::load(fixture.path());
+    REQUIRE(loaded.has_value());
+    const sailroute::PolarSlice cubic = loaded.value().slice_at(
+        10.0, sailroute::PolarAngleInterpolation::monotone_cubic);
+
+    // A shape-preserving scheme stays inside the bracketing rows on every
+    // monotone stretch, unlike an unconstrained spline.
+    for (int step = 0; step <= 100; ++step) {
+        const double angle = 40.0 + 0.2 * static_cast<double>(step);
+        const double speed = cubic.speed_knots(angle);
+        REQUIRE(speed >= 5.0 - 1e-12);
+        REQUIRE(speed <= 8.0 + 1e-12);
+    }
+    for (int step = 0; step <= 100; ++step) {
+        const double angle = 150.0 + 0.3 * static_cast<double>(step);
+        const double speed = cubic.speed_knots(angle);
+        REQUIRE(speed >= 4.0 - 1e-12);
+        REQUIRE(speed <= 6.0 + 1e-12);
+    }
+}
+
+TEST_CASE("polar slice matches direct lookup and reports wind range") {
+    const auto polar = sailroute::VesselPolar::default_racer_cruiser_45ft();
+    const double maximum = polar.maximum_tabulated_wind_speed_knots();
+    REQUIRE(maximum > 0.0);
+
+    for (const double wind : {2.0, 6.5, 12.0, 18.0}) {
+        const sailroute::PolarSlice slice = polar.slice_at(wind);
+        REQUIRE(!slice.above_tabulated_wind_speed());
+        for (const double angle : {0.0, 35.0, 52.5, 90.0, 135.0, 175.0, 180.0}) {
+            REQUIRE(slice.speed_knots(angle) == polar.boat_speed_knots(wind, angle));
+        }
+    }
+
+    const sailroute::PolarSlice above = polar.slice_at(maximum + 25.0);
+    REQUIRE(above.above_tabulated_wind_speed());
+    REQUIRE(above.speed_knots(90.0) == polar.boat_speed_knots(maximum, 90.0));
+}
+
+TEST_CASE("velocity made good angles bracket the polar optima") {
+    const auto polar = sailroute::VesselPolar::default_racer_cruiser_45ft();
+    const sailroute::PolarSlice slice = polar.slice_at(12.0);
+    const sailroute::VelocityMadeGoodAngles optima =
+        slice.velocity_made_good_angles();
+    REQUIRE(optima.valid);
+    REQUIRE(optima.upwind_degrees > 0.0);
+    REQUIRE(optima.upwind_degrees < 90.0);
+    REQUIRE(optima.downwind_degrees > 90.0);
+    REQUIRE(optima.downwind_degrees < 180.0);
+
+    // The reported angles must beat a one-degree sweep of every alternative.
+    const double best_upwind =
+        slice.speed_knots(optima.upwind_degrees) *
+        std::cos(optima.upwind_degrees * 3.14159265358979323846 / 180.0);
+    const double best_downwind =
+        -slice.speed_knots(optima.downwind_degrees) *
+        std::cos(optima.downwind_degrees * 3.14159265358979323846 / 180.0);
+    for (int angle = 1; angle < 180; ++angle) {
+        const double radians =
+            static_cast<double>(angle) * 3.14159265358979323846 / 180.0;
+        const double made_good =
+            slice.speed_knots(static_cast<double>(angle)) * std::cos(radians);
+        REQUIRE(made_good <= best_upwind + 1e-6);
+        REQUIRE(-made_good <= best_downwind + 1e-6);
+    }
+}

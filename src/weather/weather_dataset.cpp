@@ -1460,6 +1460,159 @@ const ForecastMetadata& WeatherDataset::metadata() const {
     return empty_metadata;
 }
 
+namespace {
+
+// Forecast steps surrounding a requested time, with the blend fraction between
+// them. `lower == upper` means the request landed exactly on a step.
+struct TimeBracket {
+    std::size_t lower{0};
+    std::size_t upper{0};
+    double fraction{0.0};
+};
+
+}  // namespace
+
+struct WeatherSampler::Impl {
+    std::shared_ptr<const WeatherDataset::Impl> dataset;
+    TimeBracket bracket;
+    std::optional<Error> time_error;
+};
+
+namespace {
+
+template <typename DatasetImpl>
+std::optional<Error> check_coordinate_bounds(
+    const DatasetImpl& dataset,
+    Coordinate coordinate) {
+    if (!dataset.bounds) {
+        return std::nullopt;
+    }
+
+    const GeographicBounds& bounds = *dataset.bounds;
+    double longitude_span =
+        bounds.east_longitude_degrees - bounds.west_longitude_degrees;
+    if (longitude_span < 0.0) {
+        longitude_span += kLongitudePeriod;
+    }
+    if (bounds.west_longitude_degrees == -180.0 &&
+        bounds.east_longitude_degrees == 180.0) {
+        longitude_span = kLongitudePeriod;
+    }
+    double longitude_delta =
+        normalize_longitude(coordinate.longitude_degrees) -
+        normalize_longitude(bounds.west_longitude_degrees);
+    while (longitude_delta < 0.0) {
+        longitude_delta += kLongitudePeriod;
+    }
+    const double tolerance = 1.0e-8;
+    if (!std::isfinite(coordinate.latitude_degrees) ||
+        !std::isfinite(coordinate.longitude_degrees) ||
+        coordinate.latitude_degrees < bounds.south_latitude_degrees - tolerance ||
+        coordinate.latitude_degrees > bounds.north_latitude_degrees + tolerance ||
+        longitude_delta > longitude_span + tolerance) {
+        return Error{
+            ErrorCode::coordinate_outside_forecast,
+            "coordinate is outside the requested weather bounds"};
+    }
+    return std::nullopt;
+}
+
+template <typename DatasetImpl>
+Result<TimeBracket> resolve_time_bracket(
+    const DatasetImpl& dataset,
+    TimePoint time) {
+    const auto upper =
+        std::lower_bound(dataset.times.begin(), dataset.times.end(), time);
+    TimeBracket bracket;
+    if (upper == dataset.times.end()) {
+        if (time != dataset.times.back()) {
+            return Error{
+                ErrorCode::departure_outside_forecast,
+                "requested time is after forecast coverage"};
+        }
+        bracket.lower = dataset.times.size() - 1U;
+        bracket.upper = bracket.lower;
+        return bracket;
+    }
+    if (*upper == time) {
+        bracket.lower =
+            static_cast<std::size_t>(std::distance(dataset.times.begin(), upper));
+        bracket.upper = bracket.lower;
+        return bracket;
+    }
+    if (upper == dataset.times.begin()) {
+        return Error{
+            ErrorCode::departure_outside_forecast,
+            "requested time is before forecast coverage"};
+    }
+
+    bracket.upper =
+        static_cast<std::size_t>(std::distance(dataset.times.begin(), upper));
+    bracket.lower = bracket.upper - 1U;
+    const auto interval = dataset.times[bracket.upper] - dataset.times[bracket.lower];
+    const auto elapsed = time - dataset.times[bracket.lower];
+    const double interval_seconds = static_cast<double>(
+        std::chrono::duration_cast<std::chrono::seconds>(interval).count());
+    const double elapsed_seconds = static_cast<double>(
+        std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
+    if (interval_seconds <= 0.0) {
+        return Error{
+            ErrorCode::incomplete_forecast,
+            "forecast valid times are not strictly increasing"};
+    }
+    bracket.fraction = elapsed_seconds / interval_seconds;
+    return bracket;
+}
+
+template <typename DatasetImpl>
+Result<Wind> sample_bracket(
+    const DatasetImpl& dataset,
+    const TimeBracket& time,
+    Coordinate coordinate) {
+    auto bracket_result = spatial_bracket(dataset.grid, coordinate);
+    if (!bracket_result) {
+        return bracket_result.error();
+    }
+    const SpatialBracket bracket = bracket_result.value();
+
+    auto east0_result =
+        bilinear_sample(dataset.east_values, dataset.grid, time.lower, bracket, "U");
+    if (!east0_result) {
+        return east0_result.error();
+    }
+    auto north0_result =
+        bilinear_sample(dataset.north_values, dataset.grid, time.lower, bracket, "V");
+    if (!north0_result) {
+        return north0_result.error();
+    }
+
+    if (time.lower == time.upper) {
+        return Wind{east0_result.value(), north0_result.value()};
+    }
+
+    auto east1_result =
+        bilinear_sample(dataset.east_values, dataset.grid, time.upper, bracket, "U");
+    if (!east1_result) {
+        return east1_result.error();
+    }
+    auto north1_result =
+        bilinear_sample(dataset.north_values, dataset.grid, time.upper, bracket, "V");
+    if (!north1_result) {
+        return north1_result.error();
+    }
+
+    return Wind{
+        east0_result.value() +
+            (east1_result.value() - east0_result.value()) * time.fraction,
+        north0_result.value() +
+            (north1_result.value() - north0_result.value()) * time.fraction};
+}
+
+}  // namespace
+
+// Splitting the time bracket away from the spatial sample lets a routing step
+// resolve it once. `interpolate` keeps its original order of validation so its
+// reported error is unchanged when a request is invalid in more than one way.
 Result<Wind> WeatherDataset::interpolate(
     Coordinate coordinate,
     TimePoint time) const {
@@ -1468,136 +1621,60 @@ Result<Wind> WeatherDataset::interpolate(
             ErrorCode::incomplete_forecast,
             "weather dataset is empty"};
     }
-    if (impl_->bounds) {
-        const GeographicBounds& bounds = *impl_->bounds;
-        double longitude_span =
-            bounds.east_longitude_degrees - bounds.west_longitude_degrees;
-        if (longitude_span < 0.0) {
-            longitude_span += kLongitudePeriod;
-        }
-        if (bounds.west_longitude_degrees == -180.0 &&
-            bounds.east_longitude_degrees == 180.0) {
-            longitude_span = kLongitudePeriod;
-        }
-        double longitude_delta =
-            normalize_longitude(coordinate.longitude_degrees) -
-            normalize_longitude(bounds.west_longitude_degrees);
-        while (longitude_delta < 0.0) {
-            longitude_delta += kLongitudePeriod;
-        }
-        const double tolerance = 1.0e-8;
-        if (!std::isfinite(coordinate.latitude_degrees) ||
-            !std::isfinite(coordinate.longitude_degrees) ||
-            coordinate.latitude_degrees <
-                bounds.south_latitude_degrees - tolerance ||
-            coordinate.latitude_degrees >
-                bounds.north_latitude_degrees + tolerance ||
-            longitude_delta > longitude_span + tolerance) {
-            return Error{
-                ErrorCode::coordinate_outside_forecast,
-                "coordinate is outside the requested weather bounds"};
-        }
+    if (auto bounds_error = check_coordinate_bounds(*impl_, coordinate)) {
+        return bounds_error.value();
     }
 
-    const auto upper =
-        std::lower_bound(impl_->times.begin(), impl_->times.end(), time);
-    std::size_t time0 = 0;
-    std::size_t time1 = 0;
-    double time_fraction = 0.0;
-    if (upper == impl_->times.end()) {
-        if (time != impl_->times.back()) {
-            return Error{
-                ErrorCode::departure_outside_forecast,
-                "requested time is after forecast coverage"};
-        }
-        time0 = impl_->times.size() - 1U;
-        time1 = time0;
-    } else if (*upper == time) {
-        time0 = static_cast<std::size_t>(
-            std::distance(impl_->times.begin(), upper));
-        time1 = time0;
-    } else {
-        if (upper == impl_->times.begin()) {
-            return Error{
-                ErrorCode::departure_outside_forecast,
-                "requested time is before forecast coverage"};
-        }
-        time1 = static_cast<std::size_t>(
-            std::distance(impl_->times.begin(), upper));
-        time0 = time1 - 1U;
-        const auto interval = impl_->times[time1] - impl_->times[time0];
-        const auto elapsed = time - impl_->times[time0];
-        const double interval_seconds =
-            static_cast<double>(
-                std::chrono::duration_cast<std::chrono::seconds>(interval).count());
-        const double elapsed_seconds =
-            static_cast<double>(
-                std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
-        if (interval_seconds <= 0.0) {
-            return Error{
-                ErrorCode::incomplete_forecast,
-                "forecast valid times are not strictly increasing"};
-        }
-        time_fraction = elapsed_seconds / interval_seconds;
+    auto bracket = resolve_time_bracket(*impl_, time);
+    if (!bracket) {
+        return bracket.error();
+    }
+    return sample_bracket(*impl_, bracket.value(), coordinate);
+}
+
+Result<WeatherSampler> WeatherDataset::sampler_at(TimePoint time) const {
+    if (!impl_ || impl_->times.empty()) {
+        return Error{
+            ErrorCode::incomplete_forecast,
+            "weather dataset is empty"};
     }
 
-    auto bracket_result = spatial_bracket(impl_->grid, coordinate);
-    if (!bracket_result) {
-        return bracket_result.error();
-    }
-    const SpatialBracket bracket = bracket_result.value();
+    // A time outside forecast coverage is carried on the sampler rather than
+    // reported here. `interpolate` validates the coordinate before the time, so
+    // a request that is invalid in both ways reports the coordinate problem;
+    // deferring keeps `sample` reporting exactly what `interpolate` would.
+    auto bracket = resolve_time_bracket(*impl_, time);
+    WeatherSampler sampler;
+    sampler.impl_ = std::make_shared<const WeatherSampler::Impl>(
+        bracket
+            ? WeatherSampler::Impl{impl_, bracket.value(), std::nullopt}
+            : WeatherSampler::Impl{impl_, TimeBracket{}, bracket.error()});
+    return sampler;
+}
 
-    auto east0_result =
-        bilinear_sample(
-            impl_->east_values,
-            impl_->grid,
-            time0,
-            bracket,
-            "U");
-    if (!east0_result) {
-        return east0_result.error();
-    }
-    auto north0_result =
-        bilinear_sample(
-            impl_->north_values,
-            impl_->grid,
-            time0,
-            bracket,
-            "V");
-    if (!north0_result) {
-        return north0_result.error();
-    }
+WeatherSampler::WeatherSampler() noexcept = default;
+WeatherSampler::~WeatherSampler() = default;
+WeatherSampler::WeatherSampler(const WeatherSampler&) = default;
+WeatherSampler::WeatherSampler(WeatherSampler&&) noexcept = default;
+WeatherSampler& WeatherSampler::operator=(const WeatherSampler&) = default;
+WeatherSampler& WeatherSampler::operator=(WeatherSampler&&) noexcept = default;
 
-    if (time0 == time1) {
-        return Wind{east0_result.value(), north0_result.value()};
-    }
+bool WeatherSampler::valid() const noexcept { return impl_ != nullptr; }
 
-    auto east1_result =
-        bilinear_sample(
-            impl_->east_values,
-            impl_->grid,
-            time1,
-            bracket,
-            "U");
-    if (!east1_result) {
-        return east1_result.error();
+Result<Wind> WeatherSampler::sample(Coordinate coordinate) const {
+    if (!impl_) {
+        return Error{
+            ErrorCode::incomplete_forecast,
+            "weather sampler is empty"};
     }
-    auto north1_result =
-        bilinear_sample(
-            impl_->north_values,
-            impl_->grid,
-            time1,
-            bracket,
-            "V");
-    if (!north1_result) {
-        return north1_result.error();
+    const auto& dataset = *impl_->dataset;
+    if (auto bounds_error = check_coordinate_bounds(dataset, coordinate)) {
+        return bounds_error.value();
     }
-
-    return Wind{
-        east0_result.value() +
-            (east1_result.value() - east0_result.value()) * time_fraction,
-        north0_result.value() +
-            (north1_result.value() - north0_result.value()) * time_fraction};
+    if (impl_->time_error) {
+        return impl_->time_error.value();
+    }
+    return sample_bracket(dataset, impl_->bracket, coordinate);
 }
 
 }  // namespace sailroute

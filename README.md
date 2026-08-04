@@ -101,6 +101,40 @@ The router retains up to 10 nodes per spatial bucket by default. Increase
 `--max-nodes-per-bucket` to preserve a larger set of alternate paths, or reduce
 it when runtime and memory are more important than search breadth.
 
+The accuracy options described under
+[Accuracy modeling](#accuracy-modeling) have matching flags, all defaulting to
+the behavior described above:
+
+| Flag | Values |
+| --- | --- |
+| `--tack-penalty-seconds N` | non-negative integer, default `0` |
+| `--gybe-penalty-seconds N` | non-negative integer, default `0` |
+| `--upwind-twa-degrees N` | `[0,180]`, default `90` |
+| `--downwind-twa-degrees N` | `[0,180]`, default `150` |
+| `--heading-augmentation MODE` | `none`, `destination-bearing`, `vmg`, `both` |
+| `--wind-sampling MODE` | `segment-start`, `midpoint` |
+| `--midpoint-wind-threshold-minutes N` | non-negative integer, default `0` |
+| `--polar-angle-interpolation MODE` | `linear`, `monotone-cubic` |
+| `--maximum-wind-speed-knots N` | positive, unset by default |
+| `--above-polar-range MODE` | `clamp`, `no-speed` |
+| `--pruning-strategy MODE` | `distance-grid`, `bearing-sectors` |
+| `--pruning-sector-degrees N` | `(0,180]`, default `2` |
+
+For example, to charge for maneuvers, sail the polar's VMG optima, and resolve
+the polar peak with a shape-preserving fit:
+
+```sh
+./build/sailroute \
+  --grib forecast.grib2 \
+  --start 48.294300,-123.531697 \
+  --destination 48.141100,-123.402687 \
+  --tack-penalty-seconds 60 \
+  --gybe-penalty-seconds 30 \
+  --heading-augmentation both \
+  --polar-angle-interpolation monotone-cubic \
+  --wind-sampling midpoint
+```
+
 The CLI returns `0` on success (including a forecast-exhausted partial route),
 `2` for command-line usage errors, `3` for weather or polar input errors, `4`
 for routing errors, and `5` for serialization or file-output errors.
@@ -213,6 +247,28 @@ clamps values outside either axis to the nearest edge. Non-finite inputs and
 non-positive true-wind speeds return zero. `source()` identifies the loaded or
 built-in data.
 
+Both types expose a prepared-lookup form for the common case of many samples
+sharing one coordinate of the lookup. `WeatherDataset::sampler_at(time)` resolves
+the forecast time bracket once and returns a `WeatherSampler` whose `sample()`
+takes only a coordinate. `VesselPolar::slice_at(wind_speed)` resolves the wind
+column once and returns a `PolarSlice` whose `speed_knots()` takes only a true
+wind angle. Both borrow nothing that can dangle: the sampler shares ownership of
+the forecast, and a slice is valid for the lifetime of its polar.
+
+```cpp
+const auto sampler = weather.sampler_at(when);
+const sailroute::PolarSlice slice = polar.slice_at(20.0);
+const double speed = slice.speed_knots(52.0);
+```
+
+`sampler_at` reports errors exactly where `interpolate` does. A time outside
+forecast coverage is carried on the sampler and surfaced by `sample()` only
+after the coordinate is validated, so a request invalid in both respects reports
+the coordinate problem, matching `interpolate`. `slice_at` also reports whether
+the wind speed was past the polar's last column via
+`PolarSlice::above_tabulated_wind_speed()`, and
+`VesselPolar::maximum_tabulated_wind_speed_knots()` returns that column.
+
 ### Routing configuration
 
 `RouteRequest` contains the start, destination, optional departure time, and
@@ -234,6 +290,25 @@ the following `RoutingOptions`:
 | `progress` | every step, points + route | View callback cadence and payload selection |
 | `segment_eligibility` | empty | Optional synchronous candidate predicate |
 
+The following accuracy controls are opt-in. Every default reproduces the search
+exactly as it behaved before these options existed, so enabling none of them
+leaves routes bit-identical.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `maneuver.tack_penalty` | `0s` | Time lost to a tack, deducted from the step |
+| `maneuver.gybe_penalty` | `0s` | Time lost to a gybe, deducted from the step |
+| `maneuver.upwind_true_wind_angle_degrees` | `90` | At or below this a board change is a tack |
+| `maneuver.downwind_true_wind_angle_degrees` | `150` | At or above this a board change is a gybe |
+| `heading_augmentation` | `none` | Extra headings beyond the fixed grid |
+| `wind_sampling` | `segment_start` | Where along a step wind is sampled |
+| `midpoint_wind_sampling_threshold` | `0m` | Minimum step length for midpoint sampling |
+| `polar_angle_interpolation` | `linear` | Interpolation between polar TWA rows |
+| `maximum_true_wind_speed_knots` | unset | Wind speed above which the vessel will not sail |
+| `above_polar_range` | `clamp` | Behavior past the polar's last wind column |
+| `pruning_strategy` | `destination_distance_grid` | How the frontier is bucketed for pruning |
+| `pruning_sector_degrees` | `2` | Sector width used by `bearing_sectors` |
+
 Intervals and `time_step` must be at least five minutes. The final interval
 tier must be open-ended, preceding cutoffs must be positive and strictly
 increasing, and `progress.every_n_steps` must be positive. Other numeric
@@ -244,6 +319,158 @@ boat speed, true wind, and cumulative distance. `diagnostics` reports expanded
 nodes, generated and retained candidates, and completed time steps.
 `departure_source` records whether departure was explicit, current time, or the
 forecast-start fallback. Use `to_string()` for departure and completion enums.
+
+### Accuracy modeling
+
+The default search advances a beam of candidates one time step at a time. It
+samples wind once per segment, evaluates headings on a fixed grid measured from
+0 degrees true, interpolates the polar bilinearly, and keeps the candidate
+closest to the destination in each spatial bucket. That is fast and
+deterministic, but it makes several simplifications that the options below let
+you trade against runtime.
+
+**What is not modeled at all.** Currents, sea state, land, and exclusion zones
+are outside the router. Land avoidance is delegated to
+`segment_eligibility`. Boat speed comes from the polar alone, so it is a
+flat-water, fully-crewed number.
+
+#### Maneuver penalties
+
+Without a cost for changing boards the search can zigzag for free, which
+overstates upwind and downwind velocity made good. Set `maneuver.tack_penalty`
+and `maneuver.gybe_penalty` to charge for the maneuver:
+
+```cpp
+request.options.maneuver.tack_penalty = std::chrono::seconds{60};
+request.options.maneuver.gybe_penalty = std::chrono::seconds{30};
+```
+
+A candidate's board is the sign of its heading relative to the wind direction;
+dead upwind and dead downwind count as neither board and are never penalized.
+The maneuver is classified by the mean of the parent and candidate true wind
+angles: at or above `downwind_true_wind_angle_degrees` it is a gybe, otherwise
+it is a tack, so a board change between the two thresholds is charged as a
+tack. The penalty is deducted from the usable step time before any distance is
+made, and a penalty at least as long as the step removes the candidate.
+
+Activating penalties also splits each pruning bucket by board, so a candidate
+on the favorable tack is no longer displaced by a marginally closer one on the
+wrong tack. This reduces, but does not eliminate, the underlying limitation
+described under [Known limitations](#known-limitations).
+
+Because that split retains more of the frontier, charging for maneuvers can
+occasionally report a marginally *earlier* arrival than not charging: the wider
+beam found a better route, and the saving exceeded the maneuvers the winning
+route pays for. The penalty itself is always a cost. Every leg's distance is its
+boat speed times the time actually spent sailing, and on a leg that changes
+boards the leg's duration exceeds that by exactly the penalty.
+
+#### Heading augmentation
+
+Headings are multiples of `heading_step_degrees` measured from 0 degrees true,
+so the bearing to the destination and the polar's velocity-made-good optima are
+essentially never sailed exactly. `heading_augmentation` appends extra headings
+per node:
+
+| Value | Extra headings per node |
+| --- | --- |
+| `none` | none |
+| `destination_bearing` | the great-circle bearing to the destination |
+| `velocity_made_good` | both boards of the upwind and downwind VMG optima |
+| `destination_bearing_and_velocity_made_good` | all of the above |
+
+The VMG optima are precomputed per wind-speed column when the polar is loaded
+and blended for the sampled wind speed. They only *propose* headings; the search
+still evaluates each one exactly through the polar, so the proposal being
+approximate cannot make the reported route speed wrong.
+
+Augmentation raises candidate count by roughly `5 / heading_count`. Because the
+beam prunes, adding headings occasionally produces a marginally *later* arrival:
+a new candidate can win its bucket on distance while being a worse platform for
+the remaining passage. This is inherent to beam search rather than a defect in
+the extra headings, and it applies to any option that changes which candidates
+survive pruning. Measure on your own forecasts rather than assuming a gain.
+
+#### Midpoint wind sampling
+
+By default the wind at the segment start is held for the whole step, which is a
+first-order integration; on the default three-hour tier that is roughly 30
+nautical miles on one sample. `WindSampling::midpoint` re-evaluates boat speed
+using the wind halfway along the provisional segment in both space and time,
+raising the step to second order:
+
+```cpp
+request.options.wind_sampling = sailroute::WindSampling::midpoint;
+request.options.midpoint_wind_sampling_threshold = std::chrono::minutes{60};
+```
+
+This costs a second wind interpolation and polar lookup per candidate. The
+threshold skips it for shorter steps, where it buys little. If the midpoint
+falls outside the forecast the first-order speed stands, so enabling this never
+makes a route unreachable.
+
+#### Monotone cubic polar interpolation
+
+Linear interpolation between polar rows 15 to 20 degrees apart flattens the peak
+and misplaces the VMG optimum. `PolarAngleInterpolation::monotone_cubic` fits a
+shape-preserving (PCHIP) curve through the true-wind-angle rows, which resolves
+the peak without the overshoot an unconstrained spline would introduce. Wind
+speed is still interpolated linearly between columns. Enable it before
+benchmarking `velocity_made_good` augmentation, which depends on peak
+resolution.
+
+#### Wind speed envelope
+
+By default a wind speed past the polar's last column is clamped to that column,
+so a 60-knot storm reads as the polar's top-end speed. Two independent controls
+change that:
+
+```cpp
+request.options.maximum_true_wind_speed_knots = 35.0;
+request.options.above_polar_range = sailroute::AbovePolarRangePolicy::no_speed;
+```
+
+`maximum_true_wind_speed_knots` expresses a limit the polar itself does not
+carry and removes any node where the wind exceeds it. `above_polar_range` set to
+`no_speed` refuses to extrapolate past the tabulated data. Either can make a
+route unreachable, which is reported as a routing error rather than a silently
+slow route.
+
+#### Bearing sector pruning
+
+`PruningStrategy::bearing_sectors` buckets the frontier by bearing from the
+destination and range to it, instead of a fixed grid in destination-relative
+east/north nautical miles. Sector width stays proportional to range, so far from
+the destination it preserves wide-angle diversity a fixed grid would merge,
+while converging and over-merging as the fan closes in. It retains noticeably
+more candidates and is correspondingly slower. It is offered for measurement,
+not recommended by default.
+
+#### Measuring the trade-offs
+
+`sailroute_benchmarks` reports arrival time, leg count, candidate count, and
+wall time for each option and for all of them combined, using the longest leg
+the supplied forecast covers:
+
+```sh
+cmake -S . -B build -DSAILROUTE_BUILD_BENCHMARKS=ON
+cmake --build build
+./build/sailroute_benchmarks samples/sample.grib
+```
+
+### Known limitations
+
+The search is a forward beam. Pruning freezes each surviving candidate's parent
+chain, and there is no backtracking, so an earlier leg is never revisited once
+its step completes. If a discarded candidate would have led to a materially
+faster passage later, that outcome is unrecoverable: pruning is the only place
+the optimum is lost, and it is lost permanently.
+
+Board-aware pruning narrows this failure, because the common case is a
+wrong-tack candidate displacing a faster one inside a single bucket. It does not
+remove it. A solver that genuinely re-relaxes earlier legs requires the
+time-dependent shortest-path formulation described under
+[Roadmap](#roadmap).
 
 ### Route segment eligibility contract
 
@@ -275,6 +502,12 @@ concurrent within one optimization, though separate concurrent optimizations
 can invoke shared callback state concurrently. Callers sharing mutable state
 between requests must synchronize it and must return the same decision for the
 same segment and configuration to preserve deterministic results.
+
+This contract is unchanged by the accuracy options. Augmented headings are
+appended in a fixed order after the heading grid, maneuver penalties and
+midpoint sampling are pure functions of the candidate and the forecast, and both
+pruning strategies sort their retained set by expansion ordinal. Every
+configuration therefore produces identical results for any `worker_count`.
 
 The `RouteSegmentView` and its references are valid only until the callback
 returns. Eligibility runs serially for every generated candidate, so predicates
@@ -393,6 +626,56 @@ Full-line comments may begin with `#`, `!`, `%`, `;`, or `//`; inline comments
 may begin with `#`, `!`, or `//`. Axes must be strictly increasing, contain at
 least two values, and all boat speeds must be finite and non-negative. TWA must
 be in `[0, 180]`; TWS and boat speeds are in knots.
+
+## Roadmap
+
+The options above are what can be improved inside a forward isochrone beam. The
+stages below are not implemented; they are recorded so the design direction is
+explicit.
+
+### Time-dependent shortest-path solver
+
+Replace the beam with a label-correcting time-dependent A\*/Dijkstra search over
+a space-time lattice. Minimum-time navigation through a flow field is Zermelo's
+problem; travel times are non-negative and the wind evolves forward, so
+label-setting is valid and optimal on the lattice, and earlier legs are
+re-relaxed automatically. This is the only stage that genuinely delivers
+rerouting, and it removes the limitation described under
+[Known limitations](#known-limitations).
+
+- A geodesic lattice (icosahedral, HEALPix, or Fibonacci) rather than lat/lon,
+  which degenerates at high latitude, exactly where ocean races are decided.
+- Node state carrying position, time, board, and sail and reef configuration.
+- An admissible A\* heuristic: remaining great-circle distance divided by the
+  maximum speed the polar can achieve.
+- Coarse-to-fine refinement around the incumbent corridor.
+
+### Physics
+
+- **Currents**, in the correct frames. The boat sails in the water frame and
+  translates in the ground frame, and apparent wind is generated relative to the
+  water. Adding current to speed over ground is a common and material error.
+- **Sea-state-derated polars**, as a function of wind speed, wind angle,
+  significant wave height, period, and wave direction. Upwind in a seaway the
+  loss against a flat-water polar is first-order offshore.
+- **Land and exclusion zones**: a precomputed signed-distance landmask for O(1)
+  segment rejection, and time-varying exclusion polygons such as an Antarctic
+  Exclusion Zone. Today this is the caller's job via `segment_eligibility`.
+
+### Ensemble and risk-adjusted routing
+
+Route across ensemble members rather than a single deterministic GRIB, and
+optimize the mean, a quantile, or the probability of beating a rival. The true
+optimum is a policy rather than a track, because the route is recomputed every
+forecast cycle. The primary deliverable is decision points: where members
+diverge, when commitment is required, and what being wrong costs.
+
+### Continuous optimal-control polish
+
+Remove lattice discretization error with direct collocation or multiple
+shooting, or apply the Zermelo steering law from Pontryagin's Minimum Principle.
+Run on a rolling horizon, warm-started from the previous solution each forecast
+cycle.
 
 ## Portability
 

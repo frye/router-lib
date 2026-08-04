@@ -55,9 +55,14 @@ struct Candidate {
 struct BucketKey {
     std::int64_t east{};
     std::int64_t north{};
+    // Zero unless maneuver penalties are active, in which case candidates on
+    // opposite boards are kept apart so a marginally closer wrong-tack
+    // candidate cannot displace a genuinely faster one.
+    std::int64_t board{};
 
     friend bool operator<(const BucketKey& left, const BucketKey& right) noexcept {
-        return std::tie(left.east, left.north) < std::tie(right.east, right.north);
+        return std::tie(left.east, left.north, left.board) <
+            std::tie(right.east, right.north, right.board);
     }
 };
 
@@ -74,6 +79,9 @@ struct CandidateEvaluation {
 struct ExpansionBuffer {
     std::vector<Candidate> candidates;
     std::vector<Arrival> arrivals;
+    // Headings evaluated for the parent being expanded, rebuilt per parent so
+    // augmentation does not allocate.
+    std::vector<double> headings;
     std::optional<Arrival> best_arrival;
     std::optional<Error> interpolation_error;
     std::exception_ptr exception;
@@ -208,25 +216,97 @@ double true_wind_angle(double heading_degrees, double wind_from_degrees) noexcep
     return detail::angular_difference_degrees(heading_degrees, wind_from_degrees);
 }
 
+double normalize_heading(double heading_degrees) noexcept {
+    double heading = std::fmod(heading_degrees, 360.0);
+    if (heading < 0.0) {
+        heading += 360.0;
+    }
+    return heading;
+}
+
+// Which side the wind crosses the boat: 1 and -1 are opposite boards, 0 is head
+// to wind or dead downwind, where no board is defined and turning costs nothing.
+std::int8_t board_for(double heading_degrees, double wind_from_degrees) noexcept {
+    const double delta = normalize_heading(heading_degrees - wind_from_degrees);
+    if (delta == 0.0 || delta == 180.0) {
+        return 0;
+    }
+    return delta < 180.0 ? std::int8_t{1} : std::int8_t{-1};
+}
+
+// Time lost turning from one board to the other. A board change close to the
+// wind is a tack and one away from it is a gybe; the mean of the two true wind
+// angles decides which, so a turn is classified by where it actually passes
+// through the wind rather than by its endpoints alone.
+std::chrono::seconds maneuver_penalty(
+    const ManeuverPenalties& penalties,
+    std::int8_t parent_board,
+    double parent_true_wind_angle,
+    std::int8_t board,
+    double candidate_true_wind_angle) noexcept {
+    if (parent_board == 0 || board == 0 || parent_board == board) {
+        return std::chrono::seconds::zero();
+    }
+    const double mean_angle =
+        0.5 * (parent_true_wind_angle + candidate_true_wind_angle);
+    return mean_angle >= penalties.downwind_true_wind_angle_degrees
+        ? penalties.gybe_penalty
+        : penalties.tack_penalty;
+}
+
+// Geometry that depends only on the expanding parent, hoisted out of the
+// per-heading loop where it was previously recomputed for every candidate.
+struct ParentGeometry {
+    detail::PreparedOrigin origin;
+    double distance_to_destination{};
+    double bearing_to_destination_degrees{};
+};
+
+[[nodiscard]] ParentGeometry prepare_parent(
+    Coordinate position,
+    Coordinate destination) noexcept {
+    return ParentGeometry{
+        detail::prepare_origin(position),
+        detail::great_circle_distance_nautical_miles(position, destination),
+        detail::initial_bearing_degrees(position, destination)};
+}
+
+// Slack applied to the exact triangle-inequality rejection below, large enough
+// to absorb rounding in the distance computation and far smaller than any
+// meaningful arrival radius, so a genuine arrival is never rejected.
+constexpr double arrival_bound_slack_nautical_miles = 1.0e-6;
+
+// Halvings used to locate the arrival radius crossing along a segment. Kept at
+// 60 so results stay bit-identical; the loop only runs for candidates that
+// actually reach the destination, so it is not on the hot path.
+constexpr int arrival_bisection_iterations = 60;
+
 std::optional<double> arrival_fraction(
-    Coordinate segment_start,
+    const ParentGeometry& parent,
     double heading_degrees,
     double segment_distance_nautical_miles,
     Coordinate destination,
     double arrival_radius_nautical_miles) {
-    const double start_distance =
-        detail::great_circle_distance_nautical_miles(segment_start, destination);
+    const double start_distance = parent.distance_to_destination;
     if (start_distance <= arrival_radius_nautical_miles) {
         return 0.0;
     }
     if (segment_distance_nautical_miles <= 0.0) {
         return std::nullopt;
     }
+    // Great-circle distance is a metric, so no point on a segment of length d
+    // can be closer to the destination than start_distance - d. When even that
+    // bound stays outside the arrival radius the segment cannot arrive, and the
+    // projection, endpoint construction, and bisection below are all skipped.
+    if (start_distance - segment_distance_nautical_miles >
+        arrival_radius_nautical_miles + arrival_bound_slack_nautical_miles) {
+        return std::nullopt;
+    }
 
     const double start_to_destination =
         start_distance / detail::earth_radius_nautical_miles;
     const double bearing_delta =
-        (detail::initial_bearing_degrees(segment_start, destination) - heading_degrees) *
+        (parent.bearing_to_destination_degrees - heading_degrees) *
         std::numbers::pi / 180.0;
     const double along_track_angle = std::atan2(
         std::sin(start_to_destination) * std::cos(bearing_delta),
@@ -235,8 +315,8 @@ std::optional<double> arrival_fraction(
         segment_distance_nautical_miles / detail::earth_radius_nautical_miles;
     const double closest_angle = std::clamp(along_track_angle, 0.0, segment_angle);
     const double closest_fraction = closest_angle / segment_angle;
-    const Coordinate closest = detail::destination_point(
-        segment_start,
+    const Coordinate closest = detail::destination_point_from(
+        parent.origin,
         heading_degrees,
         segment_distance_nautical_miles * closest_fraction);
     if (detail::great_circle_distance_nautical_miles(closest, destination) >
@@ -246,10 +326,10 @@ std::optional<double> arrival_fraction(
 
     double outside = 0.0;
     double inside = closest_fraction;
-    for (int iteration = 0; iteration < 60; ++iteration) {
+    for (int iteration = 0; iteration < arrival_bisection_iterations; ++iteration) {
         const double middle = (outside + inside) / 2.0;
-        const Coordinate point = detail::destination_point(
-            segment_start,
+        const Coordinate point = detail::destination_point_from(
+            parent.origin,
             heading_degrees,
             segment_distance_nautical_miles * middle);
         if (detail::great_circle_distance_nautical_miles(point, destination) <=
@@ -272,9 +352,15 @@ bool better_arrival(const Arrival& left, const Arrival& right) noexcept {
     return left.candidate.ordinal < right.candidate.ordinal;
 }
 
+// Extra headings appended per node when heading augmentation is enabled: the
+// bearing to the destination plus both boards of the upwind and downwind
+// velocity-made-good optima.
+constexpr std::size_t maximum_augmented_headings = 5U;
+
 void expand_candidate_range(
     ExpansionBuffer& buffer,
-    const WeatherDataset& weather,
+    const WeatherSampler& weather,
+    const WeatherSampler* midpoint_weather,
     const VesselPolar& polar,
     const RouteRequest& request,
     const std::vector<SearchNode>& nodes,
@@ -287,14 +373,27 @@ void expand_candidate_range(
     std::size_t heading_count,
     bool preserve_all_arrivals) {
     buffer.clear();
+    const RoutingOptions& options = request.options;
+    const std::size_t headings_per_parent =
+        heading_count + maximum_augmented_headings;
     const std::size_t parent_count = end - begin;
     if (parent_count <=
-        std::numeric_limits<std::size_t>::max() / heading_count) {
-        const std::size_t maximum_candidates = parent_count * heading_count;
+        std::numeric_limits<std::size_t>::max() / headings_per_parent) {
+        const std::size_t maximum_candidates = parent_count * headings_per_parent;
         if (maximum_candidates > buffer.candidates.capacity()) {
             buffer.candidates.reserve(maximum_candidates);
         }
     }
+
+    const bool penalise_maneuvers = options.maneuver.active();
+    const bool augment_bearing =
+        options.heading_augmentation == HeadingAugmentation::destination_bearing ||
+        options.heading_augmentation ==
+            HeadingAugmentation::destination_bearing_and_velocity_made_good;
+    const bool augment_velocity_made_good =
+        options.heading_augmentation == HeadingAugmentation::velocity_made_good ||
+        options.heading_augmentation ==
+            HeadingAugmentation::destination_bearing_and_velocity_made_good;
 
     for (std::size_t frontier_index = begin; frontier_index < end;
          ++frontier_index) {
@@ -302,8 +401,7 @@ void expand_candidate_range(
         const SearchNode& parent = nodes[parent_index];
         ++buffer.expanded_nodes;
 
-        const auto wind_result =
-            weather.interpolate(parent.point.position, current_time);
+        const auto wind_result = weather.sample(parent.point.position);
         if (!wind_result) {
             if (!buffer.interpolation_error.has_value()) {
                 buffer.interpolation_error = wind_result.error();
@@ -318,22 +416,127 @@ void expand_candidate_range(
             return;
         }
 
-        for (std::size_t heading_index = 0U; heading_index < heading_count;
+        // A wind speed the vessel is not expected to sail in removes the node
+        // rather than silently reading the polar's top-end row.
+        if (options.maximum_true_wind_speed_knots.has_value() &&
+            wind_speed > *options.maximum_true_wind_speed_knots) {
+            continue;
+        }
+
+        const ParentGeometry geometry =
+            prepare_parent(parent.point.position, request.destination);
+        // The wind speed is fixed for this parent, so resolve the polar's wind
+        // bracket once instead of per heading.
+        const PolarSlice polar_slice =
+            polar.slice_at(wind_speed, options.polar_angle_interpolation);
+        if (options.above_polar_range == AbovePolarRangePolicy::no_speed &&
+            polar_slice.above_tabulated_wind_speed()) {
+            continue;
+        }
+
+        const std::int8_t parent_board = parent.parent == no_parent
+            ? std::int8_t{0}
+            : board_for(
+                  parent.point.heading_degrees,
+                  parent.point.true_wind_direction_degrees);
+        const double parent_angle = parent.parent == no_parent
+            ? 0.0
+            : true_wind_angle(
+                  parent.point.heading_degrees,
+                  parent.point.true_wind_direction_degrees);
+
+        buffer.headings.clear();
+        for (std::size_t index = 0U; index < heading_count; ++index) {
+            buffer.headings.push_back(
+                static_cast<double>(index) * options.heading_step_degrees);
+        }
+        if (augment_bearing) {
+            buffer.headings.push_back(
+                normalize_heading(geometry.bearing_to_destination_degrees));
+        }
+        if (augment_velocity_made_good) {
+            const VelocityMadeGoodAngles optima =
+                polar_slice.velocity_made_good_angles();
+            if (optima.valid) {
+                buffer.headings.push_back(
+                    normalize_heading(wind_direction + optima.upwind_degrees));
+                buffer.headings.push_back(
+                    normalize_heading(wind_direction - optima.upwind_degrees));
+                buffer.headings.push_back(
+                    normalize_heading(wind_direction + optima.downwind_degrees));
+                buffer.headings.push_back(
+                    normalize_heading(wind_direction - optima.downwind_degrees));
+            }
+        }
+
+        for (std::size_t heading_index = 0U;
+             heading_index < buffer.headings.size();
              ++heading_index) {
-            const double heading =
-                static_cast<double>(heading_index) *
-                request.options.heading_step_degrees;
-            const double boat_speed = polar.boat_speed_knots(
-                wind_speed,
-                true_wind_angle(heading, wind_direction));
+            const double heading = buffer.headings[heading_index];
+            const double candidate_angle = true_wind_angle(heading, wind_direction);
+            double boat_speed = polar_slice.speed_knots(candidate_angle);
             if (!std::isfinite(boat_speed) || boat_speed <= 0.0 ||
-                boat_speed < request.options.minimum_boat_speed_knots) {
+                boat_speed < options.minimum_boat_speed_knots) {
                 continue;
             }
 
-            const double segment_distance = boat_speed * step_hours;
-            const Coordinate position = detail::destination_point(
-                parent.point.position,
+            // A tack or gybe eats into the step before any distance is made.
+            double penalty_seconds = 0.0;
+            double usable_hours = step_hours;
+            if (penalise_maneuvers) {
+                const std::chrono::seconds penalty = maneuver_penalty(
+                    options.maneuver,
+                    parent_board,
+                    parent_angle,
+                    board_for(heading, wind_direction),
+                    candidate_angle);
+                if (penalty > std::chrono::seconds::zero()) {
+                    if (penalty >= step) {
+                        continue;
+                    }
+                    penalty_seconds = static_cast<double>(penalty.count());
+                    usable_hours = std::chrono::duration<double, std::ratio<3600>>(
+                                       step - penalty)
+                                       .count();
+                }
+            }
+
+            // Second-order (midpoint) integration: re-evaluate boat speed with
+            // the wind halfway along the provisional segment in both space and
+            // time. If that point has no forecast the first-order speed stands,
+            // so enabling this never makes a route unreachable.
+            if (midpoint_weather != nullptr) {
+                const Coordinate midpoint = detail::destination_point_from(
+                    geometry.origin,
+                    heading,
+                    boat_speed * usable_hours * 0.5);
+                const auto midpoint_wind = midpoint_weather->sample(midpoint);
+                if (midpoint_wind) {
+                    const double midpoint_speed = midpoint_wind.value().speed_knots();
+                    const double midpoint_direction =
+                        midpoint_wind.value().direction_from_degrees();
+                    if (std::isfinite(midpoint_speed) &&
+                        std::isfinite(midpoint_direction) &&
+                        (!options.maximum_true_wind_speed_knots.has_value() ||
+                         midpoint_speed <= *options.maximum_true_wind_speed_knots)) {
+                        const PolarSlice midpoint_slice = polar.slice_at(
+                            midpoint_speed, options.polar_angle_interpolation);
+                        const double refined = midpoint_slice.speed_knots(
+                            true_wind_angle(heading, midpoint_direction));
+                        if (std::isfinite(refined)) {
+                            boat_speed = refined;
+                        }
+                    }
+                }
+                if (boat_speed <= 0.0 ||
+                    boat_speed < options.minimum_boat_speed_knots) {
+                    continue;
+                }
+            }
+
+            const double segment_distance = boat_speed * usable_hours;
+            const Coordinate position = detail::destination_point_from(
+                geometry.origin,
                 heading,
                 segment_distance);
             Candidate candidate{
@@ -354,19 +557,23 @@ void expand_candidate_range(
             ++buffer.generated_candidates;
 
             const std::optional<double> fraction = arrival_fraction(
-                parent.point.position,
+                geometry,
                 heading,
                 segment_distance,
                 request.destination,
-                request.options.arrival_radius_nautical_miles);
+                options.arrival_radius_nautical_miles);
             if (fraction.has_value()) {
                 const double travelled = segment_distance * *fraction;
                 const auto elapsed_seconds = std::chrono::seconds{
                     static_cast<std::chrono::seconds::rep>(
                         std::llround(
-                            static_cast<double>(step.count()) * *fraction))};
-                candidate.point.position = detail::destination_point(
-                    parent.point.position,
+                            penalty_seconds +
+                            static_cast<double>(step.count() -
+                                                static_cast<std::chrono::seconds::rep>(
+                                                    penalty_seconds)) *
+                                *fraction))};
+                candidate.point.position = detail::destination_point_from(
+                    geometry.origin,
                     heading,
                     travelled);
                 candidate.point.time = current_time + elapsed_seconds;
@@ -394,12 +601,10 @@ void expand_candidate_range(
 class CandidateExpansionWorkers {
 public:
     CandidateExpansionWorkers(
-        const WeatherDataset& weather,
         const VesselPolar& polar,
         const RouteRequest& request,
         bool preserve_all_arrivals)
-        : weather_(weather),
-          polar_(polar),
+        : polar_(polar),
           request_(request),
           preserve_all_arrivals_(preserve_all_arrivals) {}
 
@@ -447,6 +652,8 @@ public:
 
     void expand(
         std::size_t active_workers,
+        const WeatherSampler& sampler,
+        const WeatherSampler* midpoint_sampler,
         const std::vector<SearchNode>& nodes,
         const std::vector<NodeIndex>& frontier,
         TimePoint current_time,
@@ -456,6 +663,8 @@ public:
         ensure_worker_count(active_workers);
         {
             std::lock_guard lock(mutex_);
+            sampler_ = sampler;
+            midpoint_sampler_ = midpoint_sampler;
             nodes_ = &nodes;
             frontier_ = &frontier;
             current_time_ = current_time;
@@ -519,7 +728,8 @@ private:
             const auto [begin, end] = range_for(worker_index);
             expand_candidate_range(
                 buffer,
-                weather_,
+                sampler_,
+                midpoint_sampler_,
                 polar_,
                 request_,
                 *nodes_,
@@ -565,7 +775,8 @@ private:
         }
     }
 
-    const WeatherDataset& weather_;
+    WeatherSampler sampler_;
+    const WeatherSampler* midpoint_sampler_{nullptr};
     const VesselPolar& polar_;
     const RouteRequest& request_;
     bool preserve_all_arrivals_{};
@@ -603,7 +814,48 @@ BucketKey bucket_for(
         static_cast<std::int64_t>(
             std::floor(east_nautical_miles / bucket_size_nautical_miles)),
         static_cast<std::int64_t>(
-            std::floor(north_nautical_miles / bucket_size_nautical_miles))};
+            std::floor(north_nautical_miles / bucket_size_nautical_miles)),
+        0};
+}
+
+// Buckets by range from the destination and bearing seen from it. Sector width
+// grows with range, so far from the destination this keeps candidates that a
+// fixed grid would merge, at the cost of over-merging as the fan converges.
+BucketKey sector_bucket_for(
+    Coordinate coordinate,
+    Coordinate destination,
+    double bucket_size_nautical_miles,
+    double sector_degrees) noexcept {
+    const double distance =
+        detail::great_circle_distance_nautical_miles(coordinate, destination);
+    const double bearing =
+        normalize_heading(detail::initial_bearing_degrees(destination, coordinate));
+    return BucketKey{
+        static_cast<std::int64_t>(std::floor(bearing / sector_degrees)),
+        static_cast<std::int64_t>(
+            std::floor(distance / bucket_size_nautical_miles)),
+        0};
+}
+
+BucketKey pruning_key_for(const Candidate& candidate, Coordinate destination,
+                          const RoutingOptions& options) noexcept {
+    BucketKey key =
+        options.pruning_strategy == PruningStrategy::bearing_sectors
+        ? sector_bucket_for(
+              candidate.point.position,
+              destination,
+              options.spatial_bucket_nautical_miles,
+              options.pruning_sector_degrees)
+        : bucket_for(
+              candidate.point.position,
+              destination,
+              options.spatial_bucket_nautical_miles);
+    if (options.maneuver.active()) {
+        key.board = board_for(
+            candidate.point.heading_degrees,
+            candidate.point.true_wind_direction_degrees);
+    }
+    return key;
 }
 
 bool dominates(const Candidate& left, const Candidate& right) noexcept {
@@ -616,74 +868,134 @@ bool dominates(const Candidate& left, const Candidate& right) noexcept {
     return left.ordinal < right.ordinal;
 }
 
-std::vector<std::size_t> prune_candidates(
+// Buffers reused across every routing step so pruning does not reallocate.
+struct PruneScratch {
+    std::vector<BucketKey> keys;
+    std::vector<std::size_t> order;
+    std::vector<double> min_separation;
+    std::vector<char> selected;
+    std::vector<std::size_t> retained;
+};
+
+// Retains a heading-diverse subset of each spatial bucket.
+//
+// Candidates are grouped by bucket and ordered by dominance in a single sort
+// rather than through a node-allocating std::map. Within a bucket the most
+// dominant candidate is taken first, then repeatedly the candidate whose
+// heading is furthest from everything already selected. That farthest-point
+// choice previously rescanned the selected list for every candidate on every
+// pick, which is quadratic in the per-bucket cap; caching each candidate's
+// distance to the nearest selected heading makes it linear.
+//
+// Selection order within a bucket, and therefore the retained set, is identical
+// to the previous implementation. Buckets are independent and the result is
+// sorted by expansion ordinal, so grouping order does not affect the output.
+void prune_candidates_into(
     const std::vector<Candidate>& candidates,
     Coordinate destination,
-    const RoutingOptions& options) {
-    std::map<BucketKey, std::vector<std::size_t>> buckets;
-    for (std::size_t index = 0; index < candidates.size(); ++index) {
-        buckets[bucket_for(
-                    candidates[index].point.position,
-                    destination,
-                    options.spatial_bucket_nautical_miles)]
-            .push_back(index);
+    const RoutingOptions& options,
+    PruneScratch& scratch) {
+    const std::size_t count = candidates.size();
+    scratch.retained.clear();
+    if (count == 0U) {
+        return;
     }
 
-    std::vector<std::size_t> retained;
-    retained.reserve(candidates.size());
-    for (auto& [key, bucket] : buckets) {
-        static_cast<void>(key);
-        std::stable_sort(
-            bucket.begin(),
-            bucket.end(),
-            [&candidates](std::size_t left, std::size_t right) {
-                return dominates(candidates[left], candidates[right]);
-            });
-
-        std::vector<std::size_t> selected;
-        selected.reserve(std::min(options.max_nodes_per_bucket, bucket.size()));
-        selected.push_back(bucket.front());
-        while (selected.size() < options.max_nodes_per_bucket &&
-               selected.size() < bucket.size()) {
-            std::size_t best_index = bucket.front();
-            double best_separation = -1.0;
-            bool found = false;
-            for (const std::size_t candidate_index : bucket) {
-                if (std::find(selected.begin(), selected.end(), candidate_index) !=
-                    selected.end()) {
-                    continue;
-                }
-                double separation = 180.0;
-                for (const std::size_t selected_index : selected) {
-                    separation = std::min(
-                        separation,
-                        detail::angular_difference_degrees(
-                            candidates[candidate_index].point.heading_degrees,
-                            candidates[selected_index].point.heading_degrees));
-                }
-                if (!found || separation > best_separation ||
-                    (separation == best_separation &&
-                     dominates(candidates[candidate_index], candidates[best_index]))) {
-                    best_index = candidate_index;
-                    best_separation = separation;
-                    found = true;
-                }
-            }
-            if (!found) {
-                break;
-            }
-            selected.push_back(best_index);
-        }
-        retained.insert(retained.end(), selected.begin(), selected.end());
+    scratch.keys.resize(count);
+    scratch.order.resize(count);
+    scratch.min_separation.assign(count, 0.0);
+    scratch.selected.assign(count, 0);
+    for (std::size_t index = 0U; index < count; ++index) {
+        scratch.keys[index] = pruning_key_for(candidates[index], destination, options);
+        scratch.order[index] = index;
     }
 
     std::sort(
-        retained.begin(),
-        retained.end(),
+        scratch.order.begin(),
+        scratch.order.end(),
+        [&candidates, &scratch](std::size_t left, std::size_t right) {
+            if (scratch.keys[left] < scratch.keys[right]) {
+                return true;
+            }
+            if (scratch.keys[right] < scratch.keys[left]) {
+                return false;
+            }
+            return dominates(candidates[left], candidates[right]);
+        });
+
+    scratch.retained.reserve(count);
+    const auto heading_of = [&](std::size_t position) {
+        return candidates[scratch.order[position]].point.heading_degrees;
+    };
+
+    std::size_t run_begin = 0U;
+    while (run_begin < count) {
+        std::size_t run_end = run_begin + 1U;
+        while (run_end < count &&
+               !(scratch.keys[scratch.order[run_begin]] <
+                 scratch.keys[scratch.order[run_end]]) &&
+               !(scratch.keys[scratch.order[run_end]] <
+                 scratch.keys[scratch.order[run_begin]])) {
+            ++run_end;
+        }
+
+        const std::size_t run_size = run_end - run_begin;
+        const std::size_t limit = std::min(options.max_nodes_per_bucket, run_size);
+
+        scratch.selected[run_begin] = 1;
+        scratch.retained.push_back(scratch.order[run_begin]);
+        for (std::size_t position = run_begin + 1U; position < run_end; ++position) {
+            scratch.selected[position] = 0;
+            scratch.min_separation[position] = std::min(
+                180.0,
+                detail::angular_difference_degrees(
+                    heading_of(position),
+                    heading_of(run_begin)));
+        }
+
+        for (std::size_t taken = 1U; taken < limit; ++taken) {
+            std::size_t best_position = count;
+            double best_separation = -1.0;
+            // The run is in dominance order and the comparison is strict, so
+            // equal separations keep the more dominant candidate, matching the
+            // previous explicit tie-break.
+            for (std::size_t position = run_begin; position < run_end; ++position) {
+                if (scratch.selected[position] != 0) {
+                    continue;
+                }
+                if (scratch.min_separation[position] > best_separation) {
+                    best_position = position;
+                    best_separation = scratch.min_separation[position];
+                }
+            }
+            if (best_position == count) {
+                break;
+            }
+
+            scratch.selected[best_position] = 1;
+            scratch.retained.push_back(scratch.order[best_position]);
+            const double chosen_heading = heading_of(best_position);
+            for (std::size_t position = run_begin; position < run_end; ++position) {
+                if (scratch.selected[position] != 0) {
+                    continue;
+                }
+                scratch.min_separation[position] = std::min(
+                    scratch.min_separation[position],
+                    detail::angular_difference_degrees(
+                        heading_of(position),
+                        chosen_heading));
+            }
+        }
+
+        run_begin = run_end;
+    }
+
+    std::sort(
+        scratch.retained.begin(),
+        scratch.retained.end(),
         [&candidates](std::size_t left, std::size_t right) {
             return candidates[left].ordinal < candidates[right].ordinal;
         });
-    return retained;
 }
 
 void reconstruct_route_into(
@@ -883,6 +1195,7 @@ Result<RouteResult> Router::optimize_view_controlled(
     RouteDiagnostics diagnostics;
     std::vector<SearchNode> nodes;
     nodes.reserve(1024);
+    PruneScratch prune_scratch;
     nodes.push_back(SearchNode{
         RoutePoint{
             request.start,
@@ -923,7 +1236,6 @@ Result<RouteResult> Router::optimize_view_controlled(
     const bool has_segment_eligibility =
         static_cast<bool>(request.options.segment_eligibility);
     CandidateExpansionWorkers expansion_workers{
-        weather_,
         polar_,
         request,
         has_segment_eligibility};
@@ -970,6 +1282,28 @@ Result<RouteResult> Router::optimize_view_controlled(
 
         const double step_hours =
             std::chrono::duration<double, std::ratio<3600>>(step).count();
+        // The forecast time is fixed for the whole step, so locate the
+        // surrounding forecast steps once rather than per node.
+        auto sampler_result = weather_.sampler_at(current_time);
+        if (!sampler_result) {
+            return sampler_result.error();
+        }
+        const WeatherSampler& sampler = sampler_result.value();
+
+        // Midpoint sampling needs the wind halfway through the step as well as
+        // halfway along the segment, so resolve a second time bracket once.
+        std::optional<WeatherSampler> midpoint_sampler_storage;
+        const WeatherSampler* midpoint_sampler = nullptr;
+        if (request.options.wind_sampling == WindSampling::midpoint &&
+            step >= request.options.midpoint_wind_sampling_threshold) {
+            auto midpoint_result = weather_.sampler_at(current_time + step / 2);
+            if (!midpoint_result) {
+                return midpoint_result.error();
+            }
+            midpoint_sampler_storage = std::move(midpoint_result.value());
+            midpoint_sampler = &midpoint_sampler_storage.value();
+        }
+
         const std::size_t active_workers =
             expansion_workers.worker_count(frontier.size(), heading_count);
         const auto merge_buffer = [&](const ExpansionBuffer& buffer) {
@@ -1006,7 +1340,8 @@ Result<RouteResult> Router::optimize_view_controlled(
         if (active_workers == 1U) {
             expand_candidate_range(
                 single_worker_buffer,
-                weather_,
+                sampler,
+                midpoint_sampler,
                 polar_,
                 request,
                 nodes,
@@ -1037,6 +1372,8 @@ Result<RouteResult> Router::optimize_view_controlled(
         } else {
             expansion_workers.expand(
                 active_workers,
+                sampler,
+                midpoint_sampler,
                 nodes,
                 frontier,
                 current_time,
@@ -1141,11 +1478,19 @@ Result<RouteResult> Router::optimize_view_controlled(
                     std::to_string(diagnostics.time_steps)};
         }
 
-        const std::vector<std::size_t> retained =
-            prune_candidates(candidates, request.destination, request.options);
+        prune_candidates_into(
+            candidates, request.destination, request.options, prune_scratch);
+        const std::vector<std::size_t>& retained = prune_scratch.retained;
         next_frontier.clear();
         next_frontier.reserve(retained.size());
-        nodes.reserve(nodes.size() + retained.size());
+        // Reserving exactly nodes.size() + retained.size() would size the buffer
+        // to the current requirement on every step, so the search reallocated
+        // and copied the whole node array each time and grew in quadratic time.
+        // Grow geometrically instead.
+        if (const std::size_t required = nodes.size() + retained.size();
+            required > nodes.capacity()) {
+            nodes.reserve(std::max(required, nodes.capacity() * 2U));
+        }
         NodeIndex provisional_route_end = no_parent;
         double provisional_distance = std::numeric_limits<double>::infinity();
         for (const std::size_t candidate_index : retained) {

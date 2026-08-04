@@ -630,3 +630,81 @@ TEST_CASE("weather rejects tiles with incomplete U/V coverage") {
     REQUIRE(
         weather.error().code == sailroute::ErrorCode::incomplete_forecast);
 }
+
+TEST_CASE("time sampler reproduces interpolate exactly") {
+    const GribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const auto start = sailroute::parse_utc_time("2026-07-14T00:00:00Z");
+    REQUIRE(start.has_value());
+
+    for (const int minutes : {0, 37, 90, 180, 271, 360}) {
+        const auto when = start.value() + std::chrono::minutes{minutes};
+        const auto sampler = weather.value().sampler_at(when);
+        REQUIRE(sampler.has_value());
+        for (const double latitude : {0.0, 0.25, 1.0, 1.75, 2.0}) {
+            for (const double longitude : {0.0, 0.5, 1.0, 1.5, 2.0}) {
+                const sailroute::Coordinate coordinate{latitude, longitude};
+                const auto direct = weather.value().interpolate(coordinate, when);
+                const auto sampled = sampler.value().sample(coordinate);
+                REQUIRE(direct.has_value() == sampled.has_value());
+                if (direct.has_value()) {
+                    REQUIRE(direct.value().east_mps == sampled.value().east_mps);
+                    REQUIRE(direct.value().north_mps == sampled.value().north_mps);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("time sampler matches interpolate for out-of-range times") {
+    const GribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const auto start = sailroute::parse_utc_time("2026-07-14T00:00:00Z");
+    REQUIRE(start.has_value());
+
+    // Errors are user-visible: the router reports the last interpolation failure
+    // when a step yields no candidates, so the sampler has to fail in exactly the
+    // same order and with the same code as interpolate.
+    for (const auto when :
+         {start.value() - std::chrono::seconds{1},
+          start.value() + std::chrono::hours{24}}) {
+        const auto sampler = weather.value().sampler_at(when);
+        REQUIRE(sampler.has_value());
+        for (const sailroute::Coordinate coordinate :
+             {sailroute::Coordinate{1.0, 1.0}, sailroute::Coordinate{10.0, 1.0}}) {
+            const auto direct = weather.value().interpolate(coordinate, when);
+            const auto sampled = sampler.value().sample(coordinate);
+            REQUIRE(!direct.has_value());
+            REQUIRE(!sampled.has_value());
+            REQUIRE(direct.error().code == sampled.error().code);
+            REQUIRE(direct.error().message == sampled.error().message);
+        }
+    }
+}
+
+TEST_CASE("bounded time sampler reports the coordinate problem first") {
+    const GribFixture fixture;
+    const sailroute::GeographicBounds bounds{0.25, 0.25, 0.75, 0.75};
+    const auto weather = sailroute::WeatherDataset::load(fixture.path(), bounds);
+    REQUIRE(weather.has_value());
+    const auto start = sailroute::parse_utc_time("2026-07-14T00:00:00Z");
+    REQUIRE(start.has_value());
+
+    // Both the coordinate and the time are invalid here. interpolate checks
+    // bounds first, and the sampler must defer its time error to match.
+    const auto when = start.value() - std::chrono::seconds{1};
+    const auto sampler = weather.value().sampler_at(when);
+    REQUIRE(sampler.has_value());
+
+    const auto outside = sampler.value().sample({0.8, 0.5});
+    REQUIRE(!outside.has_value());
+    REQUIRE(
+        outside.error().code == sailroute::ErrorCode::coordinate_outside_forecast);
+
+    const auto inside = sampler.value().sample({0.5, 0.5});
+    REQUIRE(!inside.has_value());
+    REQUIRE(
+        inside.error().code == sailroute::ErrorCode::departure_outside_forecast);
+}

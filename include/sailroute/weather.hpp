@@ -28,6 +28,37 @@ struct GeographicBounds {
     double east_longitude_degrees{};
 };
 
+class WeatherDataset;
+
+/// Wind lookup for a fixed forecast time.
+///
+/// Locating the surrounding forecast steps costs a binary search and is
+/// identical for every node evaluated at a given routing step. A sampler
+/// resolves the time bracket once so per-node lookups only do the spatial
+/// bracket and the bilinear blend.
+///
+/// A sampler shares ownership of the dataset, so it stays valid independently.
+class WeatherSampler {
+public:
+    WeatherSampler() noexcept;
+    ~WeatherSampler();
+    WeatherSampler(const WeatherSampler&);
+    WeatherSampler(WeatherSampler&&) noexcept;
+    WeatherSampler& operator=(const WeatherSampler&);
+    WeatherSampler& operator=(WeatherSampler&&) noexcept;
+
+    /// Reports whether the sampler resolved a forecast time.
+    [[nodiscard]] bool valid() const noexcept;
+    /// Interpolates wind at the sampler's time, to the bit as `interpolate`.
+    [[nodiscard]] Result<Wind> sample(Coordinate coordinate) const;
+
+private:
+    friend class WeatherDataset;
+
+    struct Impl;
+    std::shared_ptr<const Impl> impl_;
+};
+
 class WeatherDataset {
 public:
     WeatherDataset();
@@ -48,8 +79,16 @@ public:
     [[nodiscard]] const ForecastMetadata& metadata() const;
     /// Interpolates eastward/northward wind in m/s at a coordinate and UTC time.
     [[nodiscard]] Result<Wind> interpolate(Coordinate coordinate, TimePoint time) const;
+    /// Resolves the forecast time bracket once for repeated per-coordinate lookups.
+    ///
+    /// Fails only when the dataset is empty. A time outside forecast coverage is
+    /// reported by `WeatherSampler::sample`, after the coordinate is validated,
+    /// so the error matches what `interpolate` would return for the same request.
+    [[nodiscard]] Result<WeatherSampler> sampler_at(TimePoint time) const;
 
 private:
+    friend class WeatherSampler;
+
     struct Impl;
     explicit WeatherDataset(std::shared_ptr<const Impl> impl);
     static Result<WeatherDataset> load_impl(
