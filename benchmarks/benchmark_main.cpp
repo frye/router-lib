@@ -94,6 +94,14 @@ double coverage_edge(
     sailroute::Coordinate outside) {
     const bool vary_latitude =
         inside.latitude_degrees != outside.latitude_degrees;
+    if (!vary_latitude &&
+        weather.interpolate(outside, when).has_value()) {
+        // The opposite meridian is still covered, so there is no edge to
+        // bracket in this direction. Use a quarter-turn from the seed on each
+        // side; together they form the longest unique great-circle longitude
+        // separation instead of a 360-degree span that normalizes to a short leg.
+        return (inside.longitude_degrees + outside.longitude_degrees) * 0.5;
+    }
     for (int iteration = 0; iteration < 40; ++iteration) {
         sailroute::Coordinate midpoint{
             (inside.latitude_degrees + outside.latitude_degrees) * 0.5,
