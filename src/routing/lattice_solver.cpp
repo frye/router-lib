@@ -2,6 +2,7 @@
 
 #include "routing/geodesy.hpp"
 #include "routing/lattice.hpp"
+#include "routing/state.hpp"
 #include "routing/transition.hpp"
 
 #include <algorithm>
@@ -24,28 +25,26 @@ using CellIndex = GeodesicLattice::CellIndex;
 using LabelIndex = std::size_t;
 constexpr LabelIndex no_label = std::numeric_limits<LabelIndex>::max();
 
-struct StateKey {
-    CellIndex cell{};
-    std::int64_t bucket{};
-    std::int8_t board{};
-
-    friend bool operator<(const StateKey& left, const StateKey& right) noexcept {
-        return std::tie(left.cell, left.bucket, left.board) <
-            std::tie(right.cell, right.bucket, right.board);
-    }
-};
-
 struct Label {
-    StateKey state;
+    SolverStateKey state;
     RoutePoint point;
     LabelIndex parent{no_label};
     std::size_t ordinal{};
 };
 
+SolverLabelIdentity label_identity(const Label& label) noexcept {
+    return SolverLabelIdentity{
+        label.state,
+        label.point.time,
+        label.parent,
+        label.ordinal,
+        label.ordinal};
+}
+
 struct QueueEntry {
     double estimated_total_seconds{};
     TimePoint arrival;
-    StateKey state;
+    SolverStateKey state;
     std::size_t ordinal{};
     LabelIndex label{};
 };
@@ -55,16 +54,18 @@ struct LaterQueueEntry {
         return std::tie(
                    left.estimated_total_seconds,
                    left.arrival,
-                   left.state.cell,
-                   left.state.bucket,
-                   left.state.board,
+                   left.state.spatial,
+                   left.state.time_bucket,
+                   left.state.arrival,
+                   left.state.configuration,
                    left.ordinal) >
             std::tie(
                    right.estimated_total_seconds,
                    right.arrival,
-                   right.state.cell,
-                   right.state.bucket,
-                   right.state.board,
+                   right.state.spatial,
+                   right.state.time_bucket,
+                   right.state.arrival,
+                   right.state.configuration,
                    right.ordinal);
     }
 };
@@ -166,7 +167,7 @@ Result<SearchOutcome> search_lattice(
     std::vector<Label> labels;
     labels.reserve(lattice.vertex_count());
     labels.push_back(Label{
-        StateKey{*start_cell, 0, 0},
+        SolverStateKey{*start_cell, 0, departure, {}},
         RoutePoint{
             request.start,
             departure,
@@ -177,7 +178,7 @@ Result<SearchOutcome> search_lattice(
             0.0},
         no_label,
         0U});
-    std::map<StateKey, LabelIndex> best{{labels.front().state, 0U}};
+    std::map<SolverStateKey, LabelIndex> best{{labels.front().state, 0U}};
     std::priority_queue<
         QueueEntry,
         std::vector<QueueEntry>,
@@ -207,7 +208,9 @@ Result<SearchOutcome> search_lattice(
     const auto push_label = [&](Label label) {
         const auto found = best.find(label.state);
         if (found != best.end() &&
-            labels[found->second].point.time <= label.point.time) {
+            dominates(
+                label_identity(labels[found->second]),
+                label_identity(label))) {
             return;
         }
         const LabelIndex index = labels.size();
@@ -260,7 +263,7 @@ Result<SearchOutcome> search_lattice(
                     polar,
                     request.options,
                     current.point,
-                    current.state.board,
+                    current.state.configuration,
                     request.destination,
                     route_end);
             if (!arrival_result) {
@@ -293,12 +296,16 @@ Result<SearchOutcome> search_lattice(
         }
 
         std::vector<CellIndex> targets;
-        const Coordinate cell_coordinate = lattice.coordinate(current.state.cell);
+        const Coordinate cell_coordinate =
+            lattice.coordinate(current.state.spatial);
         if (great_circle_distance_nautical_miles(
                 current.point.position, cell_coordinate) > 1.0e-9) {
-            targets.push_back(current.state.cell);
+            targets.push_back(
+                static_cast<CellIndex>(current.state.spatial));
         }
-        for (const CellIndex neighbor : lattice.neighbors(current.state.cell)) {
+        for (const CellIndex neighbor :
+             lattice.neighbors(
+                 static_cast<CellIndex>(current.state.spatial))) {
             targets.push_back(neighbor);
         }
         for (const CellIndex target : targets) {
@@ -311,7 +318,7 @@ Result<SearchOutcome> search_lattice(
                 polar,
                 request.options,
                 current.point,
-                current.state.board,
+                current.state.configuration,
                 lattice.coordinate(target),
                 route_end);
             if (!transition_result ||
@@ -321,17 +328,19 @@ Result<SearchOutcome> search_lattice(
             VariableTransition transition =
                 std::move(*transition_result.value());
             push_label(Label{
-                StateKey{
+                SolverStateKey{
                     target,
                     bucket_for(
                         transition.point.time, departure, bucket_width),
-                    transition.board},
+                    transition.point.time,
+                    transition.configuration},
                 std::move(transition.point),
                 entry.label,
                 next_ordinal++});
         }
 
-        const std::int64_t next_bucket = current.state.bucket + 1;
+        const std::int64_t next_bucket =
+            current.state.time_bucket + 1;
         const TimePoint wait_until =
             departure + bucket_width * next_bucket;
         if (wait_until > current.point.time && wait_until <= route_end) {
@@ -339,7 +348,11 @@ Result<SearchOutcome> search_lattice(
             waited.time = wait_until;
             waited.boat_speed_knots = 0.0;
             push_label(Label{
-                StateKey{current.state.cell, next_bucket, current.state.board},
+                SolverStateKey{
+                    current.state.spatial,
+                    next_bucket,
+                    wait_until,
+                    current.state.configuration},
                 std::move(waited),
                 entry.label,
                 next_ordinal++});

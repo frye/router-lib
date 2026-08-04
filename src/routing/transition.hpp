@@ -4,6 +4,9 @@
 #include "sailroute/types.hpp"
 #include "sailroute/weather.hpp"
 
+#include "routing/state.hpp"
+
+#include <chrono>
 #include <cstdint>
 #include <optional>
 
@@ -11,8 +14,41 @@ namespace sailroute::detail {
 
 struct VariableTransition {
     RoutePoint point;
-    std::int8_t board{};
+    OperationalConfiguration configuration;
 };
+
+struct EvaluatedWind {
+    double speed_knots{};
+    double direction_from_degrees{};
+};
+
+/// Converts an east/north wind vector in metres per second to finite routing
+/// values in knots/degrees. A successful empty result means a configured wind
+/// limit makes the state infeasible.
+[[nodiscard]] Result<std::optional<EvaluatedWind>> evaluate_wind(
+    Wind wind,
+    const RoutingOptions& options);
+
+/// Returns the board for headings and meteorological wind-from directions in
+/// degrees true. Zero is reserved for head-to-wind and dead-downwind states.
+[[nodiscard]] std::int8_t board_for_heading(
+    double heading_degrees,
+    double wind_from_degrees) noexcept;
+
+/// Returns the configured tack/gybe delay from true-wind angles in degrees.
+[[nodiscard]] std::chrono::seconds maneuver_delay(
+    const ManeuverPenalties& penalties,
+    OperationalConfiguration parent,
+    double parent_true_wind_angle_degrees,
+    OperationalConfiguration candidate,
+    double candidate_true_wind_angle_degrees) noexcept;
+
+/// Resolves boat speed in knots for a true-wind angle in degrees. Empty means
+/// the polar range or minimum-speed policy makes the action infeasible.
+[[nodiscard]] std::optional<double> boat_speed_for_angle(
+    const PolarSlice& slice,
+    const RoutingOptions& options,
+    double true_wind_angle_degrees) noexcept;
 
 /// Evaluates one time-dependent edge. A successful empty result means the edge
 /// is infeasible under the configured wind, polar, duration, or eligibility
@@ -23,7 +59,7 @@ evaluate_variable_transition(
     const VesselPolar& polar,
     const RoutingOptions& options,
     const RoutePoint& parent,
-    std::int8_t parent_board,
+    OperationalConfiguration parent_configuration,
     Coordinate destination,
     TimePoint route_end);
 

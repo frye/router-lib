@@ -80,6 +80,7 @@ if(SAILROUTE_BUILD_TESTS)
         tests/test_routing.cpp
         tests/test_serialization.cpp
         tests/test_time.cpp
+        tests/test_transition.cpp
         tests/test_weather.cpp
     )
     target_link_libraries(sailroute_tests PRIVATE sailroute::sailroute ECCODES::eccodes)

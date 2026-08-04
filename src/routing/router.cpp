@@ -6,6 +6,8 @@
 #include "routing/intervals.hpp"
 #include "routing/lattice.hpp"
 #include "routing/lattice_solver.hpp"
+#include "routing/state.hpp"
+#include "routing/transition.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -60,11 +62,11 @@ struct BucketKey {
     // Zero unless maneuver penalties are active, in which case candidates on
     // opposite boards are kept apart so a marginally closer wrong-tack
     // candidate cannot displace a genuinely faster one.
-    std::int64_t board{};
+    detail::OperationalConfiguration configuration;
 
     friend bool operator<(const BucketKey& left, const BucketKey& right) noexcept {
-        return std::tie(left.east, left.north, left.board) <
-            std::tie(right.east, right.north, right.board);
+        return std::tie(left.east, left.north, left.configuration) <
+            std::tie(right.east, right.north, right.configuration);
     }
 };
 
@@ -313,46 +315,12 @@ Result<std::pair<TimePoint, DepartureSource>> select_departure(
     return std::pair{metadata.first_valid_time, DepartureSource::forecast_start_fallback};
 }
 
-double true_wind_angle(double heading_degrees, double wind_from_degrees) noexcept {
-    return detail::angular_difference_degrees(heading_degrees, wind_from_degrees);
-}
-
 double normalize_heading(double heading_degrees) noexcept {
     double heading = std::fmod(heading_degrees, 360.0);
     if (heading < 0.0) {
         heading += 360.0;
     }
     return heading;
-}
-
-// Which side the wind crosses the boat: 1 and -1 are opposite boards, 0 is head
-// to wind or dead downwind, where no board is defined and turning costs nothing.
-std::int8_t board_for(double heading_degrees, double wind_from_degrees) noexcept {
-    const double delta = normalize_heading(heading_degrees - wind_from_degrees);
-    if (delta == 0.0 || delta == 180.0) {
-        return 0;
-    }
-    return delta < 180.0 ? std::int8_t{1} : std::int8_t{-1};
-}
-
-// Time lost turning from one board to the other. A board change close to the
-// wind is a tack and one away from it is a gybe; the mean of the two true wind
-// angles decides which, so a turn is classified by where it actually passes
-// through the wind rather than by its endpoints alone.
-std::chrono::seconds maneuver_penalty(
-    const ManeuverPenalties& penalties,
-    std::int8_t parent_board,
-    double parent_true_wind_angle,
-    std::int8_t board,
-    double candidate_true_wind_angle) noexcept {
-    if (parent_board == 0 || board == 0 || parent_board == board) {
-        return std::chrono::seconds::zero();
-    }
-    const double mean_angle =
-        0.5 * (parent_true_wind_angle + candidate_true_wind_angle);
-    return mean_angle >= penalties.downwind_true_wind_angle_degrees
-        ? penalties.gybe_penalty
-        : penalties.tack_penalty;
 }
 
 // Geometry that depends only on the expanding parent, hoisted out of the
@@ -508,19 +476,17 @@ void expand_candidate_range(
             continue;
         }
         const Wind wind = wind_result.value();
-        const double wind_speed = wind.speed_knots();
-        const double wind_direction = wind.direction_from_degrees();
-        if (!std::isfinite(wind_speed) || !std::isfinite(wind_direction)) {
+        auto evaluated_wind = detail::evaluate_wind(wind, options);
+        if (!evaluated_wind) {
             buffer.non_finite_wind = true;
             return;
         }
-
-        // A wind speed the vessel is not expected to sail in removes the node
-        // rather than silently reading the polar's top-end row.
-        if (options.maximum_true_wind_speed_knots.has_value() &&
-            wind_speed > *options.maximum_true_wind_speed_knots) {
+        if (!evaluated_wind.value().has_value()) {
             continue;
         }
+        const double wind_speed = evaluated_wind.value()->speed_knots;
+        const double wind_direction =
+            evaluated_wind.value()->direction_from_degrees;
 
         const ParentGeometry geometry =
             prepare_parent(parent.point.position, request.destination);
@@ -535,12 +501,12 @@ void expand_candidate_range(
 
         const std::int8_t parent_board = parent.parent == no_parent
             ? std::int8_t{0}
-            : board_for(
+            : detail::board_for_heading(
                   parent.point.heading_degrees,
                   parent.point.true_wind_direction_degrees);
         const double parent_angle = parent.parent == no_parent
             ? 0.0
-            : true_wind_angle(
+            : detail::angular_difference_degrees(
                   parent.point.heading_degrees,
                   parent.point.true_wind_direction_degrees);
 
@@ -572,23 +538,30 @@ void expand_candidate_range(
              heading_index < buffer.headings.size();
              ++heading_index) {
             const double heading = buffer.headings[heading_index];
-            const double candidate_angle = true_wind_angle(heading, wind_direction);
-            double boat_speed = polar_slice.speed_knots(candidate_angle);
-            if (!std::isfinite(boat_speed) || boat_speed <= 0.0 ||
-                boat_speed < options.minimum_boat_speed_knots) {
+            const double candidate_angle =
+                detail::angular_difference_degrees(heading, wind_direction);
+            const auto initial_boat_speed = detail::boat_speed_for_angle(
+                polar_slice,
+                options,
+                candidate_angle);
+            if (!initial_boat_speed.has_value()) {
                 continue;
             }
+            double boat_speed = *initial_boat_speed;
 
             // A tack or gybe eats into the step before any distance is made.
             double penalty_seconds = 0.0;
             double usable_hours = step_hours;
             std::chrono::seconds maneuver_delay{};
             if (penalise_maneuvers) {
-                maneuver_delay = maneuver_penalty(
+                maneuver_delay = detail::maneuver_delay(
                     options.maneuver,
-                    parent_board,
+                    detail::OperationalConfiguration{parent_board},
                     parent_angle,
-                    board_for(heading, wind_direction),
+                    detail::OperationalConfiguration{
+                        detail::board_for_heading(
+                            heading,
+                            wind_direction)},
                     candidate_angle);
                 if (maneuver_delay > std::chrono::seconds::zero()) {
                     if (maneuver_delay >= step) {
@@ -626,7 +599,9 @@ void expand_candidate_range(
                         const PolarSlice midpoint_slice = polar.slice_at(
                             midpoint_speed, options.polar_angle_interpolation);
                         const double refined = midpoint_slice.speed_knots(
-                            true_wind_angle(heading, midpoint_direction));
+                            detail::angular_difference_degrees(
+                                heading,
+                                midpoint_direction));
                         if (std::isfinite(refined)) {
                             boat_speed = refined;
                         }
@@ -919,7 +894,7 @@ BucketKey bucket_for(
             std::floor(east_nautical_miles / bucket_size_nautical_miles)),
         static_cast<std::int64_t>(
             std::floor(north_nautical_miles / bucket_size_nautical_miles)),
-        0};
+        {}};
 }
 
 // Buckets by range from the destination and bearing seen from it. Sector width
@@ -938,7 +913,7 @@ BucketKey sector_bucket_for(
         static_cast<std::int64_t>(std::floor(bearing / sector_degrees)),
         static_cast<std::int64_t>(
             std::floor(distance / bucket_size_nautical_miles)),
-        0};
+        {}};
 }
 
 BucketKey pruning_key_for(const Candidate& candidate, Coordinate destination,
@@ -955,7 +930,7 @@ BucketKey pruning_key_for(const Candidate& candidate, Coordinate destination,
               destination,
               options.spatial_bucket_nautical_miles);
     if (options.maneuver.active()) {
-        key.board = board_for(
+        key.configuration.board = detail::board_for_heading(
             candidate.point.heading_degrees,
             candidate.point.true_wind_direction_degrees);
     }

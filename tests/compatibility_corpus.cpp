@@ -41,16 +41,26 @@ struct GridSpec {
 class CorpusGrib {
 public:
     explicit CorpusGrib(GridSpec spec)
-        : path_(spec.filename) {
-        write_message(spec, "10u", 0L, 0.0, "w");
-        write_message(spec, "10v", 0L, -10.0, "a");
-        write_message(spec, "10u", spec.final_forecast_hour, 0.0, "a");
-        write_message(spec, "10v", spec.final_forecast_hour, -10.0, "a");
+        : directory_(create_unique_directory(spec.filename)),
+          path_(directory_ / spec.filename) {
+        spec.filename = path_.string();
+        try {
+            write_message(spec, "10u", 0L, 0.0, "w");
+            write_message(spec, "10v", 0L, -10.0, "a");
+            write_message(spec, "10u", spec.final_forecast_hour, 0.0, "a");
+            write_message(spec, "10v", spec.final_forecast_hour, -10.0, "a");
+        } catch (...) {
+            std::error_code ignored;
+            std::filesystem::remove(path_, ignored);
+            std::filesystem::remove(directory_, ignored);
+            throw;
+        }
     }
 
     ~CorpusGrib() {
         std::error_code ignored;
         std::filesystem::remove(path_, ignored);
+        std::filesystem::remove(directory_, ignored);
     }
 
     CorpusGrib(const CorpusGrib&) = delete;
@@ -61,6 +71,31 @@ public:
     }
 
 private:
+    static std::filesystem::path create_unique_directory(
+        const std::string& name) {
+        const auto seed =
+            std::chrono::steady_clock::now().time_since_epoch().count();
+        for (std::size_t attempt = 0U; attempt < 1'000U; ++attempt) {
+            const auto candidate =
+                std::filesystem::temp_directory_path() /
+                (name + "-" + std::to_string(seed) + "-" +
+                 std::to_string(attempt));
+            std::error_code error;
+            if (std::filesystem::create_directory(candidate, error)) {
+                return candidate;
+            }
+            if (error &&
+                error != std::errc::file_exists) {
+                throw std::filesystem::filesystem_error(
+                    "create compatibility fixture directory",
+                    candidate,
+                    error);
+            }
+        }
+        throw std::runtime_error(
+            "unable to reserve a compatibility fixture directory");
+    }
+
     static void write_message(
         const GridSpec& spec,
         const char* short_name,
@@ -155,6 +190,7 @@ private:
         codes_handle_delete(handle);
     }
 
+    std::filesystem::path directory_;
     std::filesystem::path path_;
 };
 
@@ -204,7 +240,18 @@ void print_result(
                   << ':' << result.error().message << '\n';
         return;
     }
-    const auto json = sailroute::route_to_json(result.value());
+    sailroute::RouteResult normalized = result.value();
+    const std::string& source = normalized.forecast_source;
+    if (source.find("sailroute-compat-regional") != std::string::npos) {
+        normalized.forecast_source = "sailroute-compat-regional.grib";
+    } else if (
+        source.find("sailroute-compat-global") != std::string::npos) {
+        normalized.forecast_source = "sailroute-compat-global.grib";
+    } else if (
+        source.find("sailroute-compat-short") != std::string::npos) {
+        normalized.forecast_source = "sailroute-compat-short.grib";
+    }
+    const auto json = sailroute::route_to_json(normalized);
     if (!json.has_value()) {
         throw std::runtime_error(json.error().message);
     }
