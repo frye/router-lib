@@ -1,6 +1,7 @@
 #include "lattice_comparison.hpp"
 
 #include "routing/lattice.hpp"
+#include "routing/mixed_lattice.hpp"
 
 #include <algorithm>
 #include <array>
@@ -463,6 +464,46 @@ void print_measurements(const ComparisonModel& model, const Measurements& value)
               << " B/cell)  checksum=" << value.checksum << '\n';
 }
 
+void report_mixed_refinement_scaling() {
+    const std::array route{
+        RoutePoint{.position = {70.0, 170.0}},
+        RoutePoint{.position = {82.0, -179.0}},
+        RoutePoint{.position = {70.0, -170.0}}};
+    constexpr std::size_t coarse_level = 2U;
+    constexpr double width_nautical_miles = 120.0;
+
+    std::cout
+        << "\nmixed-resolution corridor scaling\n"
+        << "  base L2, 120 nm geodesic segment corridor through the antimeridian "
+           "and high latitude\n"
+        << "  level  active cells/faces  global cells  active/global  build ms\n";
+    for (std::size_t refinement = 0U; refinement <= 4U; ++refinement) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto mixed = detail::MixedResolutionLattice::create(
+            coarse_level, refinement, route, width_nautical_miles);
+        const double milliseconds =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start)
+                .count();
+        if (!mixed.has_value()) {
+            throw std::runtime_error(mixed.error().message);
+        }
+        const std::size_t level = coarse_level + refinement;
+        const std::size_t global_cells =
+            10U * (std::size_t{1U} << (2U * level)) + 2U;
+        std::cout << "  L" << level << std::setw(12)
+                  << mixed.value().vertex_count() << '/'
+                  << mixed.value().leaf_face_count() << std::setw(14)
+                  << global_cells << std::setw(15) << std::fixed
+                  << std::setprecision(3)
+                  << static_cast<double>(mixed.value().vertex_count()) /
+                      static_cast<double>(global_cells)
+                  << std::setw(12) << std::setprecision(2) << milliseconds
+                  << '\n';
+    }
+    std::cout << std::defaultfloat;
+}
+
 }  // namespace
 
 void report_lattice_comparison() {
@@ -506,6 +547,7 @@ void report_lattice_comparison() {
     print_measurements(icosphere, measure(icosphere, icosphere_repeated));
     print_measurements(healpix, measure(healpix, healpix_repeated));
     print_measurements(fibonacci, measure(fibonacci, fibonacci_repeated));
+    report_mixed_refinement_scaling();
 
     std::cout
         << "\nrefinement suitability\n"

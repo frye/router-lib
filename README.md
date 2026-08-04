@@ -120,6 +120,33 @@ the behavior described above:
 | `--pruning-strategy MODE` | `distance-grid`, `bearing-sectors` |
 | `--pruning-sector-degrees N` | `(0,180]`, default `2` |
 
+The lattice solver is opt-in through `--solver lattice`. Its controls are
+rejected unless that solver is selected:
+
+| Flag | Values |
+| --- | --- |
+| `--lattice-level N` | subdivision level, default `4` |
+| `--lattice-time-bucket-minutes N` | positive integer, default `30` |
+| `--lattice-refinement-levels N` | non-negative integer, default `1` |
+| `--lattice-corridor-nm N` | positive number, default `450` |
+| `--lattice-corridor-retries N` | non-negative integer, default `2` |
+| `--lattice-progress-expansions N` | positive integer, default `250` |
+| `--lattice-search MODE` | `a-star`, `dijkstra`; default `a-star` |
+
+For example, this explicitly requests two refinement levels with the Dijkstra
+oracle:
+
+```sh
+./build/sailroute \
+  --grib forecast.grib2 \
+  --start 37.7749,-122.4194 \
+  --destination 21.3069,-157.8583 \
+  --solver lattice \
+  --lattice-refinement-levels 2 \
+  --lattice-corridor-retries 3 \
+  --lattice-search dijkstra
+```
+
 For example, to charge for maneuvers, sail the polar's VMG optima, and resolve
 the polar peak with a shape-preserving fit:
 
@@ -317,12 +344,24 @@ great-circle distance divided by the polar's global maximum boat speed; select
 | `progress_every_n_expansions` | `250` | Lattice callback cadence |
 | `search_algorithm` | `a_star` | `a_star` or the Dijkstra oracle |
 
-Refinement accepts only a complete route that is no later than the incumbent.
-If a finer corridor disconnects or regresses, the previous route is retained
-and `LatticeRouteDiagnostics::refinement_fallback` is set. Start and destination
-remain exact virtual anchors; route endpoints are never snapped to cell
-centres. The solver is intentionally serial, so `worker_count` has no effect on
-its deterministic output.
+For source compatibility, Stage 2 fields are appended to the public aggregates
+and default to the legacy beam. Existing source that does not select a solver
+continues to produce the v0.3.2 route, progress, diagnostics, errors, and JSON
+bytes covered by the compatibility corpus below. Rebuild C++ consumers when
+upgrading because the public aggregate layouts have grown; do not mix headers
+and binaries from different router-lib versions.
+
+Refinement builds a mixed-resolution graph from the complete coarse lattice and
+only subdivides faces intersecting the geodesic corridor around complete
+incumbent route segments. Coarse cells remain outside the corridor, split
+boundary edges reconnect deterministically, and a globally fine lattice is
+never allocated. A refined route is accepted only when it is complete and no
+later than the incumbent. If every bounded widening attempt disconnects or
+regresses, the previous route is retained and the lattice diagnostics report
+the fallback reason, failed attempts, accepted corridor width, and active
+cell/face counts. Start and destination remain exact virtual anchors; route
+endpoints are never snapped to cell centres. The solver is intentionally
+serial, so `worker_count` has no effect on its deterministic output.
 
 Lattice callbacks identify
 `RoutingSolver::time_dependent_lattice`, populate the distinct
@@ -354,6 +393,40 @@ cmake --build build-bench --parallel
 
 For external peak-memory measurements, run the same command under
 `/usr/bin/time -l` on macOS or `/usr/bin/time -v` on Linux.
+
+### v0.3.2 compatibility corpus
+
+The offline compatibility corpus compiles against both the current tree and the
+immutable pre-Stage-2 baseline at
+`cd99342cdaeb6725639f6ae53a384db50b0e0ad0`. It creates deterministic regional
+and global GRIB fixtures locally and covers antimeridian and high-latitude
+routes, constant and scheduled intervals, accuracy controls, forecast
+exhaustion, cancellation, segment eligibility, progress ordering, and worker
+counts 1, 4, and automatic. CTest compares the complete route JSON, diagnostics,
+errors, progress sequence, and callback counts byte-for-byte with the committed
+v0.3.2 output:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build -R sailroute_v032_compatibility --output-on-failure
+```
+
+The golden output is generated only by compiling
+`tests/compatibility_corpus.cpp` unchanged against the v0.3.2 tag. A mismatch
+writes the candidate output to `build/compatibility-actual.txt`; do not replace
+the golden file to approve an intentional behavior change.
+
+The benchmark header records the candidate revision, compatibility baseline,
+build type, compiler, operating system/architecture, and hardware concurrency.
+Record the CPU model alongside published results with
+`sysctl -n machdep.cpu.brand_string` on macOS or `lscpu` on Linux. Measure the
+corpus peak resident memory independently with:
+
+```sh
+/usr/bin/time -l ./build/sailroute_compatibility_corpus  # macOS
+/usr/bin/time -v ./build/sailroute_compatibility_corpus  # Linux
+```
 
 The following accuracy controls are opt-in. Every default reproduces the search
 exactly as it behaved before these options existed, so enabling none of them
@@ -524,17 +597,19 @@ cmake --build build
 
 ### Known limitations
 
-The search is a forward beam. Pruning freezes each surviving candidate's parent
-chain, and there is no backtracking, so an earlier leg is never revisited once
-its step completes. If a discarded candidate would have led to a materially
-faster passage later, that outcome is unrecoverable: pruning is the only place
-the optimum is lost, and it is lost permanently.
+The default search is a forward beam. Pruning freezes each surviving
+candidate's parent chain, and there is no backtracking, so an earlier leg is
+never revisited once its step completes. If a discarded candidate would have
+led to a materially faster passage later, that outcome is unrecoverable:
+pruning is the only place the optimum is lost, and it is lost permanently.
 
 Board-aware pruning narrows this failure, because the common case is a
 wrong-tack candidate displacing a faster one inside a single bucket. It does not
-remove it. A solver that genuinely re-relaxes earlier legs requires the
-time-dependent shortest-path formulation described under
-[Roadmap](#roadmap).
+remove it. The opt-in lattice solver re-relaxes labels through a
+time-dependent shortest-path search, but its finite spatial subdivision and
+time buckets still approximate a continuous sailing problem. Refinement only
+improves the corridor around its incumbent and deliberately retains that
+incumbent if a finer attempt disconnects or regresses.
 
 ### Route segment eligibility contract
 
