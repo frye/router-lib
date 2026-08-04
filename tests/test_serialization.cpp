@@ -285,6 +285,9 @@ TEST_CASE("serialization rejects non-finite route values") {
     REQUIRE(
         invalid_coordinate_json.error().code ==
         sailroute::ErrorCode::output_error);
+    REQUIRE(
+        invalid_coordinate_json.error().message.find("[-90, 90]") !=
+        std::string::npos);
     const auto gpx = sailroute::route_to_gpx(route);
     REQUIRE(!gpx.has_value());
     REQUIRE(gpx.error().code == sailroute::ErrorCode::output_error);

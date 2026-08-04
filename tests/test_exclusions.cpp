@@ -272,6 +272,17 @@ TEST_CASE("activation boundaries do not constrain zero-duration overlap") {
         ExclusionBoundaryPolicy::boundary_excluded,
         0,
         900));
+
+    ExclusionZone closing = simple_zone("closing", -1.0, 1.0, -1.0, 1.0);
+    closing.active_until = at(900);
+    const ExclusionZoneSet closing_zones = build({closing});
+    REQUIRE(!violates(
+        closing_zones,
+        {0.0, -2.0},
+        {0.0, -1.0},
+        ExclusionBoundaryPolicy::boundary_excluded,
+        0,
+        900));
 }
 
 TEST_CASE("a zone activating mid-segment only constrains the part still to sail") {

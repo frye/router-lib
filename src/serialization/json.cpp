@@ -26,6 +26,15 @@ Error invalid_numeric_value(std::string_view field) {
         "cannot serialize non-finite route value: " + std::string{field}};
 }
 
+Error invalid_coordinate_range(
+    std::string_view field,
+    std::string_view range) {
+    return Error{
+        ErrorCode::output_error,
+        "cannot serialize route coordinate outside " + std::string{range} +
+            ": " + std::string{field}};
+}
+
 Result<std::string> validate_environment_numbers(const RoutePoint& point) {
     if (!point.environment.has_value()) {
         return std::string{};
@@ -80,15 +89,19 @@ void append_provider(
 
 Result<std::string> validate_route_numbers(const RouteResult& route) {
     for (const RoutePoint& point : route.points) {
-        if (!std::isfinite(point.position.latitude_degrees) ||
-            point.position.latitude_degrees < -90.0 ||
-            point.position.latitude_degrees > 90.0) {
+        if (!std::isfinite(point.position.latitude_degrees)) {
             return invalid_numeric_value("latitude");
         }
-        if (!std::isfinite(point.position.longitude_degrees) ||
-            point.position.longitude_degrees < -180.0 ||
-            point.position.longitude_degrees > 180.0) {
+        if (point.position.latitude_degrees < -90.0 ||
+            point.position.latitude_degrees > 90.0) {
+            return invalid_coordinate_range("latitude", "[-90, 90]");
+        }
+        if (!std::isfinite(point.position.longitude_degrees)) {
             return invalid_numeric_value("longitude");
+        }
+        if (point.position.longitude_degrees < -180.0 ||
+            point.position.longitude_degrees > 180.0) {
+            return invalid_coordinate_range("longitude", "[-180, 180]");
         }
         if (!std::isfinite(point.heading_degrees)) {
             return invalid_numeric_value("heading_degrees");

@@ -511,6 +511,7 @@ ExclusionZoneSet::SegmentResult ExclusionZoneSet::intersects_segment(
         // segment actually sailed while it was open.
         double first_fraction = 0.0;
         double last_fraction = 1.0;
+        bool exclusive_clipped_end = false;
         if (zone.active_from.has_value() || zone.active_until.has_value()) {
             if (traversal_seconds > 0.0) {
                 if (zone.active_from.has_value()) {
@@ -524,8 +525,12 @@ ExclusionZoneSet::SegmentResult ExclusionZoneSet::intersects_segment(
                     const double offset = std::chrono::duration<double>(
                                               *zone.active_until - from_time)
                                               .count();
-                    last_fraction =
-                        std::min(last_fraction, offset / traversal_seconds);
+                    const double until_fraction =
+                        offset / traversal_seconds;
+                    if (until_fraction <= last_fraction) {
+                        last_fraction = until_fraction;
+                        exclusive_clipped_end = true;
+                    }
                 }
                 if (first_fraction >= last_fraction) {
                     continue;
@@ -571,12 +576,16 @@ ExclusionZoneSet::SegmentResult ExclusionZoneSet::intersects_segment(
                     parameters,
                     tests);
             }
+            if (exclusive_clipped_end) {
+                std::erase(parameters, 1.0);
+            }
             result.geometry_tests += tests;
 
             const PolygonContainment start_containment =
                 classify_point(polygon, clipped_start);
-            const PolygonContainment end_containment =
-                classify_point(polygon, clipped_end);
+            const PolygonContainment end_containment = exclusive_clipped_end
+                ? PolygonContainment{}
+                : classify_point(polygon, clipped_end);
             result.geometry_tests +=
                 start_containment.geometry_tests + end_containment.geometry_tests;
 
