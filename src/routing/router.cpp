@@ -834,7 +834,7 @@ void expand_candidate_range(
                         request.destination);
             }
 
-            if (environment_active) {
+            if (has_current || has_wave) {
                 RoutePointEnvironment audit;
                 audit.speed_over_ground_knots = ground.speed_knots;
                 audit.course_over_ground_degrees = ground.course_degrees;
@@ -846,7 +846,9 @@ void expand_candidate_range(
                 audit.wave_period_seconds = wave.peak_period_seconds;
                 audit.relative_wave_angle_degrees = relative_wave_angle;
                 candidate.point.environment = audit;
+            }
 
+            if (environment_active) {
                 // Land and exclusion rejection happens before retention, so a
                 // rejected transition never reaches progress output either.
                 const detail::SegmentCheckResult check =

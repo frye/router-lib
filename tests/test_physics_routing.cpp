@@ -271,6 +271,28 @@ TEST_CASE("an unconfigured environment reproduces the no-provider route exactly"
     }
 }
 
+TEST_CASE("geometry-only environments do not invent point physics audit data") {
+    const sailroute::test::ConstantWindGribFixture fixture;
+    const WeatherDataset weather = load_weather(fixture);
+    const auto polar = sailroute::VesselPolar::default_racer_cruiser_45ft();
+
+    RoutingEnvironment environment;
+    environment.exclusions.zones = barrier_zone(10.0, 11.0, 10.0, 11.0);
+    const Router router{weather, polar, environment};
+
+    for (const RoutingSolver solver :
+         {RoutingSolver::isochrone_beam,
+          RoutingSolver::time_dependent_lattice}) {
+        const RouteResult result =
+            route_or_throw(router, base_request(1U, solver));
+        REQUIRE(result.environment.has_value());
+        REQUIRE(result.environment->exclusions.has_value());
+        for (const RoutePoint& point : result.points) {
+            REQUIRE(!point.environment.has_value());
+        }
+    }
+}
+
 TEST_CASE("zero current is exactly equivalent to configuring no current") {
     const sailroute::test::ConstantWindGribFixture fixture;
     const WeatherDataset weather = load_weather(fixture);

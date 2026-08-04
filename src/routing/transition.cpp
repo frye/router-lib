@@ -308,7 +308,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
         wind_from,
         parent.cumulative_distance_nautical_miles + distance,
         std::nullopt};
-    if (environment_active) {
+    if (applied.has_current || applied.has_wave) {
         RoutePointEnvironment audit;
         audit.speed_over_ground_knots = solution->ground_speed_knots;
         audit.course_over_ground_degrees = ground_course;
