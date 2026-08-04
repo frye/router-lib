@@ -96,7 +96,28 @@ Result<std::string> route_to_json(const RouteResult& route) {
     output.append(std::to_string(route.diagnostics.retained_candidates));
     output.append(",\"timeSteps\":");
     output.append(std::to_string(route.diagnostics.time_steps));
-    output.append("},\n  \"points\":[");
+    output.push_back('}');
+    if (route.lattice_diagnostics.has_value()) {
+        const LatticeRouteDiagnostics& lattice = *route.lattice_diagnostics;
+        output.append(",\n  \"latticeDiagnostics\":{\"settledLabels\":");
+        output.append(std::to_string(lattice.settled_labels));
+        output.append(",\"queuedLabels\":");
+        output.append(std::to_string(lattice.queued_labels));
+        output.append(",\"relaxedLabels\":");
+        output.append(std::to_string(lattice.relaxed_labels));
+        output.append(",\"waitTransitions\":");
+        output.append(std::to_string(lattice.wait_transitions));
+        output.append(",\"refinementRuns\":");
+        output.append(std::to_string(lattice.refinement_runs));
+        output.append(",\"acceptedRefinements\":");
+        output.append(std::to_string(lattice.accepted_refinements));
+        output.append(",\"subdivisionLevel\":");
+        output.append(std::to_string(lattice.subdivision_level));
+        output.append(",\"refinementFallback\":");
+        output.append(lattice.refinement_fallback ? "true" : "false");
+        output.push_back('}');
+    }
+    output.append(",\n  \"points\":[");
 
     bool first = true;
     for (const RoutePoint& point : route.points) {

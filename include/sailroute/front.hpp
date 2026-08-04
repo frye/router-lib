@@ -7,8 +7,10 @@
 
 namespace sailroute {
 
-// Builds the destination-facing equal-time reachable front from a set of
-// retained frontier points produced by a single routing time step.
+// Builds a destination-facing equal-time reachable front from candidate points.
+// Router progress uses every eligible pre-prune candidate and anchors the
+// principal component to its provisional retained route. This standalone API
+// derives that anchor as the input point closest to the destination.
 //
 // The algorithm operates in a local geodesic frame centered on the frontier
 // centroid and oriented toward the destination:
@@ -23,9 +25,9 @@ namespace sailroute {
 //     progress (i.e. closest to the destination along the forward axis) is
 //     selected per band; ties are broken lexicographically by (latitude,
 //     longitude) for determinism.
-//   - The selected set is trimmed to the contiguous band run (no gaps in band
-//     index) that contains the provisional best point (the input point with the
-//     smallest great-circle distance to the destination).
+//   - The principal contiguous band run contains the derived provisional point.
+//     When segment_policy is all_meaningful_components, other runs with at least
+//     minimum_secondary_segment_points are retained as separate open segments.
 //   - The trimmed set is ordered port-to-starboard (ascending cross-track
 //     offset, equivalently ascending band index).
 //   - Antimeridian crossings between adjacent ordered points produce a new
@@ -34,9 +36,11 @@ namespace sailroute {
 // A single retained point produces a one-point, one-segment front.
 // An empty input produces an empty front without error.
 //
+// Every returned coordinate is an input coordinate; none are synthesized.
 // Returns an error if any input coordinate is invalid or if
 // band_width_nautical_miles is not finite and positive, or if
-// options.half_angle_degrees is not finite and in (0, 180].
+// options.half_angle_degrees is not finite and in (0, 180], or if
+// options.minimum_secondary_segment_points is zero.
 [[nodiscard]] Result<IsochroneFront> build_destination_front(
     std::span<const Coordinate> retained_points,
     Coordinate destination,

@@ -44,9 +44,17 @@ struct DisplayContourOptions {
 };
 
 /// Controls destination-facing isochrone front construction for display.
+enum class DestinationFrontSegmentPolicy {
+    provisional_component,
+    all_meaningful_components,
+};
+
 struct DestinationFrontOptions {
     // Angular extent on each side of the centroid-to-destination bearing.
     double half_angle_degrees{90.0};
+    DestinationFrontSegmentPolicy segment_policy{
+        DestinationFrontSegmentPolicy::provisional_component};
+    std::size_t minimum_secondary_segment_points{3U};
 };
 
 /// References one contiguous component in a flattened display contour.
@@ -101,6 +109,7 @@ enum class RoutingProgressPayload : std::uint8_t {
     provisional_route = 1U << 1U,
     display_contours = 1U << 2U,
     destination_front = 1U << 3U,
+    search_points = 1U << 4U,
 };
 
 constexpr RoutingProgressPayload operator|(
@@ -134,6 +143,29 @@ struct RoutingProgressOptions {
         RoutingProgressPayload::provisional_route};
     DisplayContourOptions display_contours;
     DestinationFrontOptions destination_front;
+};
+
+/// Routing engine selected for one optimization request.
+enum class RoutingSolver {
+    isochrone_beam,
+    time_dependent_lattice,
+};
+
+/// Label ordering used by the time-dependent lattice solver.
+enum class LatticeSearchAlgorithm {
+    a_star,
+    dijkstra,
+};
+
+/// Resolution, temporal state, refinement, and progress controls for Stage 2.
+struct LatticeRoutingOptions {
+    std::size_t subdivision_level{4U};
+    std::chrono::minutes time_bucket{30};
+    std::size_t refinement_levels{1U};
+    double corridor_width_nautical_miles{450.0};
+    std::size_t corridor_widening_retries{2U};
+    std::size_t progress_every_n_expansions{250U};
+    LatticeSearchAlgorithm search_algorithm{LatticeSearchAlgorithm::a_star};
 };
 
 /// Explains how a route's effective departure time was selected.
@@ -241,6 +273,7 @@ enum class PruningStrategy {
 
 /// Search resolution, pruning, concurrency, progress, and eligibility controls.
 struct RoutingOptions {
+    RoutingSolver solver{RoutingSolver::isochrone_beam};
     std::chrono::minutes time_step{30};
     double heading_step_degrees{10.0};
     double arrival_radius_nautical_miles{2.0};
@@ -257,6 +290,7 @@ struct RoutingOptions {
         {std::chrono::minutes{180}, std::nullopt},
     };
     RoutingProgressOptions progress;
+    LatticeRoutingOptions lattice;
 
     // Accuracy controls. Every default below reproduces the search exactly as it
     // behaved before these options existed.
@@ -298,6 +332,27 @@ struct RouteDiagnostics {
     std::size_t time_steps{};
 };
 
+/// Lattice-only search and refinement work. Absent for the isochrone solver.
+struct LatticeRouteDiagnostics {
+    std::size_t settled_labels{};
+    std::size_t queued_labels{};
+    std::size_t relaxed_labels{};
+    std::size_t wait_transitions{};
+    std::size_t refinement_runs{};
+    std::size_t accepted_refinements{};
+    std::size_t subdivision_level{};
+    bool refinement_fallback{};
+};
+
+/// Lattice-only callback counters for the currently active search pass.
+struct LatticeSearchProgress {
+    std::size_t settled_labels{};
+    std::size_t queued_labels{};
+    std::size_t relaxed_labels{};
+    std::size_t refinement_index{};
+    std::size_t subdivision_level{};
+};
+
 /// One retained search frontier at a completed routing time step.
 struct Isochrone {
     TimePoint time;
@@ -310,6 +365,9 @@ struct RoutingProgress {
     std::vector<RoutePoint> provisional_route;
     IsochroneFront destination_front;
     RouteDiagnostics diagnostics;
+    RoutingSolver solver{RoutingSolver::isochrone_beam};
+    std::vector<Coordinate> search_points;
+    LatticeSearchProgress search;
 };
 
 /// Callback-scoped progress data used by Router::optimize_view.
@@ -320,6 +378,9 @@ struct RoutingProgressView {
     DisplayContourView display_contours;
     IsochroneFrontView destination_front;
     RouteDiagnostics diagnostics;
+    RoutingSolver solver{RoutingSolver::isochrone_beam};
+    std::span<const Coordinate> search_points;
+    LatticeSearchProgress search;
 };
 
 /// Successful complete or forecast-exhausted routing output.
@@ -333,6 +394,7 @@ struct RouteResult {
     std::vector<RoutePoint> points;
     std::vector<Isochrone> isochrones;
     RouteDiagnostics diagnostics;
+    std::optional<LatticeRouteDiagnostics> lattice_diagnostics;
     RouteCompletion completion{RouteCompletion::destination_reached};
 };
 
@@ -342,5 +404,7 @@ struct RouteResult {
 std::string_view to_string(DepartureSource source) noexcept;
 /// Returns the stable snake_case name of a completion state.
 std::string_view to_string(RouteCompletion completion) noexcept;
+/// Returns the stable snake_case name of a routing solver.
+std::string_view to_string(RoutingSolver solver) noexcept;
 
 }  // namespace sailroute

@@ -4,6 +4,8 @@
 #include "routing/front.hpp"
 #include "routing/geodesy.hpp"
 #include "routing/intervals.hpp"
+#include "routing/lattice.hpp"
+#include "routing/lattice_solver.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -206,7 +208,8 @@ std::optional<Error> validate_request(const RouteRequest& request) {
         static_cast<std::uint8_t>(RoutingProgressPayload::retained_points) |
         static_cast<std::uint8_t>(RoutingProgressPayload::provisional_route) |
         static_cast<std::uint8_t>(RoutingProgressPayload::display_contours) |
-        static_cast<std::uint8_t>(RoutingProgressPayload::destination_front);
+        static_cast<std::uint8_t>(RoutingProgressPayload::destination_front) |
+        static_cast<std::uint8_t>(RoutingProgressPayload::search_points);
     if ((static_cast<std::uint8_t>(options.progress.payload) &
          static_cast<std::uint8_t>(~known_payloads)) != 0U) {
         return Error{
@@ -228,6 +231,46 @@ std::optional<Error> validate_request(const RouteRequest& request) {
         return Error{
             ErrorCode::invalid_argument,
             "destination front half_angle_degrees must be finite and in (0, 180]"};
+    }
+    if (options.progress.destination_front.minimum_secondary_segment_points == 0U) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "destination front minimum_secondary_segment_points must be positive"};
+    }
+    if (options.lattice.time_bucket <= std::chrono::minutes::zero()) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "lattice time_bucket must be positive"};
+    }
+    if (options.lattice.progress_every_n_expansions == 0U) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "lattice progress_every_n_expansions must be positive"};
+    }
+    if (!std::isfinite(options.lattice.corridor_width_nautical_miles) ||
+        options.lattice.corridor_width_nautical_miles <= 0.0) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "lattice corridor_width_nautical_miles must be finite and positive"};
+    }
+    if (options.lattice.subdivision_level +
+            options.lattice.refinement_levels >
+        detail::GeodesicLattice::maximum_subdivision_level) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "lattice subdivision and refinement levels exceed the supported maximum"};
+    }
+    if (options.solver == RoutingSolver::time_dependent_lattice &&
+        (options.capture_isochrones ||
+         has_payload(
+             options.progress.payload,
+             RoutingProgressPayload::display_contours) ||
+         has_payload(
+             options.progress.payload,
+             RoutingProgressPayload::destination_front))) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "lattice routing does not produce isochrones, display contours, or destination fronts"};
     }
     if (options.pruning_strategy == PruningStrategy::bearing_sectors &&
         (!std::isfinite(options.pruning_sector_degrees) ||
@@ -1114,6 +1157,7 @@ struct ProgressScratch {
     std::vector<RoutePoint> provisional_route;
     std::vector<Coordinate> contour_points;
     std::vector<DisplayContourSegment> contour_segments;
+    std::vector<Coordinate> front_source_points;
     std::vector<Coordinate> front_points;
     std::vector<IsochroneFrontSegment> front_segments;
 };
@@ -1199,7 +1243,12 @@ Result<RouteResult> Router::optimize_controlled(
                     std::vector<IsochroneFrontSegment>{
                         view.destination_front.segments.begin(),
                         view.destination_front.segments.end()}},
-                view.diagnostics};
+                view.diagnostics,
+                view.solver,
+                std::vector<Coordinate>{
+                    view.search_points.begin(),
+                    view.search_points.end()},
+                view.search};
             return on_progress(progress);
         });
 }
@@ -1248,6 +1297,15 @@ Result<RouteResult> Router::optimize_view_controlled(
     }
     if (!destination_wind) {
         return destination_wind.error();
+    }
+    if (request.options.solver == RoutingSolver::time_dependent_lattice) {
+        return detail::optimize_lattice_route(
+            weather_,
+            polar_,
+            request,
+            departure,
+            departure_source,
+            on_progress);
     }
 
     RouteDiagnostics diagnostics;
@@ -1580,6 +1638,49 @@ Result<RouteResult> Router::optimize_view_controlled(
         prune_candidates_into(
             candidates, request.destination, request.options, prune_scratch);
         const std::vector<std::size_t>& retained = prune_scratch.retained;
+        const bool deliver_progress =
+            on_progress &&
+            diagnostics.time_steps %
+                    request.options.progress.every_n_steps ==
+                0U;
+        const RoutingProgressPayload progress_payload =
+            request.options.progress.payload;
+        const bool build_pre_prune_front =
+            deliver_progress &&
+            has_payload(
+                progress_payload,
+                RoutingProgressPayload::destination_front);
+        std::size_t provisional_candidate_index =
+            std::numeric_limits<std::size_t>::max();
+        if (build_pre_prune_front) {
+            double provisional_candidate_distance =
+                std::numeric_limits<double>::infinity();
+            for (const std::size_t candidate_index : retained) {
+                if (candidates[candidate_index].distance_to_destination <
+                    provisional_candidate_distance) {
+                    provisional_candidate_distance =
+                        candidates[candidate_index].distance_to_destination;
+                    provisional_candidate_index = candidate_index;
+                }
+            }
+            progress_scratch.front_source_points.clear();
+            progress_scratch.front_source_points.reserve(candidates.size());
+            for (const Candidate& candidate : candidates) {
+                progress_scratch.front_source_points.push_back(
+                    candidate.point.position);
+            }
+            if (const auto error = detail::build_destination_front_into(
+                    progress_scratch.front_source_points,
+                    request.destination,
+                    candidates[provisional_candidate_index].point.position,
+                    request.options.spatial_bucket_nautical_miles,
+                    request.options.progress.destination_front,
+                    progress_scratch.front_points,
+                    progress_scratch.front_segments);
+                error.has_value()) {
+                return *error;
+            }
+        }
         next_frontier.clear();
         next_frontier.reserve(retained.size());
         // Reserving exactly nodes.size() + retained.size() would size the buffer
@@ -1604,17 +1705,11 @@ Result<RouteResult> Router::optimize_view_controlled(
         diagnostics.retained_candidates += retained.size();
         frontier.swap(next_frontier);
         best_route_end = provisional_route_end;
-        const bool deliver_progress =
-            on_progress &&
-            diagnostics.time_steps %
-                    request.options.progress.every_n_steps ==
-                0U;
         if (request.options.capture_isochrones) {
             isochrones.push_back(capture_isochrone(nodes, frontier));
         }
         if (deliver_progress) {
-            const RoutingProgressPayload payload =
-                request.options.progress.payload;
+            const RoutingProgressPayload payload = progress_payload;
             const bool needs_retained_points =
                 has_payload(
                     payload,
@@ -1661,16 +1756,7 @@ Result<RouteResult> Router::optimize_view_controlled(
             if (has_payload(
                     payload,
                     RoutingProgressPayload::destination_front)) {
-                if (const auto error = detail::build_destination_front_into(
-                        progress_scratch.retained_points,
-                        request.destination,
-                        request.options.spatial_bucket_nautical_miles,
-                        request.options.progress.destination_front,
-                        progress_scratch.front_points,
-                        progress_scratch.front_segments);
-                    error.has_value()) {
-                    return *error;
-                }
+                // Built from the eligible pre-prune candidate cloud above.
             } else {
                 progress_scratch.front_points.clear();
                 progress_scratch.front_segments.clear();
@@ -1691,7 +1777,10 @@ Result<RouteResult> Router::optimize_view_controlled(
                 IsochroneFrontView{
                     progress_scratch.front_points,
                     progress_scratch.front_segments},
-                diagnostics};
+                diagnostics,
+                RoutingSolver::isochrone_beam,
+                {},
+                {}};
             const RoutingProgressDecision decision = on_progress(progress);
             if (decision == RoutingProgressDecision::cancel) {
                 return cancelled_error(diagnostics);

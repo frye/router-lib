@@ -87,6 +87,8 @@ public:
             PolarAngleInterpolation::linear) const noexcept;
     /// Returns the polar's highest tabulated true wind speed, or zero if empty.
     [[nodiscard]] double maximum_tabulated_wind_speed_knots() const noexcept;
+    /// Returns a global upper bound on interpolated boat speed.
+    [[nodiscard]] double maximum_boat_speed_knots() const noexcept;
     /// Identifies the loaded file or built-in polar.
     [[nodiscard]] const std::string& source() const noexcept;
 

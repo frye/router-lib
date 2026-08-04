@@ -57,6 +57,15 @@ std::string_view to_string(RouteCompletion completion) noexcept {
     return "unknown";
 }
 
+std::string_view to_string(RoutingSolver solver) noexcept {
+    switch (solver) {
+        case RoutingSolver::isochrone_beam: return "isochrone_beam";
+        case RoutingSolver::time_dependent_lattice:
+            return "time_dependent_lattice";
+    }
+    return "unknown";
+}
+
 namespace detail {
 
 double normalize_degrees(double degrees) noexcept {

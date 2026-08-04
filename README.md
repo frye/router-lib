@@ -3,7 +3,8 @@
 `router-lib` is a C++20 library for fastest-arrival sailing route optimization
 using downloaded GRIB weather forecasts and vessel polars. It includes the
 `sailroute` command-line tool, uses ECMWF ecCodes for GRIB1/GRIB2 decoding, and
-performs an isochrone search for time-dependent routing.
+provides deterministic isochrone-beam and time-dependent geodesic-lattice
+routing.
 
 > [!WARNING]
 > The MVP does not model land, shorelines, currents, waves, traffic, restricted
@@ -58,7 +59,7 @@ cmake --install build --prefix "$PWD/install"
 Point a consuming project at that prefix, then link the exported target:
 
 ```cmake
-find_package(sailroute 0.3 CONFIG REQUIRED)
+find_package(sailroute 0.4 CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE sailroute::sailroute)
 ```
 
@@ -276,6 +277,7 @@ the following `RoutingOptions`:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
+| `solver` | `isochrone_beam` | Per-request selection of the legacy beam or Stage 2 lattice solver |
 | `time_step` | 30 minutes | Constant step used when `use_routing_intervals` is `false` |
 | `routing_intervals` | `30m@4h, 1h@24h, 3h` | Departure-relative variable step schedule |
 | `use_routing_intervals` | `true` | Select variable intervals instead of `time_step` |
@@ -289,6 +291,69 @@ the following `RoutingOptions`:
 | `capture_isochrones` | `false` | Retain every completed frontier in `RouteResult` |
 | `progress` | every step, points + route | View callback cadence and payload selection |
 | `segment_eligibility` | empty | Optional synchronous candidate predicate |
+
+#### Time-dependent lattice solver
+
+Set `RoutingOptions::solver` to
+`RoutingSolver::time_dependent_lattice`, or pass `--solver lattice`, to use
+deterministic A* over a hierarchical icosahedral lattice. The default remains
+`isochrone_beam`; unchanged callers retain their existing route, progress,
+diagnostic, and serialization behavior.
+
+Lattice states include the geodesic cell, exact arrival time, time bucket, and
+board. Neighbor edges use the same weather, polar, maneuver, wind-envelope,
+midpoint-sampling, and segment-eligibility controls as routing legs. Explicit
+wait transitions preserve later departure opportunities. A* uses remaining
+great-circle distance divided by the polar's global maximum boat speed; select
+`LatticeSearchAlgorithm::dijkstra` as a zero-heuristic oracle.
+
+| Lattice option | Default | Meaning |
+| --- | --- | --- |
+| `subdivision_level` | `4` | Coarse icosphere level; cell count is `10 * 4^level + 2` |
+| `time_bucket` | 30 minutes | Temporal dominance bucket |
+| `refinement_levels` | `1` | Successive coarse-to-fine passes |
+| `corridor_width_nautical_miles` | `450` | Initial corridor around the incumbent |
+| `corridor_widening_retries` | `2` | Bounded retries when a refined corridor disconnects |
+| `progress_every_n_expansions` | `250` | Lattice callback cadence |
+| `search_algorithm` | `a_star` | `a_star` or the Dijkstra oracle |
+
+Refinement accepts only a complete route that is no later than the incumbent.
+If a finer corridor disconnects or regresses, the previous route is retained
+and `LatticeRouteDiagnostics::refinement_fallback` is set. Start and destination
+remain exact virtual anchors; route endpoints are never snapped to cell
+centres. The solver is intentionally serial, so `worker_count` has no effect on
+its deterministic output.
+
+Lattice callbacks identify
+`RoutingSolver::time_dependent_lattice`, populate the distinct
+`search_points`/`LatticeSearchProgress` fields, and may still populate the
+existing provisional route payload. They do not repurpose retained isochrones,
+display contours, or destination fronts. Lattice requests reject
+`capture_isochrones` and those isochrone-specific progress payloads. Route JSON
+adds `latticeDiagnostics` only for lattice results, preserving legacy JSON bytes
+for the default solver.
+
+The Stage 2 topology spike compared three equal-area/geodesic families before
+search integration:
+
+| Candidate | Regularity | Stable hierarchy | Neighbor graph | Local refinement | Outcome |
+| --- | --- | --- | --- | --- | --- |
+| Subdivided icosahedron | 5/6 neighbors, bounded edge spread | inherited vertex IDs | explicit reciprocal edges | natural face subdivision | selected |
+| HEALPix | equal-area cells | strong | requires specialized polar/seam rules | hierarchical | rejected to avoid a bespoke indexing dependency |
+| Fibonacci sphere | uniform representatives | no parent/child identity | k-nearest graph must be derived | global rebuild | rejected for unstable refinement boundaries |
+
+The benchmark executable reports beam and lattice arrival quality, generated
+work, settled labels, selected level, and wall time on the same forecast leg:
+
+```sh
+cmake -S . -B build-bench -DSAILROUTE_BUILD_BENCHMARKS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-bench --parallel
+./build-bench/sailroute_benchmarks forecast.grib2
+```
+
+For external peak-memory measurements, run the same command under
+`/usr/bin/time -l` on macOS or `/usr/bin/time -v` on Linux.
 
 The following accuracy controls are opt-in. Every default reproduces the search
 exactly as it behaved before these options existed, so enabling none of them
