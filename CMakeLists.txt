@@ -156,6 +156,44 @@ if(SAILROUTE_BUILD_TESTS)
         --destination 0,1
         --lattice-level 4)
     add_cli_failure_test(
+        sailroute_cli_explicit_lattice_options
+        "cannot open GRIB file"
+        --grib sailroute-missing-forecast.grib
+        --start 0,0
+        --destination 0,1
+        --solver lattice
+        --lattice-level 4
+        --lattice-time-bucket-minutes 30
+        --lattice-refinement-levels 2
+        --lattice-corridor-nm 120
+        --lattice-corridor-retries 0
+        --lattice-progress-expansions 50
+        --lattice-search dijkstra)
+    add_cli_failure_test(
+        sailroute_cli_lattice_search_requires_solver
+        "lattice options require explicit --solver lattice selection"
+        --grib sailroute-missing-forecast.grib
+        --start 0,0
+        --destination 0,1
+        --lattice-search dijkstra)
+    add_cli_failure_test(
+        sailroute_cli_duplicate_lattice_search
+        "--lattice-search may only be specified once"
+        --grib sailroute-missing-forecast.grib
+        --start 0,0
+        --destination 0,1
+        --solver lattice
+        --lattice-search a-star
+        --lattice-search dijkstra)
+    add_cli_failure_test(
+        sailroute_cli_invalid_lattice_search
+        "--lattice-search must be a-star or dijkstra"
+        --grib sailroute-missing-forecast.grib
+        --start 0,0
+        --destination 0,1
+        --solver lattice
+        --lattice-search greedy)
+    add_cli_failure_test(
         sailroute_cli_invalid_interval_cutoffs
         "strictly increasing"
         --grib sailroute-missing-forecast.grib

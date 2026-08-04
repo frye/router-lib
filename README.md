@@ -120,6 +120,33 @@ the behavior described above:
 | `--pruning-strategy MODE` | `distance-grid`, `bearing-sectors` |
 | `--pruning-sector-degrees N` | `(0,180]`, default `2` |
 
+The lattice solver is opt-in through `--solver lattice`. Its controls are
+rejected unless that solver is selected:
+
+| Flag | Values |
+| --- | --- |
+| `--lattice-level N` | subdivision level, default `4` |
+| `--lattice-time-bucket-minutes N` | positive integer, default `30` |
+| `--lattice-refinement-levels N` | non-negative integer, default `1` |
+| `--lattice-corridor-nm N` | positive number, default `450` |
+| `--lattice-corridor-retries N` | non-negative integer, default `2` |
+| `--lattice-progress-expansions N` | positive integer, default `250` |
+| `--lattice-search MODE` | `a-star`, `dijkstra`; default `a-star` |
+
+For example, this explicitly requests two refinement levels with the Dijkstra
+oracle:
+
+```sh
+./build/sailroute \
+  --grib forecast.grib2 \
+  --start 37.7749,-122.4194 \
+  --destination 21.3069,-157.8583 \
+  --solver lattice \
+  --lattice-refinement-levels 2 \
+  --lattice-corridor-retries 3 \
+  --lattice-search dijkstra
+```
+
 For example, to charge for maneuvers, sail the polar's VMG optima, and resolve
 the polar peak with a shape-preserving fit:
 
@@ -316,6 +343,13 @@ great-circle distance divided by the polar's global maximum boat speed; select
 | `corridor_widening_retries` | `2` | Bounded retries when a refined corridor disconnects |
 | `progress_every_n_expansions` | `250` | Lattice callback cadence |
 | `search_algorithm` | `a_star` | `a_star` or the Dijkstra oracle |
+
+For source compatibility, Stage 2 fields are appended to the public aggregates
+and default to the legacy beam. Existing source that does not select a solver
+continues to produce the v0.3.2 route, progress, diagnostics, errors, and JSON
+bytes covered by the compatibility corpus below. Rebuild C++ consumers when
+upgrading because the public aggregate layouts have grown; do not mix headers
+and binaries from different router-lib versions.
 
 Refinement builds a mixed-resolution graph from the complete coarse lattice and
 only subdivides faces intersecting the geodesic corridor around complete
@@ -563,17 +597,19 @@ cmake --build build
 
 ### Known limitations
 
-The search is a forward beam. Pruning freezes each surviving candidate's parent
-chain, and there is no backtracking, so an earlier leg is never revisited once
-its step completes. If a discarded candidate would have led to a materially
-faster passage later, that outcome is unrecoverable: pruning is the only place
-the optimum is lost, and it is lost permanently.
+The default search is a forward beam. Pruning freezes each surviving
+candidate's parent chain, and there is no backtracking, so an earlier leg is
+never revisited once its step completes. If a discarded candidate would have
+led to a materially faster passage later, that outcome is unrecoverable:
+pruning is the only place the optimum is lost, and it is lost permanently.
 
 Board-aware pruning narrows this failure, because the common case is a
 wrong-tack candidate displacing a faster one inside a single bucket. It does not
-remove it. A solver that genuinely re-relaxes earlier legs requires the
-time-dependent shortest-path formulation described under
-[Roadmap](#roadmap).
+remove it. The opt-in lattice solver re-relaxes labels through a
+time-dependent shortest-path search, but its finite spatial subdivision and
+time buckets still approximate a continuous sailing problem. Refinement only
+improves the corridor around its incumbent and deliberately retains that
+incumbent if a finer attempt disconnects or regresses.
 
 ### Route segment eligibility contract
 
