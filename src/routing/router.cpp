@@ -240,45 +240,48 @@ std::optional<Error> validate_request(const RouteRequest& request) {
             ErrorCode::invalid_argument,
             "destination front half_angle_degrees must be finite and in (0, 180]"};
     }
-    if (options.progress.destination_front.minimum_secondary_segment_points == 0U) {
+    if (options.progress.destination_front.mode ==
+            DestinationFrontMode::eligible_pre_prune &&
+        options.progress.destination_front.minimum_secondary_segment_points == 0U) {
         return Error{
             ErrorCode::invalid_argument,
             "destination front minimum_secondary_segment_points must be positive"};
     }
-    if (options.lattice.time_bucket <= std::chrono::minutes::zero()) {
-        return Error{
-            ErrorCode::invalid_argument,
-            "lattice time_bucket must be positive"};
-    }
-    if (options.lattice.progress_every_n_expansions == 0U) {
-        return Error{
-            ErrorCode::invalid_argument,
-            "lattice progress_every_n_expansions must be positive"};
-    }
-    if (!std::isfinite(options.lattice.corridor_width_nautical_miles) ||
-        options.lattice.corridor_width_nautical_miles <= 0.0) {
-        return Error{
-            ErrorCode::invalid_argument,
-            "lattice corridor_width_nautical_miles must be finite and positive"};
-    }
-    if (options.lattice.subdivision_level +
-            options.lattice.refinement_levels >
-        detail::GeodesicLattice::maximum_subdivision_level) {
-        return Error{
-            ErrorCode::invalid_argument,
-            "lattice subdivision and refinement levels exceed the supported maximum"};
-    }
-    if (options.solver == RoutingSolver::time_dependent_lattice &&
-        (options.capture_isochrones ||
-         has_payload(
-             options.progress.payload,
-             RoutingProgressPayload::display_contours) ||
-         has_payload(
-             options.progress.payload,
-             RoutingProgressPayload::destination_front))) {
-        return Error{
-            ErrorCode::invalid_argument,
-            "lattice routing does not produce isochrones, display contours, or destination fronts"};
+    if (options.solver == RoutingSolver::time_dependent_lattice) {
+        if (options.lattice.time_bucket <= std::chrono::minutes::zero()) {
+            return Error{
+                ErrorCode::invalid_argument,
+                "lattice time_bucket must be positive"};
+        }
+        if (options.lattice.progress_every_n_expansions == 0U) {
+            return Error{
+                ErrorCode::invalid_argument,
+                "lattice progress_every_n_expansions must be positive"};
+        }
+        if (!std::isfinite(options.lattice.corridor_width_nautical_miles) ||
+            options.lattice.corridor_width_nautical_miles <= 0.0) {
+            return Error{
+                ErrorCode::invalid_argument,
+                "lattice corridor_width_nautical_miles must be finite and positive"};
+        }
+        if (options.lattice.subdivision_level +
+                options.lattice.refinement_levels >
+            detail::GeodesicLattice::maximum_subdivision_level) {
+            return Error{
+                ErrorCode::invalid_argument,
+                "lattice subdivision and refinement levels exceed the supported maximum"};
+        }
+        if (options.capture_isochrones ||
+            has_payload(
+                options.progress.payload,
+                RoutingProgressPayload::display_contours) ||
+            has_payload(
+                options.progress.payload,
+                RoutingProgressPayload::destination_front)) {
+            return Error{
+                ErrorCode::invalid_argument,
+                "lattice routing does not produce isochrones, display contours, or destination fronts"};
+        }
     }
     if (options.pruning_strategy == PruningStrategy::bearing_sectors &&
         (!std::isfinite(options.pruning_sector_degrees) ||
@@ -1876,7 +1879,9 @@ Result<RouteResult> Router::optimize_view_controlled(
             deliver_progress &&
             has_payload(
                 progress_payload,
-                RoutingProgressPayload::destination_front);
+                RoutingProgressPayload::destination_front) &&
+            request.options.progress.destination_front.mode ==
+                DestinationFrontMode::eligible_pre_prune;
         std::size_t provisional_candidate_index =
             std::numeric_limits<std::size_t>::max();
         if (build_pre_prune_front) {
@@ -1983,7 +1988,19 @@ Result<RouteResult> Router::optimize_view_controlled(
             if (has_payload(
                     payload,
                     RoutingProgressPayload::destination_front)) {
-                // Built from the eligible pre-prune candidate cloud above.
+                if (request.options.progress.destination_front.mode ==
+                    DestinationFrontMode::retained_frontier) {
+                    if (const auto error = detail::build_destination_front_into(
+                            progress_scratch.retained_points,
+                            request.destination,
+                            request.options.spatial_bucket_nautical_miles,
+                            request.options.progress.destination_front,
+                            progress_scratch.front_points,
+                            progress_scratch.front_segments);
+                        error.has_value()) {
+                        return *error;
+                    }
+                }
             } else {
                 progress_scratch.front_points.clear();
                 progress_scratch.front_segments.clear();

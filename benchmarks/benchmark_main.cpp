@@ -2,6 +2,8 @@
 #include "sailroute/router.hpp"
 #include "sailroute/time.hpp"
 
+#include "lattice_comparison.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -338,6 +340,8 @@ int main(int argc, char** argv) {
 
     std::cout << "polar lookups: " << iterations / seconds << "/s\n";
     std::cout << "checksum: " << checksum << '\n';
+
+    sailroute::benchmarks::report_lattice_comparison();
 
     if (argc < 2) {
         std::cout << "routing benchmarks skipped; pass a GRIB forecast path\n";

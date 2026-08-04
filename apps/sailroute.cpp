@@ -852,6 +852,18 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
     if (options.help) {
         return options;
     }
+    const bool lattice_option_seen =
+        lattice_level_seen ||
+        lattice_bucket_seen ||
+        lattice_refinement_seen ||
+        lattice_corridor_seen ||
+        lattice_progress_seen;
+    if (lattice_option_seen &&
+        options.routing.solver !=
+            sailroute::RoutingSolver::time_dependent_lattice) {
+        return usage_error(
+            "lattice options require explicit --solver lattice selection");
+    }
     if (!grib_seen || !start_seen || !destination_seen) {
         std::string missing;
         if (!grib_seen) {

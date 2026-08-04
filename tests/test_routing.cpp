@@ -444,7 +444,61 @@ TEST_CASE("routing defaults retain a wider configurable frontier") {
         sailroute::RoutingProgressPayload::display_contours));
     REQUIRE(
         options.progress.destination_front.half_angle_degrees == 90.0);
+    REQUIRE(
+        options.progress.destination_front.mode ==
+        sailroute::DestinationFrontMode::retained_frontier);
     REQUIRE(!options.segment_eligibility);
+    REQUIRE(
+        options.solver == sailroute::RoutingSolver::isochrone_beam);
+}
+
+TEST_CASE("pre-Stage-2 positional aggregates retain their field mapping") {
+    const sailroute::RoutingOptions options{
+        std::chrono::minutes{45},
+        12.0,
+        3.0,
+        8.0,
+        7U,
+        2U,
+        std::chrono::hours{120},
+        0.1,
+        true,
+        false,
+        std::vector<sailroute::RoutingInterval>{{
+            std::chrono::minutes{45},
+            std::nullopt}},
+        sailroute::RoutingProgressOptions{},
+        sailroute::ManeuverPenalties{},
+        sailroute::HeadingAugmentation::none,
+        sailroute::WindSampling::segment_start,
+        std::chrono::minutes{0},
+        sailroute::PolarAngleInterpolation::linear,
+        std::nullopt,
+        sailroute::AbovePolarRangePolicy::clamp,
+        sailroute::PruningStrategy::destination_distance_grid,
+        2.0,
+        sailroute::RouteSegmentEligibilityCallback{}};
+    REQUIRE(options.time_step == std::chrono::minutes{45});
+    REQUIRE(options.capture_isochrones);
+    REQUIRE(
+        options.solver == sailroute::RoutingSolver::isochrone_beam);
+
+    const sailroute::TimePoint departure{
+        std::chrono::seconds{1'700'000'000}};
+    const sailroute::RouteResult route{
+        departure,
+        departure + std::chrono::hours{1},
+        sailroute::DepartureSource::explicit_time,
+        "forecast",
+        "polar",
+        {},
+        {},
+        {},
+        sailroute::RouteCompletion::forecast_exhausted};
+    REQUIRE(
+        route.completion ==
+        sailroute::RouteCompletion::forecast_exhausted);
+    REQUIRE(!route.lattice_diagnostics.has_value());
 }
 
 TEST_CASE("routing interval schedules select and clamp elapsed-time tiers") {
@@ -1131,6 +1185,8 @@ TEST_CASE("progress destination fronts use pre-prune candidates and retain the a
         sailroute::RoutingProgressPayload::provisional_route |
         sailroute::RoutingProgressPayload::destination_front;
     request.options.progress.destination_front.half_angle_degrees = 120.0;
+    request.options.progress.destination_front.mode =
+        sailroute::DestinationFrontMode::eligible_pre_prune;
 
     std::size_t update_count = 0U;
     bool observed_pre_prune_point = false;
@@ -1174,6 +1230,39 @@ TEST_CASE("progress destination fronts use pre-prune candidates and retain the a
     REQUIRE(result.has_value());
     REQUIRE(update_count + 1U == result.value().diagnostics.time_steps);
     REQUIRE(observed_pre_prune_point);
+}
+
+TEST_CASE("progress destination fronts default to retained frontier candidates") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    sailroute::RouteRequest request = routing_request(1U, false);
+    request.options.progress.payload =
+        sailroute::RoutingProgressPayload::retained_points |
+        sailroute::RoutingProgressPayload::destination_front;
+
+    std::size_t update_count = 0U;
+    const auto result = router.optimize_view(
+        request,
+        [&update_count](const sailroute::RoutingProgressView& progress) {
+            ++update_count;
+            for (const sailroute::Coordinate point :
+                 progress.destination_front.points) {
+                REQUIRE(std::any_of(
+                    progress.retained_points.begin(),
+                    progress.retained_points.end(),
+                    [point](sailroute::Coordinate retained) {
+                        return retained.latitude_degrees ==
+                                   point.latitude_degrees &&
+                            retained.longitude_degrees ==
+                                   point.longitude_degrees;
+                    }));
+            }
+        });
+
+    REQUIRE(result.has_value());
+    REQUIRE(update_count > 0U);
 }
 
 TEST_CASE("destination front aperture does not change routing search") {
@@ -1314,6 +1403,22 @@ TEST_CASE("progress options reject invalid construction values") {
         REQUIRE(!result.has_value());
         REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
     }
+}
+
+TEST_CASE("beam routing ignores dormant invalid lattice options") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    sailroute::RouteRequest request = routing_request(1U, false);
+    request.options.lattice.time_bucket = std::chrono::minutes{0};
+    request.options.lattice.progress_every_n_expansions = 0U;
+    request.options.lattice.corridor_width_nautical_miles = -1.0;
+    request.options.lattice.subdivision_level = 9U;
+
+    const auto result = router.optimize(request);
+    REQUIRE(result.has_value());
+    REQUIRE(!result.value().lattice_diagnostics.has_value());
 }
 
 TEST_CASE("bearing-sector pruning rejects invalid sector widths") {

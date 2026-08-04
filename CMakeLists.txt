@@ -143,6 +143,13 @@ if(SAILROUTE_BUILD_TESTS)
         --routing-intervals 30m
         --time-step-minutes 30)
     add_cli_failure_test(
+        sailroute_cli_lattice_option_requires_solver
+        "require explicit --solver lattice"
+        --grib sailroute-missing-forecast.grib
+        --start 0,0
+        --destination 0,1
+        --lattice-level 4)
+    add_cli_failure_test(
         sailroute_cli_invalid_interval_cutoffs
         "strictly increasing"
         --grib sailroute-missing-forecast.grib
@@ -166,8 +173,14 @@ if(SAILROUTE_BUILD_TESTS)
 endif()
 
 if(SAILROUTE_BUILD_BENCHMARKS)
-    add_executable(sailroute_benchmarks benchmarks/benchmark_main.cpp)
+    add_executable(sailroute_benchmarks
+        benchmarks/benchmark_main.cpp
+        benchmarks/lattice_comparison.cpp
+    )
     target_link_libraries(sailroute_benchmarks PRIVATE sailroute::sailroute)
+    target_include_directories(
+        sailroute_benchmarks
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endif()
 
 install(TARGETS sailroute sailroute_cli

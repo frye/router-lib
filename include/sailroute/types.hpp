@@ -49,12 +49,21 @@ enum class DestinationFrontSegmentPolicy {
     all_meaningful_components,
 };
 
+/// Selects the candidate population and topology rules used for progress fronts.
+enum class DestinationFrontMode {
+    /// v0.3 behavior: build one principal component from retained frontier nodes.
+    retained_frontier,
+    /// Build from all eligible pre-prune candidates and preserve the route anchor.
+    eligible_pre_prune,
+};
+
 struct DestinationFrontOptions {
     // Angular extent on each side of the centroid-to-destination bearing.
     double half_angle_degrees{90.0};
     DestinationFrontSegmentPolicy segment_policy{
         DestinationFrontSegmentPolicy::provisional_component};
     std::size_t minimum_secondary_segment_points{3U};
+    DestinationFrontMode mode{DestinationFrontMode::retained_frontier};
 };
 
 /// References one contiguous component in a flattened display contour.
@@ -340,7 +349,6 @@ enum class PruningStrategy {
 
 /// Search resolution, pruning, concurrency, progress, and eligibility controls.
 struct RoutingOptions {
-    RoutingSolver solver{RoutingSolver::isochrone_beam};
     std::chrono::minutes time_step{30};
     double heading_step_degrees{10.0};
     double arrival_radius_nautical_miles{2.0};
@@ -357,7 +365,6 @@ struct RoutingOptions {
         {std::chrono::minutes{180}, std::nullopt},
     };
     RoutingProgressOptions progress;
-    LatticeRoutingOptions lattice;
 
     // Accuracy controls. Every default below reproduces the search exactly as it
     // behaved before these options existed.
@@ -381,6 +388,11 @@ struct RoutingOptions {
     // synchronously before retention; true accepts and false rejects.
     // The view is valid only for the callback.
     RouteSegmentEligibilityCallback segment_eligibility;
+
+    // Stage 2 controls are trailing so positional initializers written against
+    // the pre-Stage-2 aggregate keep their original field mapping.
+    RoutingSolver solver{RoutingSolver::isochrone_beam};
+    LatticeRoutingOptions lattice;
 };
 
 /// Start, destination, optional departure, and routing configuration.
@@ -505,11 +517,11 @@ struct RouteResult {
     std::vector<RoutePoint> points;
     std::vector<Isochrone> isochrones;
     RouteDiagnostics diagnostics;
+    RouteCompletion completion{RouteCompletion::destination_reached};
     std::optional<LatticeRouteDiagnostics> lattice_diagnostics;
     /// Present only when a Stage 3 environment was configured.
     std::optional<EnvironmentDiagnostics> environment_diagnostics;
     std::optional<RouteEnvironmentMetadata> environment;
-    RouteCompletion completion{RouteCompletion::destination_reached};
 };
 
 /// Checks coordinate finiteness and canonical latitude/longitude bounds.
