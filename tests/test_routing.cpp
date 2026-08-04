@@ -1296,6 +1296,44 @@ TEST_CASE("progress options reject invalid construction values") {
     }
 }
 
+TEST_CASE("bearing-sector pruning rejects invalid sector widths") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    sailroute::RouteRequest request = routing_request(1U, false);
+    request.options.pruning_strategy =
+        sailroute::PruningStrategy::bearing_sectors;
+
+    // sector_bucket_for divides a bearing by this width and casts the quotient
+    // to an integer, so a zero or non-finite width is undefined behavior rather
+    // than merely an odd search.
+    const std::array<double, 6> invalid_sectors{
+        0.0,
+        -1.0,
+        180.0001,
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+    };
+    for (const double sector : invalid_sectors) {
+        request.options.pruning_sector_degrees = sector;
+        const auto result = router.optimize(request);
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
+    }
+
+    request.options.pruning_sector_degrees = 2.0;
+    REQUIRE(router.optimize(request).has_value());
+
+    // The width is only consulted by bearing-sector pruning, so the default
+    // grid strategy stays unaffected by a stale value.
+    request.options.pruning_strategy =
+        sailroute::PruningStrategy::destination_distance_grid;
+    request.options.pruning_sector_degrees = 0.0;
+    REQUIRE(router.optimize(request).has_value());
+}
+
 TEST_CASE("router produces scheduled points at five-minute intervals") {
     const RoutingGribFixture fixture;
     const auto weather = sailroute::WeatherDataset::load(fixture.path());

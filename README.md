@@ -256,7 +256,8 @@ wind angle. Both borrow nothing that can dangle: the sampler shares ownership of
 the forecast, and a slice is valid for the lifetime of its polar.
 
 ```cpp
-const auto sampler = weather.sampler_at(when);
+const auto sampler = weather.sampler_at(when);  // Result<WeatherSampler>
+const auto wind = sampler.value().sample({37.7749, -122.4194});
 const sailroute::PolarSlice slice = polar.slice_at(20.0);
 const double speed = slice.speed_knots(52.0);
 ```

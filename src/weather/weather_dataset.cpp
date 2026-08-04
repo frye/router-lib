@@ -1659,7 +1659,9 @@ WeatherSampler::WeatherSampler(WeatherSampler&&) noexcept = default;
 WeatherSampler& WeatherSampler::operator=(const WeatherSampler&) = default;
 WeatherSampler& WeatherSampler::operator=(WeatherSampler&&) noexcept = default;
 
-bool WeatherSampler::valid() const noexcept { return impl_ != nullptr; }
+bool WeatherSampler::valid() const noexcept {
+    return impl_ != nullptr && !impl_->time_error;
+}
 
 Result<Wind> WeatherSampler::sample(Coordinate coordinate) const {
     if (!impl_) {

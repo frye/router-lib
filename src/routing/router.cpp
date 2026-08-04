@@ -182,6 +182,14 @@ std::optional<Error> validate_request(const RouteRequest& request) {
             ErrorCode::invalid_argument,
             "destination front half_angle_degrees must be finite and in (0, 180]"};
     }
+    if (options.pruning_strategy == PruningStrategy::bearing_sectors &&
+        (!std::isfinite(options.pruning_sector_degrees) ||
+         options.pruning_sector_degrees <= 0.0 ||
+         options.pruning_sector_degrees > 180.0)) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "pruning_sector_degrees must be finite and in (0, 180]"};
+    }
     return std::nullopt;
 }
 

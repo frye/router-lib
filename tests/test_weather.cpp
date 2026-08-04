@@ -684,6 +684,35 @@ TEST_CASE("time sampler matches interpolate for out-of-range times") {
     }
 }
 
+TEST_CASE("time sampler validity reports whether the time resolved") {
+    const GribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const auto start = sailroute::parse_utc_time("2026-07-14T00:00:00Z");
+    REQUIRE(start.has_value());
+
+    // valid() is documented as reporting whether the sampler resolved a
+    // forecast time, and callers use it as a guard before sampling, so a
+    // deferred time error has to make it false.
+    const auto resolved = weather.value().sampler_at(start.value());
+    REQUIRE(resolved.has_value());
+    REQUIRE(resolved.value().valid());
+
+    const auto unresolved =
+        weather.value().sampler_at(start.value() - std::chrono::seconds{1});
+    REQUIRE(unresolved.has_value());
+    REQUIRE(!unresolved.value().valid());
+
+    // The deferred error still surfaces from sample() exactly as before.
+    const auto sampled = unresolved.value().sample({1.0, 1.0});
+    REQUIRE(!sampled.has_value());
+    REQUIRE(
+        sampled.error().code == sailroute::ErrorCode::departure_outside_forecast);
+
+    // An empty sampler is invalid too, so the guard covers both cases.
+    REQUIRE(!sailroute::WeatherSampler{}.valid());
+}
+
 TEST_CASE("bounded time sampler reports the coordinate problem first") {
     const GribFixture fixture;
     const sailroute::GeographicBounds bounds{0.25, 0.25, 0.75, 0.75};
