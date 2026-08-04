@@ -40,10 +40,10 @@ namespace sailroute {
 /// threads. Providers are held by `std::shared_ptr<const T>` so a single
 /// instance can be shared across routers and optimizations.
 
-/// Distinguishes a usable sample from each way a sample can be unusable.
+/// Distinguishes a usable sample from each provider-reported failure state.
 ///
-/// `unconfigured` is never produced by a provider; it describes the state of
-/// having no provider at all, which is not a failure.
+/// An unconfigured provider is represented by an empty provider pointer and is
+/// not a sample status or a failure.
 enum class EnvironmentSampleStatus {
     available,
     outside_coverage,
