@@ -47,15 +47,31 @@ Result<std::string> validate_route_numbers(const RouteResult& route) {
         }
         if (point.environment.has_value()) {
             const RoutePointEnvironment& environment = *point.environment;
-            if (!std::isfinite(environment.speed_over_ground_knots) ||
-                !std::isfinite(environment.course_over_ground_degrees) ||
-                !std::isfinite(environment.current_east_knots) ||
-                !std::isfinite(environment.current_north_knots) ||
-                !std::isfinite(environment.flat_water_speed_knots) ||
-                !std::isfinite(environment.significant_wave_height_metres) ||
-                !std::isfinite(environment.wave_period_seconds) ||
-                !std::isfinite(environment.relative_wave_angle_degrees)) {
-                return invalid_numeric_value("environment");
+            if (!std::isfinite(environment.speed_over_ground_knots)) {
+                return invalid_numeric_value("speed_over_ground_knots");
+            }
+            if (!std::isfinite(environment.course_over_ground_degrees)) {
+                return invalid_numeric_value("course_over_ground_degrees");
+            }
+            if (!std::isfinite(environment.current_east_knots)) {
+                return invalid_numeric_value("current_east_knots");
+            }
+            if (!std::isfinite(environment.current_north_knots)) {
+                return invalid_numeric_value("current_north_knots");
+            }
+            if (!std::isfinite(environment.flat_water_speed_knots)) {
+                return invalid_numeric_value("flat_water_speed_knots");
+            }
+            if (!std::isfinite(
+                    environment.significant_wave_height_metres)) {
+                return invalid_numeric_value(
+                    "significant_wave_height_metres");
+            }
+            if (!std::isfinite(environment.wave_period_seconds)) {
+                return invalid_numeric_value("wave_period_seconds");
+            }
+            if (!std::isfinite(environment.relative_wave_angle_degrees)) {
+                return invalid_numeric_value("relative_wave_angle_degrees");
             }
         }
     }

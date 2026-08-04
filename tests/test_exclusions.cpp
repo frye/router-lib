@@ -291,9 +291,9 @@ TEST_CASE("the boundary policy decides whether a shared edge may be sailed") {
     REQUIRE(zones.contains(
         Coordinate{0.0, 0.0}, at(0), ExclusionBoundaryPolicy::boundary_excluded));
     REQUIRE(!zones.contains(
-        Coordinate{1.0, 0.0}, at(0), ExclusionBoundaryPolicy::boundary_allowed) ||
-        zones.contains(
-            Coordinate{1.0, 0.0}, at(0), ExclusionBoundaryPolicy::boundary_allowed));
+        Coordinate{1.0, 0.0},
+        at(0),
+        ExclusionBoundaryPolicy::boundary_allowed));
 }
 
 TEST_CASE("zones spanning the antimeridian need no special encoding") {

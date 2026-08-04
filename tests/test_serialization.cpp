@@ -267,6 +267,11 @@ TEST_CASE("serialization rejects non-finite route values") {
     REQUIRE(
         current_json.error().message.find("current_east_knots") !=
         std::string::npos);
+    const auto current_gpx = sailroute::route_to_gpx(route);
+    REQUIRE(!current_gpx.has_value());
+    REQUIRE(
+        current_gpx.error().message.find("current_east_knots") !=
+        std::string::npos);
 
     route = sample_route();
     route.environment = sailroute::RouteEnvironmentMetadata{};
