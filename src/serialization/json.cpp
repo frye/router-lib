@@ -80,10 +80,14 @@ void append_provider(
 
 Result<std::string> validate_route_numbers(const RouteResult& route) {
     for (const RoutePoint& point : route.points) {
-        if (!std::isfinite(point.position.latitude_degrees)) {
+        if (!std::isfinite(point.position.latitude_degrees) ||
+            point.position.latitude_degrees < -90.0 ||
+            point.position.latitude_degrees > 90.0) {
             return invalid_numeric_value("latitude");
         }
-        if (!std::isfinite(point.position.longitude_degrees)) {
+        if (!std::isfinite(point.position.longitude_degrees) ||
+            point.position.longitude_degrees < -180.0 ||
+            point.position.longitude_degrees > 180.0) {
             return invalid_numeric_value("longitude");
         }
         if (!std::isfinite(point.heading_degrees)) {

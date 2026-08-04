@@ -280,6 +280,11 @@ TEST_CASE("serialization rejects non-finite route values") {
 
     route = sample_route();
     route.points.front().position.latitude_degrees = 91.0;
+    const auto invalid_coordinate_json = sailroute::route_to_json(route);
+    REQUIRE(!invalid_coordinate_json.has_value());
+    REQUIRE(
+        invalid_coordinate_json.error().code ==
+        sailroute::ErrorCode::output_error);
     const auto gpx = sailroute::route_to_gpx(route);
     REQUIRE(!gpx.has_value());
     REQUIRE(gpx.error().code == sailroute::ErrorCode::output_error);
