@@ -503,6 +503,8 @@ void expand_candidate_range(
 
     const bool penalise_maneuvers = options.maneuver.active();
     const bool environment_active = environment.active();
+    const bool environment_fields_active =
+        environment.currents.configured() || environment.waves.configured();
     // A degenerate environment sample, reused so the no-provider path keeps
     // reading zero current and no waves without any branch in the inner loop.
     const detail::EnvironmentSamples no_environment{};
@@ -539,7 +541,7 @@ void expand_candidate_range(
         // it is sampled once per parent alongside the wind.
         const detail::EnvironmentSamples* parent_samples = &no_environment;
         detail::EnvironmentSamples sampled_environment;
-        if (environment_active) {
+        if (environment_fields_active) {
             detail::EnvironmentSampleResult sampled = detail::sample_environment(
                 environment,
                 parent.point.position,
@@ -634,7 +636,7 @@ void expand_candidate_range(
             // are defined in.
             double flat_water_speed = boat_speed;
             double relative_wave_angle = 0.0;
-            if (environment_active) {
+            if (environment_fields_active) {
                 has_current = parent_has_current;
                 has_wave = parent_has_wave;
                 current = parent_current;
@@ -696,7 +698,7 @@ void expand_candidate_range(
 
             // Second-order integration can refine wind, environment, or both at
             // the provisional segment midpoint.
-            const bool midpoint_environment = environment_active &&
+            const bool midpoint_environment = environment_fields_active &&
                 environment.sampling == EnvironmentSampling::midpoint;
             if (midpoint_weather != nullptr || midpoint_environment) {
                 const Coordinate midpoint = detail::destination_point_from(

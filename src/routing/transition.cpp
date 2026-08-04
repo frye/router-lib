@@ -90,8 +90,10 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
     }
 
     const bool environment_active = environment.active();
+    const bool environment_fields_active =
+        environment.currents.configured() || environment.waves.configured();
     EnvironmentSamples samples;
-    if (environment_active) {
+    if (environment_fields_active) {
         EnvironmentSampleResult sampled = sample_environment(
             environment, parent.position, parent.time, diagnostics);
         if (sampled.outcome == EnvironmentOutcome::failed) {
@@ -239,7 +241,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
         options.wind_sampling == WindSampling::midpoint &&
         std::chrono::duration<double>(sailing_seconds) >=
             options.midpoint_wind_sampling_threshold;
-    const bool midpoint_environment = environment_active &&
+    const bool midpoint_environment = environment_fields_active &&
         environment.sampling == EnvironmentSampling::midpoint;
     if (midpoint_wind || midpoint_environment) {
         const Coordinate midpoint =
