@@ -621,6 +621,8 @@ void expand_candidate_range(
              ++heading_index) {
             const double heading = buffer.headings[heading_index];
             const double candidate_angle = true_wind_angle(heading, wind_direction);
+            double performance_wind_speed = wind_speed;
+            double performance_wind_angle = candidate_angle;
             double boat_speed = polar_slice.speed_knots(candidate_angle);
             if (!std::isfinite(boat_speed) || boat_speed <= 0.0 ||
                 boat_speed < options.minimum_boat_speed_knots) {
@@ -740,11 +742,15 @@ void expand_candidate_range(
                          midpoint_speed <= *options.maximum_true_wind_speed_knots)) {
                         const PolarSlice midpoint_slice = polar.slice_at(
                             midpoint_speed, options.polar_angle_interpolation);
+                        const double midpoint_angle =
+                            true_wind_angle(heading, midpoint_direction);
                         const double refined = midpoint_slice.speed_knots(
-                            true_wind_angle(heading, midpoint_direction));
+                            midpoint_angle);
                         if (std::isfinite(refined)) {
                             flat_water_speed = refined;
                             boat_speed = refined;
+                            performance_wind_speed = midpoint_speed;
+                            performance_wind_angle = midpoint_angle;
                         }
                     }
                 }
@@ -754,8 +760,8 @@ void expand_candidate_range(
                     Result<double> derated = detail::apply_sea_state(
                         environment,
                         flat_water_speed,
-                        wind_speed,
-                        candidate_angle,
+                        performance_wind_speed,
+                        performance_wind_angle,
                         heading,
                         wave,
                         buffer.environment);

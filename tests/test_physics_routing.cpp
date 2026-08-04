@@ -10,6 +10,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <memory>
+#include <mutex>
 #include <numbers>
 #include <optional>
 #include <stdexcept>
@@ -36,6 +38,8 @@ using sailroute::RouteResult;
 using sailroute::Router;
 using sailroute::RoutingEnvironment;
 using sailroute::RoutingSolver;
+using sailroute::SeaStateInput;
+using sailroute::SeaStatePerformanceModel;
 using sailroute::SignedDistanceLandmask;
 using sailroute::WaveState;
 using sailroute::WeatherDataset;
@@ -123,6 +127,32 @@ void require_identical_route(const RouteResult& left, const RouteResult& right) 
 ProviderMetadata make_metadata(std::string name) {
     return ProviderMetadata{std::move(name), "unit test", "1"};
 }
+
+class RecordingSeaStateModel final : public SeaStatePerformanceModel {
+public:
+    RecordingSeaStateModel() : metadata_(make_metadata("recording")) {}
+
+    [[nodiscard]] const ProviderMetadata& metadata() const noexcept override {
+        return metadata_;
+    }
+
+    [[nodiscard]] double derated_speed_knots(
+        const SeaStateInput& input) const override {
+        std::lock_guard lock(mutex_);
+        inputs_.push_back(input);
+        return input.flat_water_speed_knots;
+    }
+
+    [[nodiscard]] std::vector<SeaStateInput> inputs() const {
+        std::lock_guard lock(mutex_);
+        return inputs_;
+    }
+
+private:
+    ProviderMetadata metadata_;
+    mutable std::mutex mutex_;
+    mutable std::vector<SeaStateInput> inputs_;
+};
 
 RoutingEnvironment current_environment(
     CurrentVector current,
@@ -696,6 +726,46 @@ TEST_CASE("midpoint environment sampling stays deterministic") {
     REQUIRE(
         first.environment_diagnostics->current_samples >
         first.diagnostics.expanded_nodes);
+}
+
+TEST_CASE("midpoint sea-state evaluation uses midpoint wind inputs") {
+    sailroute::test::ConstantWindGribFixture::Options forecast;
+    forecast.north_metres_per_second = -5.0;
+    forecast.final_east_metres_per_second = 5.0;
+    forecast.final_north_metres_per_second = -15.0;
+    const sailroute::test::ConstantWindGribFixture fixture{forecast};
+    const WeatherDataset weather = load_weather(fixture);
+    const auto polar = sailroute::VesselPolar::default_racer_cruiser_45ft();
+
+    RoutingEnvironment environment;
+    auto provider = sailroute::make_uniform_wave_provider(
+        WaveState{1.0, 8.0, 0.0}, make_metadata("wave"));
+    REQUIRE(provider.has_value());
+    const auto model = std::make_shared<RecordingSeaStateModel>();
+    environment.waves.provider = provider.value();
+    environment.waves.model = model;
+    environment.sampling = sailroute::EnvironmentSampling::midpoint;
+    const Router router{weather, polar, environment};
+
+    RouteRequest request = base_request();
+    request.options.wind_sampling = sailroute::WindSampling::midpoint;
+    (void)route_or_throw(router, request);
+
+    const std::vector<SeaStateInput> inputs = model->inputs();
+    REQUIRE(inputs.size() >= 2U);
+    bool found_refined_pair = false;
+    for (std::size_t index = 1U; index < inputs.size(); ++index) {
+        const SeaStateInput& start = inputs[index - 1U];
+        const SeaStateInput& midpoint = inputs[index];
+        if (start.heading_degrees == midpoint.heading_degrees &&
+            (start.true_wind_speed_knots != midpoint.true_wind_speed_knots ||
+             start.true_wind_angle_degrees !=
+                 midpoint.true_wind_angle_degrees)) {
+            found_refined_pair = true;
+            break;
+        }
+    }
+    REQUIRE(found_refined_pair);
 }
 
 TEST_CASE("serialization adds environment data only when it exists") {

@@ -59,6 +59,21 @@ Result<std::string> validate_route_numbers(const RouteResult& route) {
             }
         }
     }
+    if (route.environment.has_value() &&
+        route.environment->landmask.has_value()) {
+        const RouteEnvironmentMetadata& environment = *route.environment;
+        if (!std::isfinite(environment.land_resolution_nautical_miles)) {
+            return invalid_numeric_value("land_resolution_nautical_miles");
+        }
+        if (!std::isfinite(
+                environment.land_interpolation_error_nautical_miles)) {
+            return invalid_numeric_value(
+                "land_interpolation_error_nautical_miles");
+        }
+        if (!std::isfinite(environment.land_clearance_nautical_miles)) {
+            return invalid_numeric_value("land_clearance_nautical_miles");
+        }
+    }
     return std::string{};
 }
 

@@ -257,4 +257,31 @@ TEST_CASE("serialization rejects non-finite route values") {
     REQUIRE(
         isochrones_json.error().code ==
         sailroute::ErrorCode::output_error);
+
+    route = sample_route();
+    route.points.front().environment = sailroute::RoutePointEnvironment{};
+    route.points.front().environment->current_east_knots =
+        std::numeric_limits<double>::infinity();
+    const auto current_json = sailroute::route_to_json(route);
+    REQUIRE(!current_json.has_value());
+    REQUIRE(
+        current_json.error().message.find("current_east_knots") !=
+        std::string::npos);
+
+    route = sample_route();
+    route.environment = sailroute::RouteEnvironmentMetadata{};
+    route.environment->landmask =
+        sailroute::ProviderMetadata{"land", "unit test", "1"};
+    route.environment->land_resolution_nautical_miles =
+        std::numeric_limits<double>::infinity();
+    const auto environment_json = sailroute::route_to_json(route);
+    REQUIRE(!environment_json.has_value());
+    REQUIRE(
+        environment_json.error().message.find(
+            "land_resolution_nautical_miles") != std::string::npos);
+    const auto environment_gpx = sailroute::route_to_gpx(route);
+    REQUIRE(!environment_gpx.has_value());
+    REQUIRE(
+        environment_gpx.error().message.find(
+            "land_resolution_nautical_miles") != std::string::npos);
 }

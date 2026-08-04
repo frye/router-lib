@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -22,6 +23,8 @@ public:
     struct Options {
         double east_metres_per_second{0.0};
         double north_metres_per_second{-10.0};
+        std::optional<double> final_east_metres_per_second;
+        std::optional<double> final_north_metres_per_second;
         double south_latitude_degrees{0.0};
         double west_longitude_degrees{0.0};
         double step_degrees{1.0};
@@ -46,12 +49,14 @@ public:
         write(
             "10u",
             options_.final_forecast_hour,
-            options_.east_metres_per_second,
+            options_.final_east_metres_per_second.value_or(
+                options_.east_metres_per_second),
             "a");
         write(
             "10v",
             options_.final_forecast_hour,
-            options_.north_metres_per_second,
+            options_.final_north_metres_per_second.value_or(
+                options_.north_metres_per_second),
             "a");
     }
 

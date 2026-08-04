@@ -37,9 +37,11 @@ Result<std::string> validate_environment_numbers(const RoutePoint& point) {
     if (!std::isfinite(environment.course_over_ground_degrees)) {
         return invalid_numeric_value("course_over_ground_degrees");
     }
-    if (!std::isfinite(environment.current_east_knots) ||
-        !std::isfinite(environment.current_north_knots)) {
-        return invalid_numeric_value("current_knots");
+    if (!std::isfinite(environment.current_east_knots)) {
+        return invalid_numeric_value("current_east_knots");
+    }
+    if (!std::isfinite(environment.current_north_knots)) {
+        return invalid_numeric_value("current_north_knots");
     }
     if (!std::isfinite(environment.flat_water_speed_knots)) {
         return invalid_numeric_value("flat_water_speed_knots");
@@ -107,10 +109,15 @@ Result<std::string> validate_route_numbers(const RouteResult& route) {
     }
     if (route.environment.has_value()) {
         const RouteEnvironmentMetadata& environment = *route.environment;
-        if (!std::isfinite(environment.land_resolution_nautical_miles) ||
-            !std::isfinite(
-                environment.land_interpolation_error_nautical_miles) ||
-            !std::isfinite(environment.land_clearance_nautical_miles)) {
+        if (!std::isfinite(environment.land_resolution_nautical_miles)) {
+            return invalid_numeric_value("land_resolution_nautical_miles");
+        }
+        if (!std::isfinite(
+                environment.land_interpolation_error_nautical_miles)) {
+            return invalid_numeric_value(
+                "land_interpolation_error_nautical_miles");
+        }
+        if (!std::isfinite(environment.land_clearance_nautical_miles)) {
             return invalid_numeric_value("land_clearance_nautical_miles");
         }
     }
