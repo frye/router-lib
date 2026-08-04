@@ -619,12 +619,14 @@ what `WindSampling::midpoint` does for wind.
 
 #### Missing data
 
-Each provider carries a `MissingDataPolicy`. `fail_route` fails the whole
-optimization with `ErrorCode::environment_data_unavailable`; `reject_transition`
-drops the affected transition as if it were infeasible. There is no third
-option, and in particular missing data is never reinterpreted as zero current,
-a calm sea, or open water. A provider that reports `available` while returning a
-non-finite or out-of-range value is treated as invalid data, not as a value.
+Current, wave, and land providers carry a `MissingDataPolicy`. `fail_route`
+fails the whole optimization with `ErrorCode::environment_data_unavailable`;
+`reject_transition` drops the affected transition as if it were infeasible.
+There is no third option, and in particular missing data is never reinterpreted
+as zero current, a calm sea, or open water. Exclusion sets are immutable,
+globally defined geometry and therefore have no missing-data state. A provider
+that reports `available` while returning a non-finite or out-of-range value is
+treated as invalid data, not as a value.
 
 `fail_route` is the default because silently narrowing a search is worse than
 stopping. It does mean a bounded field fails as soon as the search fans outside

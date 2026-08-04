@@ -215,11 +215,6 @@ Result<std::string> route_to_gpx(const RouteResult& route) {
             "sailroute:landPolicy",
             to_string(environment.land_policy),
             "      ");
-        append_element(
-            output,
-            "sailroute:exclusionPolicy",
-            to_string(environment.exclusion_policy),
-            "      ");
         if (environment.landmask.has_value()) {
             append_number_element(
                 output,

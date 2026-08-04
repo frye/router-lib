@@ -96,7 +96,6 @@ std::optional<RouteEnvironmentMetadata> describe_environment(
     metadata.current_policy = environment.currents.missing_data_policy;
     metadata.wave_policy = environment.waves.missing_data_policy;
     metadata.land_policy = environment.land.missing_data_policy;
-    metadata.exclusion_policy = environment.exclusions.missing_data_policy;
     if (environment.currents.configured()) {
         metadata.current_provider = environment.currents.provider->metadata();
     }

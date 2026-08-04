@@ -505,7 +505,6 @@ struct ExclusionSettings {
     std::optional<ExclusionZoneSet> zones;
     ExclusionBoundaryPolicy boundary_policy{
         ExclusionBoundaryPolicy::boundary_excluded};
-    MissingDataPolicy missing_data_policy{MissingDataPolicy::fail_route};
 
     [[nodiscard]] bool configured() const noexcept {
         return zones.has_value();

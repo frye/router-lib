@@ -444,7 +444,6 @@ struct RouteEnvironmentMetadata {
     MissingDataPolicy current_policy{MissingDataPolicy::fail_route};
     MissingDataPolicy wave_policy{MissingDataPolicy::fail_route};
     MissingDataPolicy land_policy{MissingDataPolicy::fail_route};
-    MissingDataPolicy exclusion_policy{MissingDataPolicy::fail_route};
     EnvironmentSampling sampling{EnvironmentSampling::segment_start};
     /// Landmask node spacing, interpolation error bound, and configured
     /// clearance, all nautical miles. Zero when no landmask is configured.

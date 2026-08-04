@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <numbers>
 #include <string>
 #include <utility>
@@ -20,6 +21,8 @@ using environment_detail::UnitVector;
 // roughly two centimetres on the earth's surface, which is far below any
 // meaningful exclusion tolerance and far above double rounding noise.
 constexpr double boundary_tolerance_radians = 3.0e-9;
+constexpr double endpoint_parameter_tolerance =
+    32.0 * std::numeric_limits<double>::epsilon();
 
 // A ring whose vertices average to nearly the origin bounds two hemispheres of
 // equal claim, so its interior is undefined. Such rings are rejected instead of
@@ -577,7 +580,9 @@ ExclusionZoneSet::SegmentResult ExclusionZoneSet::intersects_segment(
                     tests);
             }
             if (exclusive_clipped_end) {
-                std::erase(parameters, 1.0);
+                std::erase_if(parameters, [](double parameter) {
+                    return parameter >= 1.0 - endpoint_parameter_tolerance;
+                });
             }
             result.geometry_tests += tests;
 

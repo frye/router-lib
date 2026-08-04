@@ -256,9 +256,6 @@ Result<std::string> route_to_json(const RouteResult& route) {
         output.append(",\"land\":");
         serialization_detail::append_json_string(
             output, to_string(environment.land_policy));
-        output.append(",\"exclusion\":");
-        serialization_detail::append_json_string(
-            output, to_string(environment.exclusion_policy));
         output.push_back('}');
         if (environment.landmask.has_value()) {
             output.append(",\"landResolutionNauticalMiles\":");
