@@ -527,7 +527,7 @@ ExclusionZoneSet::SegmentResult ExclusionZoneSet::intersects_segment(
                     last_fraction =
                         std::min(last_fraction, offset / traversal_seconds);
                 }
-                if (first_fraction > last_fraction) {
+                if (first_fraction >= last_fraction) {
                     continue;
                 }
             } else {

@@ -249,6 +249,31 @@ TEST_CASE("activation windows bound which part of a traversal is constrained") {
         Coordinate{0.0, 0.0}, at(5400), ExclusionBoundaryPolicy::boundary_excluded));
 }
 
+TEST_CASE("activation boundaries do not constrain zero-duration overlap") {
+    ExclusionZone expired = simple_zone("expired", -1.0, 1.0, -1.0, 1.0);
+    expired.active_until = at(0);
+    const ExclusionZoneSet expired_zones = build({expired});
+    REQUIRE(!violates(
+        expired_zones,
+        {0.0, 0.0},
+        {0.0, 2.0},
+        ExclusionBoundaryPolicy::boundary_excluded,
+        0,
+        900));
+
+    ExclusionZone unopened =
+        simple_zone("unopened", -1.0, 1.0, -1.0, 1.0);
+    unopened.active_from = at(900);
+    const ExclusionZoneSet unopened_zones = build({unopened});
+    REQUIRE(!violates(
+        unopened_zones,
+        {0.0, -2.0},
+        {0.0, 0.0},
+        ExclusionBoundaryPolicy::boundary_excluded,
+        0,
+        900));
+}
+
 TEST_CASE("a zone activating mid-segment only constrains the part still to sail") {
     ExclusionZone opening = simple_zone("opening", -1.0, 1.0, -3.0, -1.5);
     opening.active_from = at(1800);
