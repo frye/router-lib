@@ -8,6 +8,7 @@
 
 #include <eccodes.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -1119,7 +1120,7 @@ TEST_CASE("progress views select payloads without changing routing") {
     REQUIRE(update_count + 1U == result.value().diagnostics.time_steps);
 }
 
-TEST_CASE("progress views forward destination front options") {
+TEST_CASE("progress destination fronts use pre-prune candidates and retain the anchor") {
     const RoutingGribFixture fixture;
     const auto weather = sailroute::WeatherDataset::load(fixture.path());
     REQUIRE(weather.has_value());
@@ -1127,51 +1128,52 @@ TEST_CASE("progress views forward destination front options") {
     sailroute::RouteRequest request = routing_request(1U, false);
     request.options.progress.payload =
         sailroute::RoutingProgressPayload::retained_points |
+        sailroute::RoutingProgressPayload::provisional_route |
         sailroute::RoutingProgressPayload::destination_front;
     request.options.progress.destination_front.half_angle_degrees = 120.0;
 
     std::size_t update_count = 0U;
+    bool observed_pre_prune_point = false;
     const auto result = router.optimize_view(
         request,
-        [&request, &update_count](
+        [&update_count, &observed_pre_prune_point](
             const sailroute::RoutingProgressView& progress) {
             ++update_count;
-            const auto expected = sailroute::build_destination_front(
-                progress.retained_points,
-                request.destination,
-                request.options.spatial_bucket_nautical_miles,
-                request.options.progress.destination_front);
-            REQUIRE(expected.has_value());
-            REQUIRE(
-                progress.destination_front.points.size() ==
-                expected.value().points.size());
-            REQUIRE(
-                progress.destination_front.segments.size() ==
-                expected.value().segments.size());
-            for (std::size_t index = 0U;
-                 index < expected.value().points.size();
-                 ++index) {
-                REQUIRE(
-                    progress.destination_front.points[index].latitude_degrees ==
-                    expected.value().points[index].latitude_degrees);
-                REQUIRE(
-                    progress.destination_front.points[index].longitude_degrees ==
-                    expected.value().points[index].longitude_degrees);
+            REQUIRE(!progress.provisional_route.empty());
+            REQUIRE(!progress.destination_front.points.empty());
+            const sailroute::Coordinate anchor =
+               progress.provisional_route.back().position;
+            const auto contains = [](std::span<const sailroute::Coordinate> points,
+                                    sailroute::Coordinate expected) {
+               return std::any_of(
+                   points.begin(),
+                   points.end(),
+                   [expected](sailroute::Coordinate point) {
+                       return point.latitude_degrees ==
+                                  expected.latitude_degrees &&
+                           point.longitude_degrees ==
+                                  expected.longitude_degrees;
+                   });
+            };
+            REQUIRE(contains(progress.destination_front.points, anchor));
+            for (const sailroute::IsochroneFrontSegment& segment :
+                progress.destination_front.segments) {
+               REQUIRE(segment.point_count > 0U);
+               REQUIRE(
+                   segment.point_offset + segment.point_count <=
+                   progress.destination_front.points.size());
             }
-            for (std::size_t index = 0U;
-                 index < expected.value().segments.size();
-                 ++index) {
-                REQUIRE(
-                    progress.destination_front.segments[index].point_offset ==
-                    expected.value().segments[index].point_offset);
-                REQUIRE(
-                    progress.destination_front.segments[index].point_count ==
-                    expected.value().segments[index].point_count);
+            for (const sailroute::Coordinate point :
+                progress.destination_front.points) {
+               if (!contains(progress.retained_points, point)) {
+                   observed_pre_prune_point = true;
+               }
             }
         });
 
     REQUIRE(result.has_value());
     REQUIRE(update_count + 1U == result.value().diagnostics.time_steps);
+    REQUIRE(observed_pre_prune_point);
 }
 
 TEST_CASE("destination front aperture does not change routing search") {
@@ -1820,4 +1822,150 @@ TEST_CASE("accuracy options stay deterministic across worker counts") {
         configure(parallel);
         require_same_route(reference, must_route(router, parallel));
     }
+}
+
+TEST_CASE("time-dependent lattice routing preserves exact anchors and is deterministic") {
+        const RoutingGribFixture fixture;
+        const auto weather = sailroute::WeatherDataset::load(fixture.path());
+        REQUIRE(weather.has_value());
+        const sailroute::Router router{weather.value()};
+
+        sailroute::RouteRequest request = routing_request(1U, false);
+        request.options.solver =
+            sailroute::RoutingSolver::time_dependent_lattice;
+        request.options.lattice.subdivision_level = 4U;
+        request.options.lattice.refinement_levels = 1U;
+        const auto first = router.optimize(request);
+        REQUIRE(first.has_value());
+        REQUIRE(
+            first.value().completion ==
+            sailroute::RouteCompletion::destination_reached);
+        REQUIRE(first.value().lattice_diagnostics.has_value());
+        REQUIRE(first.value().isochrones.empty());
+        REQUIRE(
+            first.value().points.front().position.latitude_degrees ==
+            request.start.latitude_degrees);
+        REQUIRE(
+            first.value().points.front().position.longitude_degrees ==
+            request.start.longitude_degrees);
+        REQUIRE(
+            first.value().points.back().position.latitude_degrees ==
+            request.destination.latitude_degrees);
+        REQUIRE(
+            first.value().points.back().position.longitude_degrees ==
+            request.destination.longitude_degrees);
+
+        request.options.worker_count = 4U;
+        const auto parallel_option = router.optimize(request);
+        REQUIRE(parallel_option.has_value());
+        REQUIRE(
+            parallel_option.value().arrival_time ==
+            first.value().arrival_time);
+        require_same_route(parallel_option.value(), first.value());
+    }
+
+    TEST_CASE("lattice A star and Dijkstra agree on earliest arrival") {
+        const RoutingGribFixture fixture;
+        const auto weather = sailroute::WeatherDataset::load(fixture.path());
+        REQUIRE(weather.has_value());
+        const sailroute::Router router{weather.value()};
+
+        sailroute::RouteRequest a_star = routing_request(0U, false);
+        a_star.options.solver =
+            sailroute::RoutingSolver::time_dependent_lattice;
+        a_star.options.lattice.subdivision_level = 4U;
+        a_star.options.lattice.refinement_levels = 0U;
+        sailroute::RouteRequest dijkstra = a_star;
+        dijkstra.options.lattice.search_algorithm =
+            sailroute::LatticeSearchAlgorithm::dijkstra;
+
+        const auto a_star_result = router.optimize(a_star);
+        const auto dijkstra_result = router.optimize(dijkstra);
+        REQUIRE(a_star_result.has_value());
+        REQUIRE(dijkstra_result.has_value());
+        REQUIRE(a_star_result.value().arrival_time == dijkstra_result.value().arrival_time);
+        require_same_route(a_star_result.value(), dijkstra_result.value());
+    }
+
+    TEST_CASE("lattice routing rejects isochrone-specific outputs") {
+        const RoutingGribFixture fixture;
+        const auto weather = sailroute::WeatherDataset::load(fixture.path());
+        REQUIRE(weather.has_value());
+        const sailroute::Router router{weather.value()};
+
+        sailroute::RouteRequest request = routing_request(0U, true);
+        request.options.solver =
+            sailroute::RoutingSolver::time_dependent_lattice;
+        const auto result = router.optimize(request);
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
+    }
+
+    TEST_CASE("lattice progress uses the distinct search payload") {
+        const RoutingGribFixture fixture;
+        const auto weather = sailroute::WeatherDataset::load(fixture.path());
+        REQUIRE(weather.has_value());
+        const sailroute::Router router{weather.value()};
+
+        sailroute::RouteRequest request = routing_request(0U, false);
+        request.start = {1.0, 0.1};
+        request.destination = {1.0, 1.4};
+        request.options.solver =
+            sailroute::RoutingSolver::time_dependent_lattice;
+        request.options.lattice.subdivision_level = 7U;
+        request.options.lattice.refinement_levels = 0U;
+        request.options.lattice.progress_every_n_expansions = 1U;
+        request.options.progress.payload =
+            sailroute::RoutingProgressPayload::provisional_route |
+            sailroute::RoutingProgressPayload::search_points;
+
+        std::size_t callbacks = 0U;
+        const auto result = router.optimize_view(
+            request,
+            [&callbacks](const sailroute::RoutingProgressView& progress) {
+                ++callbacks;
+                REQUIRE(
+                    progress.solver ==
+                    sailroute::RoutingSolver::time_dependent_lattice);
+                REQUIRE(progress.retained_points.empty());
+                REQUIRE(progress.display_contours.points.empty());
+                REQUIRE(progress.destination_front.points.empty());
+                REQUIRE(!progress.search_points.empty());
+                REQUIRE(progress.search.settled_labels > 0U);
+            });
+        REQUIRE(result.has_value());
+        REQUIRE(callbacks > 0U);
+}
+
+TEST_CASE("lattice cancellation during refinement is propagated") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+
+    sailroute::RouteRequest request = routing_request(0U, false);
+    request.start = {1.0, 0.1};
+    request.destination = {1.0, 1.4};
+    request.options.solver =
+        sailroute::RoutingSolver::time_dependent_lattice;
+    request.options.lattice.subdivision_level = 6U;
+    request.options.lattice.refinement_levels = 1U;
+    request.options.lattice.progress_every_n_expansions = 1U;
+    request.options.progress.payload =
+        sailroute::RoutingProgressPayload::search_points;
+
+    bool cancelled_refinement = false;
+    const auto result = router.optimize_view(
+        request,
+        [&cancelled_refinement](
+            const sailroute::RoutingProgressView& progress) {
+            if (progress.search.refinement_index == 1U) {
+                cancelled_refinement = true;
+                return sailroute::RoutingProgressDecision::cancel;
+            }
+            return sailroute::RoutingProgressDecision::continue_routing;
+        });
+    REQUIRE(cancelled_refinement);
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == sailroute::ErrorCode::cancelled);
 }

@@ -809,6 +809,14 @@ double VesselPolar::maximum_tabulated_wind_speed_knots() const noexcept {
     return impl_->wind_speeds.back();
 }
 
+double VesselPolar::maximum_boat_speed_knots() const noexcept {
+    if (!impl_ || impl_->boat_speeds.empty()) {
+        return 0.0;
+    }
+    return *std::max_element(
+        impl_->boat_speeds.begin(), impl_->boat_speeds.end());
+}
+
 VelocityMadeGoodAngles PolarSlice::velocity_made_good_angles() const noexcept {
     VelocityMadeGoodAngles angles;
     if (upwind_vmg_ == nullptr) {

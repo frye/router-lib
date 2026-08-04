@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(sailroute VERSION 0.3.2 LANGUAGES CXX)
+project(sailroute VERSION 0.4.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -31,7 +31,10 @@ add_library(sailroute STATIC
     src/routing/front.cpp
     src/routing/geodesy.cpp
     src/routing/intervals.cpp
+    src/routing/lattice.cpp
+    src/routing/lattice_solver.cpp
     src/routing/router.cpp
+    src/routing/transition.cpp
     src/serialization/json.cpp
     src/serialization/gpx.cpp
     src/serialization/isochrones.cpp
@@ -72,6 +75,7 @@ if(SAILROUTE_BUILD_TESTS)
         tests/test_main.cpp
         tests/test_contours.cpp
         tests/test_front.cpp
+        tests/test_lattice.cpp
         tests/test_polar.cpp
         tests/test_routing.cpp
         tests/test_serialization.cpp
@@ -79,6 +83,7 @@ if(SAILROUTE_BUILD_TESTS)
         tests/test_weather.cpp
     )
     target_link_libraries(sailroute_tests PRIVATE sailroute::sailroute ECCODES::eccodes)
+    target_include_directories(sailroute_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(
         sailroute_tests
         PRIVATE SAILROUTE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")

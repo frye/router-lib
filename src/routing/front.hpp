@@ -19,4 +19,14 @@ namespace sailroute::detail {
     std::vector<Coordinate>& front_points,
     std::vector<IsochroneFrontSegment>& segments);
 
+// Uses an explicit candidate-cloud anchor to select the principal component.
+[[nodiscard]] std::optional<Error> build_destination_front_into(
+    std::span<const Coordinate> candidate_points,
+    Coordinate destination,
+    Coordinate anchor,
+    double band_width_nautical_miles,
+    const DestinationFrontOptions& options,
+    std::vector<Coordinate>& front_points,
+    std::vector<IsochroneFrontSegment>& segments);
+
 }  // namespace sailroute::detail

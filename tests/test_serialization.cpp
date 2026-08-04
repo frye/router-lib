@@ -71,6 +71,34 @@ TEST_CASE("JSON serialization escapes metadata and includes route points") {
     REQUIRE(serialized.value().find("forecast \\\"A\\\" & B") != std::string::npos);
     REQUIRE(serialized.value().find("\"points\":[") != std::string::npos);
     REQUIRE(serialized.value().find("\"expandedNodes\":10") != std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"latticeDiagnostics\"") ==
+        std::string::npos);
+}
+
+TEST_CASE("JSON conditionally includes lattice diagnostics") {
+    auto route = sample_route();
+    route.lattice_diagnostics = sailroute::LatticeRouteDiagnostics{
+        .settled_labels = 11U,
+        .queued_labels = 20U,
+        .relaxed_labels = 19U,
+        .wait_transitions = 3U,
+        .refinement_runs = 2U,
+        .accepted_refinements = 1U,
+        .subdivision_level = 5U,
+        .refinement_fallback = true,
+    };
+    const auto serialized = sailroute::route_to_json(route);
+    REQUIRE(serialized.has_value());
+    REQUIRE(
+        serialized.value().find("\"latticeDiagnostics\"") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"settledLabels\":11") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"refinementFallback\":true") !=
+        std::string::npos);
 }
 
 TEST_CASE("GPX serialization escapes XML and emits timestamped track points") {

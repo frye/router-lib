@@ -1,6 +1,7 @@
 #include "sailroute/front.hpp"
 
 #include "../src/routing/geodesy.hpp"
+#include "../src/routing/front.hpp"
 #include "test_support.hpp"
 
 #include <algorithm>
@@ -503,6 +504,136 @@ TEST_CASE("destination front rejects invalid half angles") {
         REQUIRE(!result.has_value());
         REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
     }
+}
+
+TEST_CASE("destination front explicit anchors select the principal component") {
+        const std::vector<sailroute::Coordinate> points{
+            {0.0, -4.0},
+            {0.0, -3.0},
+            {0.0, -2.0},
+            {0.0, 2.0},
+            {0.0, 3.0},
+            {0.0, 4.0},
+        };
+        std::vector<sailroute::Coordinate> front_points;
+        std::vector<sailroute::IsochroneFrontSegment> segments;
+        const auto error = sailroute::detail::build_destination_front_into(
+            points,
+            sailroute::Coordinate{10.0, 0.0},
+            sailroute::Coordinate{0.0, -3.0},
+            50.0,
+            sailroute::DestinationFrontOptions{180.0},
+            front_points,
+            segments);
+        REQUIRE(!error.has_value());
+        REQUIRE(segments.size() == 1U);
+        REQUIRE(std::any_of(
+            front_points.begin(),
+            front_points.end(),
+            [](sailroute::Coordinate point) {
+                return point.latitude_degrees == 0.0 &&
+                    point.longitude_degrees == -3.0;
+            }));
+        REQUIRE(std::all_of(
+            front_points.begin(),
+            front_points.end(),
+            [](sailroute::Coordinate point) {
+                return point.longitude_degrees < 0.0;
+            }));
+    }
+
+    TEST_CASE("destination front aperture never removes the explicit anchor") {
+        const std::vector<sailroute::Coordinate> points{
+            {-1.0, 0.0},
+            {1.0, 0.0},
+            {0.0, 1.0},
+        };
+        const sailroute::Coordinate anchor{-1.0, 0.0};
+        std::vector<sailroute::Coordinate> front_points;
+        std::vector<sailroute::IsochroneFrontSegment> segments;
+        const auto error = sailroute::detail::build_destination_front_into(
+            points,
+            sailroute::Coordinate{10.0, 0.0},
+            anchor,
+            60.0,
+            sailroute::DestinationFrontOptions{10.0},
+            front_points,
+            segments);
+        REQUIRE(!error.has_value());
+        REQUIRE(std::any_of(
+            front_points.begin(),
+            front_points.end(),
+            [anchor](sailroute::Coordinate point) {
+                return point.latitude_degrees == anchor.latitude_degrees &&
+                    point.longitude_degrees == anchor.longitude_degrees;
+            }));
+    }
+
+    TEST_CASE("destination front keeps only meaningful secondary components") {
+        const std::vector<sailroute::Coordinate> points{
+            {0.0, -4.0},
+            {0.0, -3.0},
+            {0.0, -2.0},
+            {0.0, 2.0},
+            {0.0, 3.0},
+            {0.0, 4.0},
+        };
+        std::vector<sailroute::Coordinate> front_points;
+        std::vector<sailroute::IsochroneFrontSegment> segments;
+        sailroute::DestinationFrontOptions options{
+            180.0,
+            sailroute::DestinationFrontSegmentPolicy::all_meaningful_components,
+            3U};
+        const auto error = sailroute::detail::build_destination_front_into(
+            points,
+            sailroute::Coordinate{10.0, 0.0},
+            sailroute::Coordinate{0.0, -3.0},
+            50.0,
+            options,
+            front_points,
+            segments);
+        REQUIRE(!error.has_value());
+        REQUIRE(segments.size() == 2U);
+        REQUIRE(front_points.size() == 6U);
+
+        options.minimum_secondary_segment_points = 4U;
+        const auto filtered = sailroute::detail::build_destination_front_into(
+            points,
+            sailroute::Coordinate{10.0, 0.0},
+            sailroute::Coordinate{0.0, -3.0},
+            50.0,
+            options,
+            front_points,
+            segments);
+        REQUIRE(!filtered.has_value());
+        REQUIRE(segments.size() == 1U);
+        REQUIRE(front_points.size() == 3U);
+    }
+
+    TEST_CASE("destination front validates explicit anchors and secondary size") {
+        const std::vector<sailroute::Coordinate> points{{0.0, 0.0}};
+        std::vector<sailroute::Coordinate> front_points;
+        std::vector<sailroute::IsochroneFrontSegment> segments;
+        auto error = sailroute::detail::build_destination_front_into(
+            points,
+            sailroute::Coordinate{10.0, 0.0},
+            sailroute::Coordinate{0.0, 1.0},
+            50.0,
+            sailroute::DestinationFrontOptions{},
+            front_points,
+            segments);
+        REQUIRE(error.has_value());
+        REQUIRE(error->code == sailroute::ErrorCode::invalid_argument);
+
+        sailroute::DestinationFrontOptions options;
+        options.minimum_secondary_segment_points = 0U;
+        const auto result = sailroute::build_destination_front(
+            points,
+            sailroute::Coordinate{10.0, 0.0},
+            50.0,
+            options);
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
 }
 
 // ── RoutingProgressPayload integration ────────────────────────────────────────

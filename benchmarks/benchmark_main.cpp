@@ -150,8 +150,14 @@ void report_route_quality(
               << "  candidates " << std::setw(9)
               << route.value().diagnostics.generated_candidates
               << "  " << std::setprecision(1) << std::setw(8) << milliseconds
-              << " ms\n"
-              << std::defaultfloat;
+              << " ms";
+    if (route.value().lattice_diagnostics.has_value()) {
+        std::cout << "  settled "
+                 << route.value().lattice_diagnostics->settled_labels
+                 << "  level "
+                 << route.value().lattice_diagnostics->subdivision_level;
+    }
+    std::cout << '\n' << std::defaultfloat;
 }
 
 }  // namespace
@@ -309,6 +315,21 @@ int main(int argc, char** argv) {
 
     std::cout << "\nroute quality by accuracy option\n";
     report_route_quality(router, request, "baseline");
+    {
+        sailroute::RouteRequest variant = request;
+        variant.options.solver =
+            sailroute::RoutingSolver::time_dependent_lattice;
+        variant.options.lattice.subdivision_level = 3U;
+        variant.options.lattice.refinement_levels = 0U;
+        report_route_quality(router, variant, "lattice coarse A*");
+        variant.options.lattice.search_algorithm =
+            sailroute::LatticeSearchAlgorithm::dijkstra;
+        report_route_quality(router, variant, "lattice coarse Dijkstra");
+        variant.options.lattice.search_algorithm =
+            sailroute::LatticeSearchAlgorithm::a_star;
+        variant.options.lattice.refinement_levels = 1U;
+        report_route_quality(router, variant, "lattice refined A*");
+    }
 
     {
         sailroute::RouteRequest variant = request;

@@ -53,6 +53,12 @@ void print_help(std::ostream& output) {
         "  --isochrones-gpx PATH               Write retained frontiers as GPX 1.1\n"
         "\n"
         "Routing controls:\n"
+        "  --solver MODE                       isochrone|lattice (default: isochrone)\n"
+        "  --lattice-level N                  Icosphere subdivision level (0-8)\n"
+        "  --lattice-time-bucket-minutes N    Time-state bucket width (> 0)\n"
+        "  --lattice-refinement-levels N      Coarse-to-fine levels (default: 1)\n"
+        "  --lattice-corridor-nm N            Refinement corridor width (> 0)\n"
+        "  --lattice-progress-expansions N    Search callback cadence (> 0)\n"
         "  --routing-intervals SPEC            Interval schedule (default: 30m@4h,1h@24h,3h)\n"
         "  --time-step-minutes N               Constant interval in minutes (>= 5)\n"
         "  --heading-step-degrees N            Heading increment (0 < N <= 180)\n"
@@ -265,6 +271,12 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
     bool above_polar_range_seen = false;
     bool pruning_strategy_seen = false;
     bool pruning_sector_seen = false;
+    bool solver_seen = false;
+    bool lattice_level_seen = false;
+    bool lattice_bucket_seen = false;
+    bool lattice_refinement_seen = false;
+    bool lattice_corridor_seen = false;
+    bool lattice_progress_seen = false;
 
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument{argv[index]};
@@ -405,6 +417,86 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
             }
             options.isochrones_gpx_path =
                 std::filesystem::path{value.value()};
+        } else if (argument == "--solver") {
+            if (const auto duplicate = reject_duplicate(solver_seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            if (value.value() == "isochrone") {
+                options.routing.solver = sailroute::RoutingSolver::isochrone_beam;
+            } else if (value.value() == "lattice") {
+                options.routing.solver =
+                    sailroute::RoutingSolver::time_dependent_lattice;
+            } else {
+                return usage_error("--solver must be isochrone or lattice");
+            }
+        } else if (
+            argument == "--lattice-level" ||
+            argument == "--lattice-refinement-levels" ||
+            argument == "--lattice-time-bucket-minutes" ||
+            argument == "--lattice-progress-expansions") {
+            bool* seen = &lattice_level_seen;
+            if (argument == "--lattice-refinement-levels") {
+                seen = &lattice_refinement_seen;
+            } else if (argument == "--lattice-time-bucket-minutes") {
+                seen = &lattice_bucket_seen;
+            } else if (argument == "--lattice-progress-expansions") {
+                seen = &lattice_progress_seen;
+            }
+            if (const auto duplicate = reject_duplicate(*seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            unsigned long long parsed = 0U;
+            if (!parse_unsigned(value.value(), parsed) ||
+                parsed > static_cast<unsigned long long>(
+                             std::numeric_limits<std::size_t>::max())) {
+                return usage_error(std::string{argument} + " must be a practical integer");
+            }
+            if (argument == "--lattice-level") {
+                if (parsed > 8U) {
+                    return usage_error("--lattice-level must be in [0,8]");
+                }
+                options.routing.lattice.subdivision_level =
+                    static_cast<std::size_t>(parsed);
+            } else if (argument == "--lattice-refinement-levels") {
+                options.routing.lattice.refinement_levels =
+                    static_cast<std::size_t>(parsed);
+            } else if (parsed == 0U) {
+                return usage_error(std::string{argument} + " must be positive");
+            } else if (argument == "--lattice-time-bucket-minutes") {
+                using Rep = std::chrono::minutes::rep;
+                if (parsed > static_cast<unsigned long long>(
+                                 std::numeric_limits<Rep>::max())) {
+                    return usage_error(
+                        "--lattice-time-bucket-minutes is too large");
+                }
+                options.routing.lattice.time_bucket =
+                    std::chrono::minutes{static_cast<Rep>(parsed)};
+            } else {
+                options.routing.lattice.progress_every_n_expansions =
+                    static_cast<std::size_t>(parsed);
+            }
+        } else if (argument == "--lattice-corridor-nm") {
+            if (const auto duplicate =
+                    reject_duplicate(lattice_corridor_seen, argument)) {
+                return *duplicate;
+            }
+            auto value = value_after(argument);
+            if (!value) {
+                return value.error();
+            }
+            double parsed = 0.0;
+            if (!parse_double(value.value(), parsed) || parsed <= 0.0) {
+                return usage_error("--lattice-corridor-nm must be positive");
+            }
+            options.routing.lattice.corridor_width_nautical_miles = parsed;
         } else if (argument == "--routing-intervals") {
             if (const auto duplicate =
                     reject_duplicate(routing_intervals_seen, argument)) {

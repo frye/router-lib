@@ -84,15 +84,15 @@ struct FrontPoint {
     double along_track{};
     double cross_track{};
     double bearing_delta{};
+    double distance_to_destination{};
     bool at_centroid{};
     std::int64_t band{};
 };
 
-}  // namespace
-
-std::optional<Error> build_destination_front_into(
-    std::span<const Coordinate> retained_points,
+std::optional<Error> build_destination_front_impl(
+    std::span<const Coordinate> candidate_points,
     Coordinate destination,
+    std::optional<Coordinate> explicit_anchor,
     double band_width_nautical_miles,
     const DestinationFrontOptions& options,
     std::vector<Coordinate>& front_points,
@@ -118,33 +118,60 @@ std::optional<Error> build_destination_front_into(
             "destination front half_angle_degrees must be finite and in (0, 180]"};
     }
 
-    for (const Coordinate& p : retained_points) {
+    if (options.minimum_secondary_segment_points == 0U) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "destination front minimum_secondary_segment_points must be positive"};
+    }
+    if (explicit_anchor.has_value() && !is_valid(*explicit_anchor)) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "destination front anchor contains an invalid coordinate"};
+    }
+
+    for (const Coordinate& p : candidate_points) {
         if (!is_valid(p)) {
             return Error{
                 ErrorCode::invalid_argument,
-                "retained_points contains an invalid coordinate"};
+                "candidate_points contains an invalid coordinate"};
+        }
+    }
+    if (explicit_anchor.has_value()) {
+        const bool present = std::any_of(
+            candidate_points.begin(),
+            candidate_points.end(),
+            [&](Coordinate point) {
+                return point.latitude_degrees ==
+                           explicit_anchor->latitude_degrees &&
+                    point.longitude_degrees ==
+                           explicit_anchor->longitude_degrees;
+            });
+        if (!present) {
+            return Error{
+                ErrorCode::invalid_argument,
+                "destination front anchor must be present in candidate_points"};
         }
     }
 
-    if (retained_points.empty()) {
+    if (candidate_points.empty()) {
         return std::nullopt;
     }
 
     // Single-point degenerate case.
-    if (retained_points.size() == 1U) {
-        front_points.push_back(retained_points.front());
+    if (candidate_points.size() == 1U) {
+        front_points.push_back(candidate_points.front());
         segments.push_back(IsochroneFrontSegment{0U, 1U});
         return std::nullopt;
     }
 
     // ── Frame ──────────────────────────────────────────────────────────────
-    const Coordinate centroid = frontier_centroid(retained_points);
+    const Coordinate centroid = frontier_centroid(candidate_points);
     const double forward_bearing = initial_bearing_degrees(centroid, destination);
 
     // ── Project all points into the local frame ────────────────────────────
     std::vector<FrontPoint> projected;
-    projected.reserve(retained_points.size());
-    for (const Coordinate& p : retained_points) {
+    projected.reserve(candidate_points.size());
+    for (const Coordinate& p : candidate_points) {
         const double dist = great_circle_distance_nautical_miles(centroid, p);
         double bearing = 0.0;
         if (dist > 0.0) {
@@ -157,6 +184,7 @@ std::optional<Error> build_destination_front_into(
             at,
             ct,
             angular_difference_degrees(bearing, forward_bearing),
+            great_circle_distance_nautical_miles(p, destination),
             dist == 0.0,
             band_index(ct, band_width_nautical_miles)});
     }
@@ -184,8 +212,16 @@ std::optional<Error> build_destination_front_into(
                 std::remove_if(
                     projected.begin(),
                     projected.end(),
-                    [&options, boundary_tolerance](const FrontPoint& fp) {
+                    [&options, &explicit_anchor, boundary_tolerance](
+                        const FrontPoint& fp) {
+                        const bool is_anchor =
+                            explicit_anchor.has_value() &&
+                            fp.position.latitude_degrees ==
+                                explicit_anchor->latitude_degrees &&
+                            fp.position.longitude_degrees ==
+                                explicit_anchor->longitude_degrees;
                         return !fp.at_centroid &&
+                               !is_anchor &&
                                fp.bearing_delta >
                                    options.half_angle_degrees +
                                        boundary_tolerance;
@@ -199,21 +235,45 @@ std::optional<Error> build_destination_front_into(
         return std::nullopt;
     }
 
-    // ── Identify provisional best (closest to destination) ────────────────
-    const auto provisional_it = std::min_element(
-        projected.begin(),
-        projected.end(),
-        [&destination](const FrontPoint& left, const FrontPoint& right) {
-            return great_circle_distance_nautical_miles(
-                       left.position, destination) <
-                   great_circle_distance_nautical_miles(
-                       right.position, destination);
-        });
-    const std::int64_t provisional_band = provisional_it->band;
+    // ── Identify the principal component anchor ────────────────────────────
+    const auto same_coordinate = [](Coordinate left, Coordinate right) {
+        return left.latitude_degrees == right.latitude_degrees &&
+               left.longitude_degrees == right.longitude_degrees;
+    };
+    auto anchor_it = projected.end();
+    if (explicit_anchor.has_value()) {
+        anchor_it = std::find_if(
+            projected.begin(),
+            projected.end(),
+            [&](const FrontPoint& point) {
+                return same_coordinate(point.position, *explicit_anchor);
+            });
+        if (anchor_it == projected.end()) {
+            return Error{
+                ErrorCode::invalid_argument,
+                "destination front anchor must be present in candidate_points"};
+        }
+    } else {
+        anchor_it = std::min_element(
+            projected.begin(),
+            projected.end(),
+            [](const FrontPoint& left, const FrontPoint& right) {
+                if (left.distance_to_destination !=
+                    right.distance_to_destination) {
+                    return left.distance_to_destination <
+                           right.distance_to_destination;
+                }
+                return std::tie(
+                           left.position.latitude_degrees,
+                           left.position.longitude_degrees) <
+                       std::tie(
+                           right.position.latitude_degrees,
+                           right.position.longitude_degrees);
+            });
+    }
+    const std::int64_t anchor_band = anchor_it->band;
 
-    // ── Per-band selection: best along-track progress, deterministic tie-break
-    // Sort by band, then by descending along_track, then by (lat, lon) for
-    // determinism.
+    // ── Per-band selection ─────────────────────────────────────────────────
     std::sort(
         projected.begin(),
         projected.end(),
@@ -221,8 +281,13 @@ std::optional<Error> build_destination_front_into(
             if (left.band != right.band) {
                 return left.band < right.band;
             }
+            if (left.distance_to_destination !=
+                right.distance_to_destination) {
+                return left.distance_to_destination <
+                       right.distance_to_destination;
+            }
             if (left.along_track != right.along_track) {
-                return left.along_track > right.along_track;  // descending
+                return left.along_track > right.along_track;
             }
             // Lexicographic tie-break for determinism.
             return std::tie(
@@ -241,73 +306,109 @@ std::optional<Error> build_destination_front_into(
             band_winners.push_back(fp);
         }
     }
+    if (explicit_anchor.has_value()) {
+        const auto anchored = std::find_if(
+            projected.begin(),
+            projected.end(),
+            [&](const FrontPoint& point) {
+                return same_coordinate(point.position, *explicit_anchor);
+            });
+        const auto winner = std::find_if(
+            band_winners.begin(),
+            band_winners.end(),
+            [anchor_band](const FrontPoint& point) {
+                return point.band == anchor_band;
+            });
+        *winner = *anchored;
+    }
 
-    // ── Contiguous run containing provisional best ─────────────────────────
-    // band_winners is already sorted by band ascending.
-    const auto prov_band_it = std::find_if(
+    const auto anchor_band_it = std::find_if(
         band_winners.begin(),
         band_winners.end(),
-        [provisional_band](const FrontPoint& fp) {
-            return fp.band == provisional_band;
+        [anchor_band](const FrontPoint& fp) {
+            return fp.band == anchor_band;
         });
 
+    const std::size_t anchor_position =
+        static_cast<std::size_t>(anchor_band_it - band_winners.begin());
     std::size_t run_begin = 0U;
-    std::size_t run_end = band_winners.size();
-
-    if (prov_band_it != band_winners.end()) {
-        const std::size_t prov_pos =
-            static_cast<std::size_t>(prov_band_it - band_winners.begin());
-
-        // Extend left.
-        run_begin = prov_pos;
-        while (run_begin > 0U &&
-               band_winners[run_begin - 1U].band ==
-                   band_winners[run_begin].band - 1) {
-            --run_begin;
-        }
-        // Extend right.
-        run_end = prov_pos + 1U;
+    while (run_begin < band_winners.size()) {
+        std::size_t run_end = run_begin + 1U;
         while (run_end < band_winners.size() &&
                band_winners[run_end].band ==
                    band_winners[run_end - 1U].band + 1) {
             ++run_end;
         }
-    }
-
-    // band_winners[run_begin..run_end) is the contiguous run, already in
-    // port-to-starboard (ascending band / cross_track) order.
-
-    // ── Emit points and segments with antimeridian segmentation ───────────
-    // A new segment begins whenever an adjacent pair of points would require
-    // crossing the antimeridian (|longitude delta| > 180).
-    const std::size_t run_size = run_end - run_begin;
-    front_points.reserve(run_size);
-
-    std::size_t seg_start_offset = 0U;
-    for (std::size_t i = run_begin; i < run_end; ++i) {
-        const Coordinate& pos = band_winners[i].position;
-        if (!front_points.empty()) {
-            const double lon_delta = std::abs(
-                pos.longitude_degrees -
-                front_points.back().longitude_degrees);
-            if (lon_delta > 180.0) {
-                // Antimeridian crossing: close current segment and start new one.
+        const bool contains_anchor =
+            anchor_position >= run_begin && anchor_position < run_end;
+        const bool retain =
+            contains_anchor ||
+            (options.segment_policy ==
+                 DestinationFrontSegmentPolicy::all_meaningful_components &&
+             run_end - run_begin >=
+                 options.minimum_secondary_segment_points);
+        if (retain) {
+            std::size_t segment_start = front_points.size();
+            for (std::size_t index = run_begin; index < run_end; ++index) {
+                const Coordinate position = band_winners[index].position;
+                if (front_points.size() > segment_start &&
+                   std::abs(
+                       position.longitude_degrees -
+                       front_points.back().longitude_degrees) > 180.0) {
+                   segments.push_back(IsochroneFrontSegment{
+                       segment_start,
+                       front_points.size() - segment_start});
+                   segment_start = front_points.size();
+                }
+                front_points.push_back(position);
+            }
+            if (front_points.size() > segment_start) {
                 segments.push_back(IsochroneFrontSegment{
-                    seg_start_offset,
-                    front_points.size() - seg_start_offset});
-                seg_start_offset = front_points.size();
+                   segment_start,
+                   front_points.size() - segment_start});
             }
         }
-        front_points.push_back(pos);
-    }
-
-    if (!front_points.empty()) {
-        segments.push_back(IsochroneFrontSegment{
-            seg_start_offset,
-            front_points.size() - seg_start_offset});
+        run_begin = run_end;
     }
 
     return std::nullopt;
+}
+
+}  // namespace
+
+std::optional<Error> build_destination_front_into(
+    std::span<const Coordinate> retained_points,
+    Coordinate destination,
+    double band_width_nautical_miles,
+    const DestinationFrontOptions& options,
+    std::vector<Coordinate>& front_points,
+    std::vector<IsochroneFrontSegment>& segments) {
+    return build_destination_front_impl(
+        retained_points,
+        destination,
+        std::nullopt,
+        band_width_nautical_miles,
+        options,
+        front_points,
+        segments);
+}
+
+std::optional<Error> build_destination_front_into(
+    std::span<const Coordinate> candidate_points,
+    Coordinate destination,
+    Coordinate anchor,
+    double band_width_nautical_miles,
+    const DestinationFrontOptions& options,
+    std::vector<Coordinate>& front_points,
+    std::vector<IsochroneFrontSegment>& segments) {
+    return build_destination_front_impl(
+        candidate_points,
+        destination,
+        anchor,
+        band_width_nautical_miles,
+        options,
+        front_points,
+        segments);
 }
 
 }  // namespace detail
