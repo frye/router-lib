@@ -782,6 +782,9 @@ void expand_candidate_range(
                     : detail::GroundVelocity{heading, boat_speed};
             }
 
+            if (!(ground.speed_knots > 0.0)) {
+                continue;
+            }
             const double segment_distance = ground.speed_knots * usable_hours;
             const Coordinate position = detail::destination_point_from(
                 geometry.origin,

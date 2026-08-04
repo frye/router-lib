@@ -358,6 +358,44 @@ TEST_CASE("ground motion is the vector sum of water velocity and current") {
     REQUIRE(crabbed);
 }
 
+TEST_CASE("the isochrone solver rejects current-cancelled ground motion") {
+    const sailroute::test::ConstantWindGribFixture fixture;
+    const WeatherDataset weather = load_weather(fixture);
+    const auto polar = sailroute::VesselPolar::default_racer_cruiser_45ft();
+    RouteRequest request = base_request();
+
+    const auto wind = weather.interpolate(request.start, *request.departure_time);
+    REQUIRE(wind.has_value());
+    constexpr double heading_degrees = 90.0;
+    const double angle = sailroute::detail::angular_difference_degrees(
+        heading_degrees, wind.value().direction_from_degrees());
+    const double boat_speed =
+        polar.boat_speed_knots(wind.value().speed_knots(), angle);
+    const double heading_radians =
+        heading_degrees * std::numbers::pi / 180.0;
+    const CurrentVector cancelling_current{
+        -boat_speed * std::sin(heading_radians),
+        -boat_speed * std::cos(heading_radians)};
+    const Router router{
+        weather, polar, current_environment(cancelling_current)};
+
+    std::size_t cancelled_segments = 0U;
+    request.options.segment_eligibility =
+        [&cancelled_segments](const sailroute::RouteSegmentView& segment) {
+            if (segment.candidate.environment.has_value() &&
+                !(segment.candidate.environment->speed_over_ground_knots >
+                  0.0)) {
+                ++cancelled_segments;
+            }
+            return true;
+        };
+
+    const auto result = router.optimize(request);
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == ErrorCode::no_route);
+    REQUIRE(cancelled_segments == 0U);
+}
+
 TEST_CASE("a following current arrives sooner and an opposing one later") {
     const sailroute::test::ConstantWindGribFixture fixture;
     const WeatherDataset weather = load_weather(fixture);
