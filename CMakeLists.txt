@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(sailroute VERSION 0.3.1 LANGUAGES CXX)
+project(sailroute VERSION 0.3.2 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -140,6 +140,10 @@ if(SAILROUTE_BUILD_TESTS)
         --start 0,0
         --destination 0,1
         --routing-intervals 5m@10m,)
+    add_cli_failure_test(
+        sailroute_cli_removed_upwind_twa
+        "unknown option: --upwind-twa-degrees"
+        --upwind-twa-degrees 90)
     set_tests_properties(
         sailroute_cli_help
         PROPERTIES PASS_REGULAR_EXPRESSION "--routing-intervals SPEC")

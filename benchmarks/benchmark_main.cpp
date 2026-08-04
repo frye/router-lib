@@ -2,11 +2,15 @@
 #include "sailroute/time.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -80,6 +84,76 @@ void benchmark_routing(
               << ", checksum: " << checksum << '\n';
 }
 
+// The forecast footprint is not published in the metadata, so bisect on
+// interpolate to find it. This lets the benchmark route the longest leg any
+// supplied GRIB actually supports instead of hard-coding a domain.
+double coverage_edge(
+    const sailroute::WeatherDataset& weather,
+    sailroute::TimePoint when,
+    sailroute::Coordinate inside,
+    sailroute::Coordinate outside) {
+    const bool vary_latitude =
+        inside.latitude_degrees != outside.latitude_degrees;
+    if (!vary_latitude &&
+        weather.interpolate(outside, when).has_value()) {
+        // The opposite meridian is still covered, so there is no edge to
+        // bracket in this direction. Use a quarter-turn from the seed on each
+        // side; together they form the longest unique great-circle longitude
+        // separation instead of a 360-degree span that normalizes to a short leg.
+        return (inside.longitude_degrees + outside.longitude_degrees) * 0.5;
+    }
+    for (int iteration = 0; iteration < 40; ++iteration) {
+        sailroute::Coordinate midpoint{
+            (inside.latitude_degrees + outside.latitude_degrees) * 0.5,
+            (inside.longitude_degrees + outside.longitude_degrees) * 0.5};
+        if (weather.interpolate(midpoint, when).has_value()) {
+            inside = midpoint;
+        } else {
+            outside = midpoint;
+        }
+    }
+    return vary_latitude ? inside.latitude_degrees : inside.longitude_degrees;
+}
+
+double normalize_longitude(double longitude_degrees) noexcept {
+    double normalized = std::fmod(longitude_degrees + 180.0, 360.0);
+    if (normalized < 0.0) {
+        normalized += 360.0;
+    }
+    return normalized - 180.0;
+}
+
+// Routes once and reports arrival and search effort, so accuracy options can be
+// judged on route quality rather than asserted.
+void report_route_quality(
+    const sailroute::Router& router,
+    sailroute::RouteRequest request,
+    std::string_view label) {
+    const auto start = std::chrono::steady_clock::now();
+    auto route = router.optimize(request);
+    const double milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    std::cout << "  " << std::left << std::setw(30) << label << std::right;
+    if (!route.has_value()) {
+        std::cout << "  no route (" << route.error().message << ")\n";
+        return;
+    }
+    const double hours = std::chrono::duration<double, std::ratio<3600>>(
+                             route.value().arrival_time -
+                             route.value().departure_time)
+                             .count();
+    std::cout << "  " << std::fixed << std::setprecision(4) << std::setw(9)
+              << hours << " h"
+              << "  legs " << std::setw(4) << route.value().points.size()
+              << "  candidates " << std::setw(9)
+              << route.value().diagnostics.generated_candidates
+              << "  " << std::setprecision(1) << std::setw(8) << milliseconds
+              << " ms\n"
+              << std::defaultfloat;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -115,18 +189,86 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    const sailroute::ForecastMetadata& metadata = weather.value().metadata();
+    const sailroute::TimePoint probe_time = metadata.first_valid_time;
+
+    // Find any covered point, then grow a leg across the whole footprint.
+    // Sweeps coarse to fine so a global forecast is seeded almost immediately
+    // while a small regional domain is still found.
+    sailroute::Coordinate seed{0.0, 0.0};
+    bool seeded = false;
+    for (const double resolution : {1.0, 0.25, 0.05}) {
+        const int latitude_steps = static_cast<int>(180.0 / resolution);
+        const int longitude_steps = static_cast<int>(360.0 / resolution);
+        for (int latitude = 0; latitude <= latitude_steps && !seeded; ++latitude) {
+            for (int longitude = 0; longitude < longitude_steps && !seeded;
+                 ++longitude) {
+                const sailroute::Coordinate probe{
+                    -90.0 + static_cast<double>(latitude) * resolution,
+                    -180.0 + static_cast<double>(longitude) * resolution};
+                if (weather.value().interpolate(probe, probe_time).has_value()) {
+                    seed = probe;
+                    seeded = true;
+                }
+            }
+        }
+        if (seeded) {
+            break;
+        }
+    }
+    if (!seeded) {
+        std::cerr << "forecast covers no probed coordinate\n";
+        return 1;
+    }
+
+    const double south = coverage_edge(
+        weather.value(), probe_time, seed, {-90.0, seed.longitude_degrees});
+    const double north = coverage_edge(
+        weather.value(), probe_time, seed, {90.0, seed.longitude_degrees});
+    const double west = coverage_edge(
+        weather.value(),
+        probe_time,
+        seed,
+        {seed.latitude_degrees, seed.longitude_degrees - 180.0});
+    const double east = coverage_edge(
+        weather.value(),
+        probe_time,
+        seed,
+        {seed.latitude_degrees, seed.longitude_degrees + 180.0});
+
+    // Inset slightly so rounding never places an endpoint outside the forecast.
+    const double latitude_inset = (north - south) * 0.02;
+    const double longitude_inset = (east - west) * 0.02;
+
     sailroute::RouteRequest request;
-    request.start = {20.0, 5.0};
-    request.destination = {20.0, 5.8};
-    request.departure_time = departure.value();
+    request.start = {
+        south + latitude_inset,
+        normalize_longitude(west + longitude_inset)};
+    request.destination = {
+        north - latitude_inset,
+        normalize_longitude(east - longitude_inset)};
+    request.departure_time = departure.has_value() &&
+            departure.value() >= metadata.first_valid_time &&
+            departure.value() <= metadata.last_valid_time
+        ? departure.value()
+        : metadata.first_valid_time;
     request.options.time_step = std::chrono::minutes{30};
     request.options.use_routing_intervals = false;
     request.options.heading_step_degrees = 5.0;
     request.options.arrival_radius_nautical_miles = 0.5;
     request.options.spatial_bucket_nautical_miles = 3.0;
     request.options.max_nodes_per_bucket = 4U;
-    request.options.maximum_route_duration = std::chrono::hours{12};
+    request.options.maximum_route_duration = std::chrono::hours{240};
     const sailroute::Router router{weather.value(), polar};
+
+    std::cout << "forecast " << metadata.source << "\n  leg "
+              << std::fixed << std::setprecision(4)
+              << request.start.latitude_degrees << ','
+              << request.start.longitude_degrees << " -> "
+              << request.destination.latitude_degrees << ','
+              << request.destination.longitude_degrees
+              << " departing " << sailroute::format_utc_time(request.departure_time.value())
+              << "\n" << std::defaultfloat;
 
     benchmark_routing(
         router,
@@ -164,5 +306,61 @@ int main(int argc, char** argv) {
         1U,
         ProgressMode::view_with_contours,
         "routing progress view with contours");
+
+    std::cout << "\nroute quality by accuracy option\n";
+    report_route_quality(router, request, "baseline");
+
+    {
+        sailroute::RouteRequest variant = request;
+        variant.options.heading_augmentation =
+            sailroute::HeadingAugmentation::destination_bearing;
+        report_route_quality(router, variant, "destination bearing heading");
+    }
+    {
+        sailroute::RouteRequest variant = request;
+        variant.options.heading_augmentation =
+            sailroute::HeadingAugmentation::velocity_made_good;
+        report_route_quality(router, variant, "velocity made good headings");
+    }
+    {
+        sailroute::RouteRequest variant = request;
+        variant.options.heading_augmentation = sailroute::HeadingAugmentation::
+            destination_bearing_and_velocity_made_good;
+        report_route_quality(router, variant, "both augmentations");
+    }
+    {
+        sailroute::RouteRequest variant = request;
+        variant.options.polar_angle_interpolation =
+            sailroute::PolarAngleInterpolation::monotone_cubic;
+        report_route_quality(router, variant, "monotone cubic polar");
+    }
+    {
+        sailroute::RouteRequest variant = request;
+        variant.options.wind_sampling = sailroute::WindSampling::midpoint;
+        report_route_quality(router, variant, "midpoint wind sampling");
+    }
+    {
+        sailroute::RouteRequest variant = request;
+        variant.options.maneuver.tack_penalty = std::chrono::seconds{60};
+        variant.options.maneuver.gybe_penalty = std::chrono::seconds{30};
+        report_route_quality(router, variant, "maneuver penalties");
+    }
+    {
+        sailroute::RouteRequest variant = request;
+        variant.options.pruning_strategy =
+            sailroute::PruningStrategy::bearing_sectors;
+        report_route_quality(router, variant, "bearing sector pruning");
+    }
+    {
+        sailroute::RouteRequest variant = request;
+        variant.options.heading_augmentation = sailroute::HeadingAugmentation::
+            destination_bearing_and_velocity_made_good;
+        variant.options.polar_angle_interpolation =
+            sailroute::PolarAngleInterpolation::monotone_cubic;
+        variant.options.wind_sampling = sailroute::WindSampling::midpoint;
+        variant.options.maneuver.tack_penalty = std::chrono::seconds{60};
+        variant.options.maneuver.gybe_penalty = std::chrono::seconds{30};
+        report_route_quality(router, variant, "all accuracy options");
+    }
     return 0;
 }

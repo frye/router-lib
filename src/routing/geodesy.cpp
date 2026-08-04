@@ -115,22 +115,39 @@ Coordinate destination_point(
     Coordinate start,
     double bearing_degrees,
     double distance_nautical_miles) noexcept {
-    const double start_latitude = degrees_to_radians(start.latitude_degrees);
-    const double start_longitude = degrees_to_radians(start.longitude_degrees);
+    return destination_point_from(
+        prepare_origin(start),
+        bearing_degrees,
+        distance_nautical_miles);
+}
+
+PreparedOrigin prepare_origin(Coordinate start) noexcept {
+    const double latitude_radians = degrees_to_radians(start.latitude_degrees);
+    return PreparedOrigin{
+        latitude_radians,
+        degrees_to_radians(start.longitude_degrees),
+        std::sin(latitude_radians),
+        std::cos(latitude_radians)};
+}
+
+Coordinate destination_point_from(
+    const PreparedOrigin& origin,
+    double bearing_degrees,
+    double distance_nautical_miles) noexcept {
     const double bearing = degrees_to_radians(normalize_degrees(bearing_degrees));
     const double angular_distance = distance_nautical_miles / earth_radius_nautical_miles;
 
     const double destination_latitude = std::asin(std::clamp(
-        std::sin(start_latitude) * std::cos(angular_distance) +
-            std::cos(start_latitude) * std::sin(angular_distance) * std::cos(bearing),
+        origin.sin_latitude * std::cos(angular_distance) +
+            origin.cos_latitude * std::sin(angular_distance) * std::cos(bearing),
         -1.0,
         1.0));
     const double destination_longitude =
-        start_longitude +
+        origin.longitude_radians +
         std::atan2(
-            std::sin(bearing) * std::sin(angular_distance) * std::cos(start_latitude),
+            std::sin(bearing) * std::sin(angular_distance) * origin.cos_latitude,
             std::cos(angular_distance) -
-                std::sin(start_latitude) * std::sin(destination_latitude));
+                origin.sin_latitude * std::sin(destination_latitude));
 
     double longitude = radians_to_degrees(destination_longitude);
     longitude = std::fmod(longitude + 540.0, 360.0) - 180.0;
