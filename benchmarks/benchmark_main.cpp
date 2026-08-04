@@ -2,6 +2,7 @@
 #include "sailroute/time.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <filesystem>
 #include <iomanip>
@@ -104,6 +105,14 @@ double coverage_edge(
         }
     }
     return vary_latitude ? inside.latitude_degrees : inside.longitude_degrees;
+}
+
+double normalize_longitude(double longitude_degrees) noexcept {
+    double normalized = std::fmod(longitude_degrees + 180.0, 360.0);
+    if (normalized < 0.0) {
+        normalized += 360.0;
+    }
+    return normalized - 180.0;
 }
 
 // Routes once and reports arrival and search effort, so accuracy options can be
@@ -224,8 +233,12 @@ int main(int argc, char** argv) {
     const double longitude_inset = (east - west) * 0.02;
 
     sailroute::RouteRequest request;
-    request.start = {south + latitude_inset, west + longitude_inset};
-    request.destination = {north - latitude_inset, east - longitude_inset};
+    request.start = {
+        south + latitude_inset,
+        normalize_longitude(west + longitude_inset)};
+    request.destination = {
+        north - latitude_inset,
+        normalize_longitude(east - longitude_inset)};
     request.departure_time = departure.has_value() &&
             departure.value() >= metadata.first_valid_time &&
             departure.value() <= metadata.last_valid_time
