@@ -19,18 +19,21 @@ namespace sailroute {
 //     If no non-centroid point lies within the aperture, all points are
 //     retained and the per-band selection picks the best available ones.
 //   - Points are assigned to cross-track bands of width
-//     band_width_nautical_miles.  The point with the greatest along-track
-//     progress (i.e. closest to the destination along the forward axis) is
-//     selected per band; ties are broken lexicographically by (latitude,
-//     longitude) for determinism.
-//   - The selected set is trimmed to the contiguous band run (no gaps in band
-//     index) that contains the provisional best point (the input point with the
-//     smallest great-circle distance to the destination).
-//   - The trimmed set is ordered port-to-starboard (ascending cross-track
-//     offset, equivalently ascending band index).
+//     band_width_nautical_miles. The legacy provisional-component policy
+//     selects greatest along-track progress per band. The opt-in
+//     all-meaningful-components policy selects smallest remaining great-circle
+//     distance, followed by greatest along-track progress. Both use
+//     lexicographic (latitude, longitude) tie-breaks.
+//   - Missing bands split the winners into open components. The component
+//     containing the provisional best point is always retained. With
+//     all_meaningful_components, secondary components meeting
+//     minimum_secondary_segment_points are retained as well.
+//   - Retained components and their points are ordered port-to-starboard
+//     (ascending cross-track band).
 //   - Antimeridian crossings between adjacent ordered points produce a new
 //     segment boundary; no coordinates are interpolated or synthesised.
 //
+// Defaults preserve the original single provisional-component behavior.
 // A single retained point produces a one-point, one-segment front.
 // An empty input produces an empty front without error.
 //

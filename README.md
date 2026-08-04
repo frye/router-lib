@@ -556,15 +556,18 @@ notification and cancellation forms with callback-scoped spans:
 ```cpp
 request.options.progress.every_n_steps = 2;
 request.options.progress.payload =
-    sailroute::RoutingProgressPayload::retained_points |
-    sailroute::RoutingProgressPayload::display_contours;
+    sailroute::RoutingProgressPayload::destination_front;
+request.options.progress.destination_front.half_angle_degrees = 120.0;
+request.options.progress.destination_front.segment_policy =
+    sailroute::DestinationFrontSegmentPolicy::all_meaningful_components;
+request.options.progress.destination_front.minimum_secondary_segment_points = 3;
 
 auto result = router.optimize_view(
     request,
     [](const sailroute::RoutingProgressView& progress) {
         render_frontier(
-            progress.display_contours.points,
-            progress.display_contours.segments);
+            progress.destination_front.points,
+            progress.destination_front.segments);
         return sailroute::RoutingProgressDecision::continue_routing;
     });
 ```
@@ -575,8 +578,21 @@ copy required data before retaining it or sending it to another thread.
 Callbacks remain ordered, run on the thread that called `optimize_view`, and
 default to every retained step. `every_n_steps` throttles callback delivery
 only: `capture_isochrones` still records every frontier. Payload flags select
-raw retained points, the provisional route, and display contours; unrequested
-payloads have empty spans and are not constructed.
+raw retained points, the provisional route, display contours, and the
+destination-facing front; unrequested payloads have empty spans and are not
+constructed.
+
+Destination-front defaults are backward compatible: the builder uses the
+post-pruning retained frontier and emits only the contiguous cross-track
+component containing the provisional route endpoint. A UI can opt into
+`DestinationFrontSegmentPolicy::all_meaningful_components` to construct the
+front from every eligible non-arrival candidate before search pruning. In that
+mode, the anchor component is always emitted and disconnected secondary
+components are emitted only when they contain at least
+`minimum_secondary_segment_points` band winners. Every coordinate is an actual
+candidate; missing bands and antimeridian crossings create separate open
+segments rather than interpolated points. This display-only payload does not
+change pruning or route selection.
 
 `build_display_contours` is also available independently. It projects points
 around a circular-mean meridian, constructs a deterministic Delaunay

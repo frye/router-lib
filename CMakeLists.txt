@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(sailroute VERSION 0.3.2 LANGUAGES CXX)
+project(sailroute VERSION 0.4.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)

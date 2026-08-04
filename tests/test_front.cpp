@@ -1,5 +1,6 @@
 #include "sailroute/front.hpp"
 
+#include "../src/routing/front.hpp"
 #include "../src/routing/geodesy.hpp"
 #include "test_support.hpp"
 
@@ -51,6 +52,69 @@ bool contains_coordinate(
             return point.latitude_degrees == expected.latitude_degrees &&
                    point.longitude_degrees == expected.longitude_degrees;
         });
+}
+
+bool same_coordinate(
+    sailroute::Coordinate left,
+    sailroute::Coordinate right) {
+    return left.latitude_degrees == right.latitude_degrees &&
+        left.longitude_degrees == right.longitude_degrees;
+}
+
+std::vector<sailroute::Coordinate> cross_track_fixture(
+    sailroute::Coordinate center,
+    double forward_bearing_degrees,
+    std::span<const double> signed_offsets_nautical_miles) {
+    std::vector<sailroute::Coordinate> points;
+    points.reserve(signed_offsets_nautical_miles.size());
+    for (const double offset : signed_offsets_nautical_miles) {
+        if (offset == 0.0) {
+            points.push_back(center);
+            continue;
+        }
+        const double bearing = offset < 0.0
+            ? forward_bearing_degrees - 90.0
+            : forward_bearing_degrees + 90.0;
+        points.push_back(sailroute::detail::destination_point(
+            center,
+            bearing,
+            std::abs(offset)));
+    }
+    return points;
+}
+
+sailroute::IsochroneFront build_anchored_front(
+    std::span<const sailroute::Coordinate> points,
+    sailroute::Coordinate destination,
+    sailroute::Coordinate anchor,
+    double band_width_nautical_miles,
+    const sailroute::DestinationFrontOptions& options) {
+    sailroute::IsochroneFront front;
+    const auto error = sailroute::detail::build_destination_front_into(
+        points,
+        destination,
+        anchor,
+        band_width_nautical_miles,
+        options,
+        front.points,
+        front.segments);
+    if (error.has_value()) {
+        throw std::runtime_error(error->message);
+    }
+    return front;
+}
+
+void require_points_from_input(
+    const sailroute::IsochroneFront& front,
+    std::span<const sailroute::Coordinate> input) {
+    for (const sailroute::Coordinate output : front.points) {
+        REQUIRE(std::any_of(
+            input.begin(),
+            input.end(),
+            [output](sailroute::Coordinate candidate) {
+                return same_coordinate(output, candidate);
+            }));
+    }
 }
 
 std::vector<sailroute::Coordinate> angular_frontier(
@@ -240,6 +304,11 @@ TEST_CASE("destination front default options preserve the three-argument result"
     REQUIRE(legacy.has_value());
     REQUIRE(configured.has_value());
     require_same_front(legacy.value(), configured.value());
+    const sailroute::DestinationFrontOptions defaults;
+    REQUIRE(
+        defaults.segment_policy ==
+        sailroute::DestinationFrontSegmentPolicy::provisional_component);
+    REQUIRE(defaults.minimum_secondary_segment_points == 3U);
 }
 
 TEST_CASE("destination front configurable aperture includes exact 120 boundaries") {
@@ -414,6 +483,193 @@ TEST_CASE("destination front handles two points in the same band") {
     REQUIRE(result.value().segments.size() == 1U);
 }
 
+TEST_CASE("anchored destination front preserves both sides of the route endpoint") {
+    const sailroute::Coordinate anchor{0.0, 0.0};
+    const sailroute::Coordinate destination{10.0, 0.0};
+    const std::array<double, 5> offsets{-80.0, -30.0, 0.0, 30.0, 80.0};
+    const std::vector<sailroute::Coordinate> points =
+        cross_track_fixture(anchor, 0.0, offsets);
+    const sailroute::DestinationFrontOptions options{
+        90.0,
+        sailroute::DestinationFrontSegmentPolicy::all_meaningful_components,
+        3U};
+
+    const sailroute::IsochroneFront front =
+        build_anchored_front(points, destination, anchor, 50.0, options);
+
+    REQUIRE(front.segments.size() == 1U);
+    REQUIRE(front.points.size() == 4U);
+    const auto principal = segment_points(front, front.segments.front());
+    const auto anchor_it = std::find_if(
+        principal.begin(),
+        principal.end(),
+        [anchor](sailroute::Coordinate point) {
+            return same_coordinate(point, anchor);
+        });
+    REQUIRE(anchor_it != principal.end());
+    REQUIRE(anchor_it != principal.begin());
+    REQUIRE(anchor_it + 1 != principal.end());
+    for (std::size_t index = 1U; index < principal.size(); ++index) {
+        REQUIRE(
+            principal[index - 1U].longitude_degrees <=
+            principal[index].longitude_degrees);
+    }
+    require_points_from_input(front, points);
+}
+
+TEST_CASE("destination front retains meaningful runs without bridging gaps") {
+    const sailroute::Coordinate anchor{0.0, 0.0};
+    const sailroute::Coordinate destination{10.0, 0.0};
+    const std::array<double, 11> offsets{
+        -330.0, -280.0, -230.0,
+        -80.0, -30.0, 0.0, 30.0, 80.0,
+        230.0, 280.0, 330.0};
+    const std::vector<sailroute::Coordinate> points =
+        cross_track_fixture(anchor, 0.0, offsets);
+
+    const sailroute::IsochroneFront legacy = build_anchored_front(
+        points,
+        destination,
+        anchor,
+        50.0,
+        sailroute::DestinationFrontOptions{});
+    const sailroute::IsochroneFront all_components = build_anchored_front(
+        points,
+        destination,
+        anchor,
+        50.0,
+        sailroute::DestinationFrontOptions{
+            90.0,
+            sailroute::DestinationFrontSegmentPolicy::all_meaningful_components,
+            3U});
+
+    REQUIRE(legacy.segments.size() == 1U);
+    REQUIRE(legacy.points.size() == 4U);
+    REQUIRE(all_components.segments.size() == 3U);
+    REQUIRE(all_components.points.size() == 10U);
+    for (const sailroute::IsochroneFrontSegment segment :
+         all_components.segments) {
+        REQUIRE(segment.point_count >= 3U);
+    }
+    require_points_from_input(all_components, points);
+
+    const sailroute::IsochroneFront stricter = build_anchored_front(
+        points,
+        destination,
+        anchor,
+        50.0,
+        sailroute::DestinationFrontOptions{
+            90.0,
+            sailroute::DestinationFrontSegmentPolicy::all_meaningful_components,
+            4U});
+    REQUIRE(stricter.segments.size() == 1U);
+    REQUIRE(stricter.points.size() == 4U);
+
+    std::vector<sailroute::Coordinate> reversed = points;
+    std::reverse(reversed.begin(), reversed.end());
+    const sailroute::IsochroneFront reversed_front = build_anchored_front(
+        reversed,
+        destination,
+        anchor,
+        50.0,
+        sailroute::DestinationFrontOptions{
+            90.0,
+            sailroute::DestinationFrontSegmentPolicy::all_meaningful_components,
+            3U});
+    require_same_front(all_components, reversed_front);
+}
+
+TEST_CASE("destination front omits one and two point secondary hooks") {
+    const sailroute::Coordinate anchor{0.0, 0.0};
+    const sailroute::Coordinate destination{10.0, 0.0};
+    const sailroute::DestinationFrontOptions options{
+        90.0,
+        sailroute::DestinationFrontSegmentPolicy::all_meaningful_components,
+        3U};
+
+    const std::array<double, 7> one_point_offsets{
+        -230.0, -80.0, -30.0, 0.0, 30.0, 80.0, 230.0};
+    const std::vector<sailroute::Coordinate> one_point_cloud =
+        cross_track_fixture(anchor, 0.0, one_point_offsets);
+    const sailroute::IsochroneFront one_point = build_anchored_front(
+        one_point_cloud, destination, anchor, 50.0, options);
+    REQUIRE(one_point.segments.size() == 1U);
+    REQUIRE(one_point.points.size() == 4U);
+
+    const std::array<double, 9> two_point_offsets{
+        -280.0, -230.0,
+        -80.0, -30.0, 0.0, 30.0, 80.0,
+        230.0, 280.0};
+    const std::vector<sailroute::Coordinate> two_point_cloud =
+        cross_track_fixture(anchor, 0.0, two_point_offsets);
+    const sailroute::IsochroneFront two_point = build_anchored_front(
+        two_point_cloud, destination, anchor, 50.0, options);
+    REQUIRE(two_point.segments.size() == 1U);
+    REQUIRE(two_point.points.size() == 4U);
+}
+
+TEST_CASE("Race Rocks candidate fixture preserves a two-sided principal front") {
+    const sailroute::Coordinate anchor{48.2975, -123.5310};
+    const sailroute::Coordinate destination{48.3500, -122.9000};
+    const double forward_bearing =
+        sailroute::detail::initial_bearing_degrees(anchor, destination);
+    const std::array<double, 11> offsets{
+        -16.5, -14.0, -11.5,
+        -4.0, -1.5, 0.0, 1.5, 4.0,
+        11.5, 14.0, 16.5};
+    const std::vector<sailroute::Coordinate> candidate_cloud =
+        cross_track_fixture(anchor, forward_bearing, offsets);
+
+    const sailroute::IsochroneFront front = build_anchored_front(
+        candidate_cloud,
+        destination,
+        anchor,
+        2.5,
+        sailroute::DestinationFrontOptions{
+            120.0,
+            sailroute::DestinationFrontSegmentPolicy::all_meaningful_components,
+            3U});
+
+    REQUIRE(front.segments.size() == 3U);
+    require_points_from_input(front, candidate_cloud);
+    bool found_anchor = false;
+    for (const sailroute::IsochroneFrontSegment segment : front.segments) {
+        REQUIRE(segment.point_count >= 3U);
+        const auto points = segment_points(front, segment);
+        const auto anchor_it = std::find_if(
+            points.begin(),
+            points.end(),
+            [anchor](sailroute::Coordinate point) {
+                return same_coordinate(point, anchor);
+            });
+        if (anchor_it == points.end()) {
+            continue;
+        }
+        found_anchor = true;
+        REQUIRE(anchor_it != points.begin());
+        REQUIRE(anchor_it + 1 != points.end());
+    }
+    REQUIRE(found_anchor);
+
+    const std::array<std::size_t, 11> shuffled_indices{
+        7U, 1U, 9U, 3U, 0U, 10U, 5U, 2U, 8U, 4U, 6U};
+    std::vector<sailroute::Coordinate> shuffled;
+    shuffled.reserve(candidate_cloud.size());
+    for (const std::size_t index : shuffled_indices) {
+        shuffled.push_back(candidate_cloud[index]);
+    }
+    const sailroute::IsochroneFront shuffled_front = build_anchored_front(
+        shuffled,
+        destination,
+        anchor,
+        2.5,
+        sailroute::DestinationFrontOptions{
+            120.0,
+            sailroute::DestinationFrontSegmentPolicy::all_meaningful_components,
+            3U});
+    require_same_front(front, shuffled_front);
+}
+
 // ── Antimeridian segmentation ────────────────────────────────────────────────
 //
 // Five frontier points spanning the antimeridian:
@@ -453,6 +709,38 @@ TEST_CASE("destination front segments antimeridian crossings") {
                 std::abs(
                     pts[i].longitude_degrees - pts[i - 1U].longitude_degrees) <=
                 180.0);
+        }
+    }
+}
+
+TEST_CASE("destination front splits antimeridian crossings inside retained runs") {
+    const sailroute::Coordinate anchor{0.0, 180.0};
+    const sailroute::Coordinate destination{10.0, 180.0};
+    const std::array<double, 11> offsets{
+        -330.0, -280.0, -230.0,
+        -80.0, -30.0, 0.0, 30.0, 80.0,
+        230.0, 280.0, 330.0};
+    const std::vector<sailroute::Coordinate> points =
+        cross_track_fixture(anchor, 0.0, offsets);
+    const sailroute::IsochroneFront front = build_anchored_front(
+        points,
+        destination,
+        anchor,
+        50.0,
+        sailroute::DestinationFrontOptions{
+            90.0,
+            sailroute::DestinationFrontSegmentPolicy::all_meaningful_components,
+            3U});
+
+    REQUIRE(front.segments.size() == 4U);
+    require_points_from_input(front, points);
+    for (const sailroute::IsochroneFrontSegment segment : front.segments) {
+        const auto segment_view = segment_points(front, segment);
+        for (std::size_t index = 1U; index < segment_view.size(); ++index) {
+            REQUIRE(
+                std::abs(
+                    segment_view[index].longitude_degrees -
+                    segment_view[index - 1U].longitude_degrees) <= 180.0);
         }
     }
 }
@@ -503,6 +791,37 @@ TEST_CASE("destination front rejects invalid half angles") {
         REQUIRE(!result.has_value());
         REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
     }
+}
+
+TEST_CASE("destination front rejects unsupported segment policies and anchors") {
+    const std::vector<sailroute::Coordinate> points{
+        {0.0, -1.0},
+        {0.0, 0.0},
+        {0.0, 1.0}};
+    sailroute::DestinationFrontOptions invalid_policy;
+    invalid_policy.segment_policy =
+        static_cast<sailroute::DestinationFrontSegmentPolicy>(99);
+    const auto policy_result = sailroute::build_destination_front(
+        points,
+        sailroute::Coordinate{5.0, 0.0},
+        60.0,
+        invalid_policy);
+    REQUIRE(!policy_result.has_value());
+    REQUIRE(
+        policy_result.error().code ==
+        sailroute::ErrorCode::invalid_argument);
+
+    sailroute::IsochroneFront front;
+    const auto anchor_error = sailroute::detail::build_destination_front_into(
+        points,
+        sailroute::Coordinate{5.0, 0.0},
+        sailroute::Coordinate{1.0, 1.0},
+        60.0,
+        sailroute::DestinationFrontOptions{},
+        front.points,
+        front.segments);
+    REQUIRE(anchor_error.has_value());
+    REQUIRE(anchor_error->code == sailroute::ErrorCode::invalid_argument);
 }
 
 // ── RoutingProgressPayload integration ────────────────────────────────────────

@@ -317,6 +317,40 @@ void require_same_progress(
     }
 }
 
+void require_same_front(
+    const sailroute::IsochroneFront& left,
+    const sailroute::IsochroneFront& right) {
+    REQUIRE(left.points.size() == right.points.size());
+    REQUIRE(left.segments.size() == right.segments.size());
+    for (std::size_t index = 0U; index < left.points.size(); ++index) {
+        REQUIRE(
+            left.points[index].latitude_degrees ==
+            right.points[index].latitude_degrees);
+        REQUIRE(
+            left.points[index].longitude_degrees ==
+            right.points[index].longitude_degrees);
+    }
+    for (std::size_t index = 0U; index < left.segments.size(); ++index) {
+        REQUIRE(
+            left.segments[index].point_offset ==
+            right.segments[index].point_offset);
+        REQUIRE(
+            left.segments[index].point_count ==
+            right.segments[index].point_count);
+    }
+}
+
+sailroute::IsochroneFront copy_front(
+    const sailroute::IsochroneFrontView& view) {
+    return sailroute::IsochroneFront{
+        std::vector<sailroute::Coordinate>{
+            view.points.begin(),
+            view.points.end()},
+        std::vector<sailroute::IsochroneFrontSegment>{
+            view.segments.begin(),
+            view.segments.end()}};
+}
+
 struct SegmentObservation {
     sailroute::RoutePoint parent;
     sailroute::RoutePoint candidate;
@@ -443,6 +477,12 @@ TEST_CASE("routing defaults retain a wider configurable frontier") {
         sailroute::RoutingProgressPayload::display_contours));
     REQUIRE(
         options.progress.destination_front.half_angle_degrees == 90.0);
+    REQUIRE(
+        options.progress.destination_front.segment_policy ==
+        sailroute::DestinationFrontSegmentPolicy::provisional_component);
+    REQUIRE(
+        options.progress.destination_front.minimum_secondary_segment_points ==
+        3U);
     REQUIRE(!options.segment_eligibility);
 }
 
@@ -636,35 +676,48 @@ TEST_CASE("rejected segments never enter retained or emitted routing state") {
             }
             return true;
         };
-    std::vector<sailroute::RoutingProgress> progress_updates;
-    const auto result = router.optimize(
+    request.options.progress.payload =
+        sailroute::RoutingProgressPayload::retained_points |
+        sailroute::RoutingProgressPayload::provisional_route |
+        sailroute::RoutingProgressPayload::destination_front;
+    request.options.progress.destination_front.segment_policy =
+        sailroute::DestinationFrontSegmentPolicy::all_meaningful_components;
+    std::size_t progress_updates = 0U;
+    const auto result = router.optimize_view(
         request,
-        [&progress_updates](const sailroute::RoutingProgress& progress) {
-            progress_updates.push_back(progress);
+        [&progress_updates, &rejected](
+            const sailroute::RoutingProgressView& progress) {
+            ++progress_updates;
+            for (const sailroute::Coordinate point : progress.retained_points) {
+                REQUIRE(!matches_rejected_point(
+                    point,
+                    progress.time,
+                    rejected));
+            }
+            for (const sailroute::Coordinate point :
+                 progress.destination_front.points) {
+                REQUIRE(!matches_rejected_point(
+                    point,
+                    progress.time,
+                    rejected));
+            }
+            for (const sailroute::RoutePoint& point :
+                 progress.provisional_route) {
+                REQUIRE(!matches_rejected_point(
+                    point.position,
+                    point.time,
+                    rejected));
+            }
         });
     REQUIRE(result.has_value());
     REQUIRE(!rejected.empty());
-    REQUIRE(!progress_updates.empty());
+    REQUIRE(progress_updates > 0U);
 
     for (const sailroute::Isochrone& isochrone : result.value().isochrones) {
         for (const sailroute::Coordinate point : isochrone.points) {
             REQUIRE(!matches_rejected_point(
                 point,
                 isochrone.time,
-                rejected));
-        }
-    }
-    for (const sailroute::RoutingProgress& progress : progress_updates) {
-        for (const sailroute::Coordinate point : progress.isochrone.points) {
-            REQUIRE(!matches_rejected_point(
-                point,
-                progress.isochrone.time,
-                rejected));
-        }
-        for (const sailroute::RoutePoint& point : progress.provisional_route) {
-            REQUIRE(!matches_rejected_point(
-                point.position,
-                point.time,
                 rejected));
         }
     }
@@ -1119,7 +1172,74 @@ TEST_CASE("progress views select payloads without changing routing") {
     REQUIRE(update_count + 1U == result.value().diagnostics.time_steps);
 }
 
-TEST_CASE("progress views forward destination front options") {
+TEST_CASE("progress views build destination fronts from eligible pre-prune candidates") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+    sailroute::RouteRequest request = routing_request(1U, false);
+    request.start = {0.8, 0.8};
+    request.destination = {1.2, 1.2};
+    request.options.heading_step_degrees = 5.0;
+    request.options.max_nodes_per_bucket = 1U;
+    request.options.progress.payload =
+        sailroute::RoutingProgressPayload::retained_points |
+        sailroute::RoutingProgressPayload::provisional_route |
+        sailroute::RoutingProgressPayload::destination_front;
+    request.options.progress.destination_front.half_angle_degrees = 120.0;
+    request.options.progress.destination_front.segment_policy =
+        sailroute::DestinationFrontSegmentPolicy::all_meaningful_components;
+
+    std::vector<sailroute::RoutePoint> eligible_candidates;
+    request.options.segment_eligibility =
+        [&eligible_candidates](const sailroute::RouteSegmentView& segment) {
+            eligible_candidates.push_back(segment.candidate);
+            return true;
+        };
+    std::size_t update_count = 0U;
+    bool observed_pre_prune_point = false;
+    const auto result = router.optimize_view(
+        request,
+        [&eligible_candidates, &observed_pre_prune_point, &update_count](
+            const sailroute::RoutingProgressView& progress) {
+            ++update_count;
+            REQUIRE(!progress.provisional_route.empty());
+            const sailroute::Coordinate anchor =
+                progress.provisional_route.back().position;
+            bool anchor_present = false;
+            for (const sailroute::Coordinate point :
+                 progress.destination_front.points) {
+                REQUIRE(matches_rejected_point(
+                    point,
+                    progress.time,
+                    eligible_candidates));
+                anchor_present =
+                    anchor_present ||
+                    (point.latitude_degrees == anchor.latitude_degrees &&
+                     point.longitude_degrees == anchor.longitude_degrees);
+                const bool retained = std::any_of(
+                    progress.retained_points.begin(),
+                    progress.retained_points.end(),
+                    [point](sailroute::Coordinate retained_point) {
+                        return point.latitude_degrees ==
+                                   retained_point.latitude_degrees &&
+                            point.longitude_degrees ==
+                                   retained_point.longitude_degrees;
+                    });
+                observed_pre_prune_point =
+                    observed_pre_prune_point || !retained;
+            }
+            REQUIRE(anchor_present);
+        });
+
+    if (!result.has_value()) {
+        throw std::runtime_error(result.error().message);
+    }
+    REQUIRE(update_count + 1U == result.value().diagnostics.time_steps);
+    REQUIRE(observed_pre_prune_point);
+}
+
+TEST_CASE("default progress fronts preserve retained-front behavior") {
     const RoutingGribFixture fixture;
     const auto weather = sailroute::WeatherDataset::load(fixture.path());
     REQUIRE(weather.has_value());
@@ -1128,67 +1248,96 @@ TEST_CASE("progress views forward destination front options") {
     request.options.progress.payload =
         sailroute::RoutingProgressPayload::retained_points |
         sailroute::RoutingProgressPayload::destination_front;
-    request.options.progress.destination_front.half_angle_degrees = 120.0;
 
-    std::size_t update_count = 0U;
+    std::size_t updates = 0U;
     const auto result = router.optimize_view(
         request,
-        [&request, &update_count](
-            const sailroute::RoutingProgressView& progress) {
-            ++update_count;
+        [&request, &updates](const sailroute::RoutingProgressView& progress) {
+            ++updates;
             const auto expected = sailroute::build_destination_front(
                 progress.retained_points,
                 request.destination,
                 request.options.spatial_bucket_nautical_miles,
                 request.options.progress.destination_front);
             REQUIRE(expected.has_value());
-            REQUIRE(
-                progress.destination_front.points.size() ==
-                expected.value().points.size());
-            REQUIRE(
-                progress.destination_front.segments.size() ==
-                expected.value().segments.size());
-            for (std::size_t index = 0U;
-                 index < expected.value().points.size();
-                 ++index) {
-                REQUIRE(
-                    progress.destination_front.points[index].latitude_degrees ==
-                    expected.value().points[index].latitude_degrees);
-                REQUIRE(
-                    progress.destination_front.points[index].longitude_degrees ==
-                    expected.value().points[index].longitude_degrees);
-            }
-            for (std::size_t index = 0U;
-                 index < expected.value().segments.size();
-                 ++index) {
-                REQUIRE(
-                    progress.destination_front.segments[index].point_offset ==
-                    expected.value().segments[index].point_offset);
-                REQUIRE(
-                    progress.destination_front.segments[index].point_count ==
-                    expected.value().segments[index].point_count);
-            }
+            require_same_front(
+                copy_front(progress.destination_front),
+                expected.value());
         });
 
     REQUIRE(result.has_value());
-    REQUIRE(update_count + 1U == result.value().diagnostics.time_steps);
+    REQUIRE(updates + 1U == result.value().diagnostics.time_steps);
 }
 
-TEST_CASE("destination front aperture does not change routing search") {
+TEST_CASE("destination front construction does not change routing search") {
     const RoutingGribFixture fixture;
     const auto weather = sailroute::WeatherDataset::load(fixture.path());
     REQUIRE(weather.has_value());
     const sailroute::Router router{weather.value()};
     sailroute::RouteRequest default_request = routing_request(1U, true);
-    sailroute::RouteRequest wide_request = default_request;
-    wide_request.options.progress.destination_front.half_angle_degrees = 120.0;
+    sailroute::RouteRequest front_request = default_request;
+    front_request.options.progress.payload =
+        sailroute::RoutingProgressPayload::destination_front;
+    front_request.options.progress.destination_front.half_angle_degrees = 120.0;
+    front_request.options.progress.destination_front.segment_policy =
+        sailroute::DestinationFrontSegmentPolicy::all_meaningful_components;
 
     const auto default_result = router.optimize(default_request);
-    const auto wide_result = router.optimize(wide_request);
+    std::size_t updates = 0U;
+    const auto front_result = router.optimize_view(
+        front_request,
+        [&updates](const sailroute::RoutingProgressView& progress) {
+            ++updates;
+            REQUIRE(!progress.destination_front.points.empty());
+        });
 
     REQUIRE(default_result.has_value());
-    REQUIRE(wide_result.has_value());
-    require_same_route(default_result.value(), wide_result.value());
+    REQUIRE(front_result.has_value());
+    REQUIRE(updates > 0U);
+    require_same_route(default_result.value(), front_result.value());
+}
+
+TEST_CASE("destination fronts are deterministic across worker counts") {
+    const RoutingGribFixture fixture;
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(weather.has_value());
+    const sailroute::Router router{weather.value()};
+
+    const auto route_and_fronts =
+        [&router](std::size_t worker_count) {
+            sailroute::RouteRequest request =
+                routing_request(worker_count, false);
+            request.options.progress.payload =
+                sailroute::RoutingProgressPayload::destination_front;
+            request.options.progress.destination_front.segment_policy =
+                sailroute::DestinationFrontSegmentPolicy::
+                    all_meaningful_components;
+            std::vector<sailroute::IsochroneFront> fronts;
+            auto result = router.optimize_view(
+                request,
+                [&fronts](const sailroute::RoutingProgressView& progress) {
+                    fronts.push_back(copy_front(progress.destination_front));
+                });
+            if (!result.has_value()) {
+                throw std::runtime_error(result.error().message);
+            }
+            return std::pair{
+                std::move(result.value()),
+                std::move(fronts)};
+        };
+
+    const auto [single_route, single_fronts] = route_and_fronts(1U);
+    const auto [parallel_route, parallel_fronts] = route_and_fronts(4U);
+    const auto [automatic_route, automatic_fronts] = route_and_fronts(0U);
+
+    require_same_route(single_route, parallel_route);
+    require_same_route(single_route, automatic_route);
+    REQUIRE(single_fronts.size() == parallel_fronts.size());
+    REQUIRE(single_fronts.size() == automatic_fronts.size());
+    for (std::size_t index = 0U; index < single_fronts.size(); ++index) {
+        require_same_front(single_fronts[index], parallel_fronts[index]);
+        require_same_front(single_fronts[index], automatic_fronts[index]);
+    }
 }
 
 TEST_CASE("progress view cadence throttles callbacks but not isochrone capture") {
@@ -1312,6 +1461,15 @@ TEST_CASE("progress options reject invalid construction values") {
         REQUIRE(!result.has_value());
         REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
     }
+
+    request.options.progress.destination_front.half_angle_degrees = 90.0;
+    request.options.progress.destination_front.segment_policy =
+        static_cast<sailroute::DestinationFrontSegmentPolicy>(99);
+    result = router.optimize_view(
+        request,
+        sailroute::RoutingProgressViewCallback{});
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
 }
 
 TEST_CASE("bearing-sector pruning rejects invalid sector widths") {
