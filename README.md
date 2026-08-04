@@ -317,12 +317,17 @@ great-circle distance divided by the polar's global maximum boat speed; select
 | `progress_every_n_expansions` | `250` | Lattice callback cadence |
 | `search_algorithm` | `a_star` | `a_star` or the Dijkstra oracle |
 
-Refinement accepts only a complete route that is no later than the incumbent.
-If a finer corridor disconnects or regresses, the previous route is retained
-and `LatticeRouteDiagnostics::refinement_fallback` is set. Start and destination
-remain exact virtual anchors; route endpoints are never snapped to cell
-centres. The solver is intentionally serial, so `worker_count` has no effect on
-its deterministic output.
+Refinement builds a mixed-resolution graph from the complete coarse lattice and
+only subdivides faces intersecting the geodesic corridor around complete
+incumbent route segments. Coarse cells remain outside the corridor, split
+boundary edges reconnect deterministically, and a globally fine lattice is
+never allocated. A refined route is accepted only when it is complete and no
+later than the incumbent. If every bounded widening attempt disconnects or
+regresses, the previous route is retained and the lattice diagnostics report
+the fallback reason, failed attempts, accepted corridor width, and active
+cell/face counts. Start and destination remain exact virtual anchors; route
+endpoints are never snapped to cell centres. The solver is intentionally
+serial, so `worker_count` has no effect on its deterministic output.
 
 Lattice callbacks identify
 `RoutingSolver::time_dependent_lattice`, populate the distinct

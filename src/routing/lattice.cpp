@@ -1,7 +1,6 @@
 #include "routing/lattice.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <map>
 #include <numbers>
@@ -13,12 +12,6 @@ namespace sailroute::detail {
 namespace {
 
 constexpr double earth_radius_nautical_miles = 3440.065;
-
-struct Face {
-    GeodesicLattice::CellIndex first;
-    GeodesicLattice::CellIndex second;
-    GeodesicLattice::CellIndex third;
-};
 
 struct Vector3 {
     double x;
@@ -103,7 +96,8 @@ GeodesicLattice::GeodesicLattice(std::size_t subdivision_level)
     }
 
     std::vector<Face> faces{
-        {0U, 11U, 5U}, {0U, 5U, 1U}, {0U, 1U, 7U}, {0U, 7U, 10U},
+        Face{0U, 11U, 5U}, Face{0U, 5U, 1U}, Face{0U, 1U, 7U},
+        Face{0U, 7U, 10U},
         {0U, 10U, 11U}, {1U, 5U, 9U}, {5U, 11U, 4U}, {11U, 10U, 2U},
         {10U, 7U, 6U}, {7U, 1U, 8U}, {3U, 9U, 4U}, {3U, 4U, 2U},
         {3U, 2U, 6U}, {3U, 6U, 8U}, {3U, 8U, 9U}, {4U, 9U, 5U},
@@ -135,12 +129,12 @@ GeodesicLattice::GeodesicLattice(std::size_t subdivision_level)
         };
 
         for (const Face face : faces) {
-            const CellIndex first_second = midpoint(face.first, face.second);
-            const CellIndex second_third = midpoint(face.second, face.third);
-            const CellIndex third_first = midpoint(face.third, face.first);
-            subdivided_faces.push_back({face.first, first_second, third_first});
-            subdivided_faces.push_back({face.second, second_third, first_second});
-            subdivided_faces.push_back({face.third, third_first, second_third});
+            const CellIndex first_second = midpoint(face[0U], face[1U]);
+            const CellIndex second_third = midpoint(face[1U], face[2U]);
+            const CellIndex third_first = midpoint(face[2U], face[0U]);
+            subdivided_faces.push_back({face[0U], first_second, third_first});
+            subdivided_faces.push_back({face[1U], second_third, first_second});
+            subdivided_faces.push_back({face[2U], third_first, second_third});
             subdivided_faces.push_back({first_second, second_third, third_first});
         }
         faces = std::move(subdivided_faces);
@@ -161,9 +155,9 @@ GeodesicLattice::GeodesicLattice(std::size_t subdivision_level)
         neighbors_[second].push_back(first);
     };
     for (const Face face : faces) {
-        add_edge(face.first, face.second);
-        add_edge(face.second, face.third);
-        add_edge(face.third, face.first);
+        add_edge(face[0U], face[1U]);
+        add_edge(face[1U], face[2U]);
+        add_edge(face[2U], face[0U]);
     }
     for (std::vector<CellIndex>& adjacent : neighbors_) {
         std::sort(adjacent.begin(), adjacent.end());
@@ -185,6 +179,7 @@ GeodesicLattice::GeodesicLattice(std::size_t subdivision_level)
                 std::max(maximum_neighbor_edge_length_nautical_miles_, length);
         }
     }
+    faces_ = std::move(faces);
 }
 
 std::size_t GeodesicLattice::subdivision_level() const noexcept {
@@ -202,6 +197,10 @@ Coordinate GeodesicLattice::coordinate(CellIndex cell) const noexcept {
 std::span<const GeodesicLattice::CellIndex> GeodesicLattice::neighbors(
     CellIndex cell) const noexcept {
     return neighbors_[cell];
+}
+
+std::span<const GeodesicLattice::Face> GeodesicLattice::faces() const noexcept {
+    return faces_;
 }
 
 std::optional<GeodesicLattice::CellIndex> GeodesicLattice::nearest_cell(
@@ -229,6 +228,22 @@ std::optional<GeodesicLattice::CellIndex> GeodesicLattice::nearest_cell(
 
 double GeodesicLattice::maximum_neighbor_edge_length_nautical_miles() const noexcept {
     return maximum_neighbor_edge_length_nautical_miles_;
+}
+
+double GeodesicLattice::maximum_neighbor_edge_length_nautical_miles(
+    CellIndex cell) const noexcept {
+    double maximum = 0.0;
+    for (const CellIndex neighbor : neighbors_[cell]) {
+        const double dot_product =
+            unit_vectors_[3U * cell] * unit_vectors_[3U * neighbor] +
+            unit_vectors_[3U * cell + 1U] * unit_vectors_[3U * neighbor + 1U] +
+            unit_vectors_[3U * cell + 2U] * unit_vectors_[3U * neighbor + 2U];
+        maximum = std::max(
+            maximum,
+            earth_radius_nautical_miles *
+                std::acos(std::clamp(dot_product, -1.0, 1.0)));
+    }
+    return maximum;
 }
 
 std::optional<GeodesicLattice::CellIndex> GeodesicLattice::coincident_cell_at_level(

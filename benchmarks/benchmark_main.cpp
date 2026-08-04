@@ -191,7 +191,19 @@ void report_route_quality(
         std::cout << "  settled "
                  << route.value().lattice_diagnostics->settled_labels
                  << "  level "
-                 << route.value().lattice_diagnostics->subdivision_level;
+                 << route.value().lattice_diagnostics->subdivision_level
+                 << "  active cells/faces "
+                 << route.value().lattice_diagnostics->active_cells << '/'
+                 << route.value().lattice_diagnostics->active_faces
+                 << "  refinement accepted/runs "
+                 << route.value().lattice_diagnostics->accepted_refinements
+                 << '/'
+                 << route.value().lattice_diagnostics->refinement_runs
+                 << "  corridor "
+                 << route.value()
+                        .lattice_diagnostics
+                        ->accepted_corridor_width_nautical_miles
+                 << " nm";
     }
     std::cout << '\n' << std::defaultfloat;
 }

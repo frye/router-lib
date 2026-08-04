@@ -1990,6 +1990,18 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
             first.value().completion ==
             sailroute::RouteCompletion::destination_reached);
         REQUIRE(first.value().lattice_diagnostics.has_value());
+        REQUIRE(
+            first.value().lattice_diagnostics->accepted_refinements == 1U);
+        REQUIRE(first.value().lattice_diagnostics->active_cells > 2562U);
+        REQUIRE(first.value().lattice_diagnostics->active_cells < 10242U);
+        REQUIRE(first.value().lattice_diagnostics->active_faces > 5120U);
+        REQUIRE(
+            first.value()
+                .lattice_diagnostics
+                ->accepted_corridor_width_nautical_miles == 450.0);
+        REQUIRE(
+            first.value().lattice_diagnostics->fallback_reason ==
+            sailroute::LatticeRefinementFallbackReason::none);
         REQUIRE(first.value().isochrones.empty());
         REQUIRE(
             first.value().points.front().position.latitude_degrees ==
@@ -2004,6 +2016,30 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
             first.value().points.back().position.longitude_degrees ==
             request.destination.longitude_degrees);
 
+        auto coarse_request = request;
+        coarse_request.options.lattice.refinement_levels = 0U;
+        const auto coarse = router.optimize(coarse_request);
+        REQUIRE(coarse.has_value());
+        REQUIRE(
+            first.value().completion ==
+            coarse.value().completion);
+        REQUIRE(
+            first.value().arrival_time <=
+            coarse.value().arrival_time);
+
+        auto twice_refined_request = request;
+        twice_refined_request.options.lattice.refinement_levels = 2U;
+        const auto twice_refined = router.optimize(twice_refined_request);
+        REQUIRE(twice_refined.has_value());
+        REQUIRE(
+            twice_refined.value().lattice_diagnostics.has_value());
+        REQUIRE(
+            twice_refined.value()
+                .lattice_diagnostics->accepted_refinements == 2U);
+        REQUIRE(
+            twice_refined.value().arrival_time <=
+            first.value().arrival_time);
+
         request.options.worker_count = 4U;
         const auto parallel_option = router.optimize(request);
         REQUIRE(parallel_option.has_value());
@@ -2011,6 +2047,12 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
             parallel_option.value().arrival_time ==
             first.value().arrival_time);
         require_same_route(parallel_option.value(), first.value());
+        const auto first_json = sailroute::route_to_json(first.value());
+        const auto parallel_json =
+            sailroute::route_to_json(parallel_option.value());
+        REQUIRE(first_json.has_value());
+        REQUIRE(parallel_json.has_value());
+        REQUIRE(first_json.value() == parallel_json.value());
     }
 
     TEST_CASE("lattice A star and Dijkstra agree on earliest arrival") {
@@ -2063,6 +2105,44 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
             REQUIRE(repeated.has_value());
             require_same_route(repeated.value(), a_star_result.value());
         }
+    }
+
+    TEST_CASE("failed mixed refinement retains the coarse incumbent") {
+        const RoutingGribFixture fixture{
+            20260714,
+            1200,
+            48,
+            0.0,
+            -10.0,
+            0.0,
+            -10.0,
+            RoutingGridSpec{
+                8L, 5L, 80.0, 0.0, -80.0, 315.0, 45.0, 40.0}};
+        const auto weather = sailroute::WeatherDataset::load(fixture.path());
+        REQUIRE(weather.has_value());
+        const sailroute::Router router{weather.value()};
+
+        sailroute::RouteRequest request = routing_request(1U, false);
+        request.start = {0.0, 179.0};
+        request.destination = {0.0, -177.0};
+        request.options.maximum_route_duration = std::chrono::hours{48};
+        request.options.solver =
+            sailroute::RoutingSolver::time_dependent_lattice;
+        request.options.lattice.subdivision_level = 5U;
+        request.options.lattice.refinement_levels = 1U;
+        request.options.lattice.corridor_width_nautical_miles = 1.0;
+        request.options.lattice.corridor_widening_retries = 0U;
+        const auto route = router.optimize(request);
+        REQUIRE(route.has_value());
+        REQUIRE(route.value().lattice_diagnostics.has_value());
+        REQUIRE(
+            route.value().lattice_diagnostics->refinement_runs == 1U);
+        REQUIRE(route.value().lattice_diagnostics->refinement_fallback);
+        REQUIRE(
+            route.value().lattice_diagnostics->fallback_reason !=
+            sailroute::LatticeRefinementFallbackReason::none);
+        REQUIRE(
+            route.value().lattice_diagnostics->active_cells == 10242U);
     }
 
     TEST_CASE("lattice re-relaxation beats a frozen beam") {

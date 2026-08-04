@@ -89,6 +89,13 @@ TEST_CASE("JSON conditionally includes lattice diagnostics") {
         .refinement_fallback = true,
         .re_relaxed_labels = 4U,
         .stale_queue_entries = 2U,
+        .active_cells = 120U,
+        .active_faces = 220U,
+        .accepted_corridor_width_nautical_miles = 90.0,
+        .disconnected_refinements = 1U,
+        .regressed_refinements = 2U,
+        .fallback_reason =
+            sailroute::LatticeRefinementFallbackReason::retry_exhausted,
     };
     const auto serialized = sailroute::route_to_json(route);
     REQUIRE(serialized.has_value());
@@ -106,6 +113,26 @@ TEST_CASE("JSON conditionally includes lattice diagnostics") {
         std::string::npos);
     REQUIRE(
         serialized.value().find("\"staleQueueEntries\":2") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"activeCells\":120") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"activeFaces\":220") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find(
+            "\"acceptedCorridorWidthNauticalMiles\":90") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"disconnectedRefinements\":1") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"regressedRefinements\":2") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find(
+            "\"fallbackReason\":\"retry_exhausted\"") !=
         std::string::npos);
 }
 
@@ -250,6 +277,17 @@ TEST_CASE("serialization rejects non-finite route values") {
     const auto json = sailroute::route_to_json(route);
     REQUIRE(!json.has_value());
     REQUIRE(json.error().code == sailroute::ErrorCode::output_error);
+
+    route = sample_route();
+    route.lattice_diagnostics = sailroute::LatticeRouteDiagnostics{};
+    route.lattice_diagnostics
+        ->accepted_corridor_width_nautical_miles =
+        std::numeric_limits<double>::quiet_NaN();
+    const auto lattice_json = sailroute::route_to_json(route);
+    REQUIRE(!lattice_json.has_value());
+    REQUIRE(
+        lattice_json.error().code ==
+        sailroute::ErrorCode::output_error);
 
     route = sample_route();
     route.points.front().position.latitude_degrees = 91.0;

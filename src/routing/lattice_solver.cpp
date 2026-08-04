@@ -2,6 +2,7 @@
 
 #include "routing/geodesy.hpp"
 #include "routing/lattice.hpp"
+#include "routing/mixed_lattice.hpp"
 #include "routing/state.hpp"
 #include "routing/transition.hpp"
 
@@ -110,13 +111,14 @@ std::int64_t bucket_for(
         width.count();
 }
 
+template <typename Lattice>
 Result<SearchOutcome> search_lattice(
     const WeatherDataset& weather,
     const VesselPolar& polar,
     const RouteRequest& request,
     TimePoint departure,
     DepartureSource departure_source,
-    const GeodesicLattice& lattice,
+    const Lattice& lattice,
     std::span<const std::uint8_t> allowed,
     std::size_t refinement_index,
     const RoutingViewControlCallback& on_progress) {
@@ -273,7 +275,9 @@ Result<SearchOutcome> search_lattice(
         if (current_distance <=
             std::max(
                 request.options.arrival_radius_nautical_miles,
-                lattice.maximum_neighbor_edge_length_nautical_miles() * 1.75)) {
+                lattice.maximum_neighbor_edge_length_nautical_miles(
+                    current.state.spatial) *
+                    1.75)) {
             auto arrival_result = evaluate_variable_transition(
                     weather,
                     polar,
@@ -435,24 +439,6 @@ Result<SearchOutcome> search_lattice(
         "time-dependent lattice search exhausted every reachable state"};
 }
 
-std::vector<std::uint8_t> corridor_cells(
-    const GeodesicLattice& lattice,
-    std::span<const RoutePoint> route,
-    double width_nautical_miles) {
-    std::vector<std::uint8_t> allowed(lattice.vertex_count(), 0U);
-    for (CellIndex cell = 0U; cell < lattice.vertex_count(); ++cell) {
-        const Coordinate coordinate = lattice.coordinate(cell);
-        for (const RoutePoint& point : route) {
-            if (great_circle_distance_nautical_miles(
-                    coordinate, point.position) <= width_nautical_miles) {
-                allowed[cell] = 1U;
-                break;
-            }
-        }
-    }
-    return allowed;
-}
-
 }  // namespace
 
 Result<RouteResult> optimize_lattice_route(
@@ -491,15 +477,14 @@ Result<RouteResult> optimize_lattice_route(
 
     RouteResult result = std::move(incumbent.value().result);
     LatticeRouteDiagnostics cumulative = incumbent.value().diagnostics;
+    cumulative.active_cells = coarse.value().vertex_count();
+    cumulative.active_faces = coarse.value().faces().size();
     for (std::size_t refinement = 1U;
          refinement <= request.options.lattice.refinement_levels;
          ++refinement) {
-        auto lattice = GeodesicLattice::create(
-            request.options.lattice.subdivision_level + refinement);
-        if (!lattice) {
-            return lattice.error();
-        }
         bool accepted = false;
+        LatticeRefinementFallbackReason last_failure =
+            LatticeRefinementFallbackReason::none;
         for (std::size_t retry = 0U;
              retry <= request.options.lattice.corridor_widening_retries;
              ++retry) {
@@ -507,8 +492,14 @@ Result<RouteResult> optimize_lattice_route(
             const double width =
                 request.options.lattice.corridor_width_nautical_miles *
                 static_cast<double>(std::size_t{1U} << retry);
-            std::vector<std::uint8_t> allowed =
-                corridor_cells(lattice.value(), result.points, width);
+            auto lattice = MixedResolutionLattice::create(
+                request.options.lattice.subdivision_level,
+                refinement,
+                result.points,
+                width);
+            if (!lattice) {
+                return lattice.error();
+            }
             auto refined = search_lattice(
                 weather,
                 polar,
@@ -516,11 +507,14 @@ Result<RouteResult> optimize_lattice_route(
                 departure,
                 departure_source,
                 lattice.value(),
-                allowed,
+                {},
                 refinement,
                 on_progress);
             if (!refined) {
                 if (refined.error().code == ErrorCode::no_route) {
+                    ++cumulative.disconnected_refinements;
+                    last_failure =
+                        LatticeRefinementFallbackReason::disconnected;
                     continue;
                 }
                 return refined.error();
@@ -544,13 +538,24 @@ Result<RouteResult> optimize_lattice_route(
                 ++cumulative.accepted_refinements;
                 cumulative.subdivision_level =
                     lattice.value().subdivision_level();
+                cumulative.active_cells = lattice.value().vertex_count();
+                cumulative.active_faces = lattice.value().leaf_face_count();
+                cumulative.accepted_corridor_width_nautical_miles = width;
+                cumulative.fallback_reason =
+                    LatticeRefinementFallbackReason::none;
                 result = std::move(refined.value().result);
                 accepted = true;
                 break;
             }
+            ++cumulative.regressed_refinements;
+            last_failure = LatticeRefinementFallbackReason::regressed;
         }
         if (!accepted) {
             cumulative.refinement_fallback = true;
+            cumulative.fallback_reason =
+                request.options.lattice.corridor_widening_retries == 0U
+                ? last_failure
+                : LatticeRefinementFallbackReason::retry_exhausted;
             break;
         }
     }

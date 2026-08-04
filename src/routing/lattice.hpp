@@ -3,6 +3,7 @@
 #include "sailroute/error.hpp"
 #include "sailroute/types.hpp"
 
+#include <array>
 #include <cstddef>
 #include <optional>
 #include <span>
@@ -16,6 +17,7 @@ namespace sailroute::detail {
 class GeodesicLattice {
 public:
     using CellIndex = std::size_t;
+    using Face = std::array<CellIndex, 3U>;
 
     /// Prevents unexpectedly large routing allocations (level 8 has 655,362
     /// cells). Larger resolutions are intentionally not supported internally.
@@ -36,6 +38,7 @@ public:
     /// cell. Every returned edge is reciprocal; cells have degree five or six.
     /// Passing an index outside [0, vertex_count()) is a programmer error.
     [[nodiscard]] std::span<const CellIndex> neighbors(CellIndex cell) const noexcept;
+    [[nodiscard]] std::span<const Face> faces() const noexcept;
 
     /// Finds the closest vertex to a valid canonical coordinate. Invalid input
     /// yields std::nullopt. Ties are resolved by the lowest cell index.
@@ -44,6 +47,8 @@ public:
 
     /// Largest great-circle length of any lattice edge, in nautical miles.
     [[nodiscard]] double maximum_neighbor_edge_length_nautical_miles() const noexcept;
+    [[nodiscard]] double maximum_neighbor_edge_length_nautical_miles(
+        CellIndex cell) const noexcept;
 
     /// Returns the corresponding cell index at a level no finer than this
     /// lattice when this cell was inherited from that level; otherwise nullopt.
@@ -58,6 +63,7 @@ private:
     std::size_t subdivision_level_{};
     std::vector<Coordinate> coordinates_;
     std::vector<std::vector<CellIndex>> neighbors_;
+    std::vector<Face> faces_;
     std::vector<double> unit_vectors_;
     double maximum_neighbor_edge_length_nautical_miles_{};
 };

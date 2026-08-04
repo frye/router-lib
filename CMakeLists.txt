@@ -33,6 +33,7 @@ add_library(sailroute STATIC
     src/routing/intervals.cpp
     src/routing/lattice.cpp
     src/routing/lattice_solver.cpp
+    src/routing/mixed_lattice.cpp
     src/routing/router.cpp
     src/routing/transition.cpp
     src/serialization/json.cpp
