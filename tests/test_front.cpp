@@ -627,13 +627,24 @@ TEST_CASE("destination front explicit anchors select the principal component") {
 
         sailroute::DestinationFrontOptions options;
         options.minimum_secondary_segment_points = 0U;
-        const auto result = sailroute::build_destination_front(
+        const auto legacy_result = sailroute::build_destination_front(
             points,
             sailroute::Coordinate{10.0, 0.0},
             50.0,
             options);
-        REQUIRE(!result.has_value());
-        REQUIRE(result.error().code == sailroute::ErrorCode::invalid_argument);
+        REQUIRE(legacy_result.has_value());
+
+        options.mode =
+            sailroute::DestinationFrontMode::eligible_pre_prune;
+        const auto enhanced_result = sailroute::build_destination_front(
+            points,
+            sailroute::Coordinate{10.0, 0.0},
+            50.0,
+            options);
+        REQUIRE(!enhanced_result.has_value());
+        REQUIRE(
+            enhanced_result.error().code ==
+            sailroute::ErrorCode::invalid_argument);
 }
 
 // ── RoutingProgressPayload integration ────────────────────────────────────────
