@@ -87,6 +87,10 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
     const double heading = initial_bearing_degrees(parent.position, destination);
     auto wind_result = weather.interpolate(parent.position, parent.time);
     if (!wind_result) {
+        if (wind_result.error().code ==
+            ErrorCode::coordinate_outside_forecast) {
+            return std::optional<VariableTransition>{};
+        }
         return wind_result.error();
     }
     auto evaluated_wind = evaluate_wind(wind_result.value(), options);
@@ -134,6 +138,10 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
                     std::ceil(sailing_seconds * 0.5))};
         auto midpoint_wind = weather.interpolate(midpoint, midpoint_time);
         if (!midpoint_wind) {
+            if (midpoint_wind.error().code ==
+                ErrorCode::coordinate_outside_forecast) {
+                return std::optional<VariableTransition>{};
+            }
             return midpoint_wind.error();
         }
         auto evaluated_midpoint =

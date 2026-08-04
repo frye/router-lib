@@ -1,5 +1,6 @@
 #include "sailroute/front.hpp"
 #include "sailroute/router.hpp"
+#include "sailroute/serialization.hpp"
 #include "sailroute/time.hpp"
 
 #include "../src/routing/geodesy.hpp"
@@ -248,6 +249,18 @@ void require_same_route(
                 left_isochrone.points[point_index].longitude_degrees ==
                 right_isochrone.points[point_index].longitude_degrees);
         }
+    }
+}
+
+void require_monotonic_route(
+    const sailroute::RouteResult& route) {
+    REQUIRE(!route.points.empty());
+    for (std::size_t index = 1U; index < route.points.size(); ++index) {
+        REQUIRE(route.points[index - 1U].time < route.points[index].time);
+        REQUIRE(
+            route.points[index - 1U]
+                .cumulative_distance_nautical_miles <=
+            route.points[index].cumulative_distance_nautical_miles);
     }
 }
 
@@ -1990,6 +2003,98 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
         REQUIRE(dijkstra_result.has_value());
         REQUIRE(a_star_result.value().arrival_time == dijkstra_result.value().arrival_time);
         require_same_route(a_star_result.value(), dijkstra_result.value());
+        REQUIRE(a_star_result.value().lattice_diagnostics.has_value());
+        REQUIRE(dijkstra_result.value().lattice_diagnostics.has_value());
+        REQUIRE(
+            a_star_result.value().lattice_diagnostics->settled_labels <=
+            dijkstra_result.value().lattice_diagnostics->settled_labels);
+        require_monotonic_route(a_star_result.value());
+
+        const auto a_star_json =
+            sailroute::route_to_json(a_star_result.value());
+        const auto dijkstra_json =
+            sailroute::route_to_json(dijkstra_result.value());
+        REQUIRE(a_star_json.has_value());
+        REQUIRE(dijkstra_json.has_value());
+        REQUIRE(
+            a_star_json.value().find("\"latticeDiagnostics\"") !=
+            std::string::npos);
+        REQUIRE(
+            dijkstra_json.value().find("\"latticeDiagnostics\"") !=
+            std::string::npos);
+
+        for (std::size_t repetition = 0U; repetition < 4U; ++repetition) {
+            const auto repeated = router.optimize(a_star);
+            REQUIRE(repeated.has_value());
+            require_same_route(repeated.value(), a_star_result.value());
+        }
+    }
+
+    TEST_CASE("lattice forecast and duration exhaustion remain distinct") {
+        const RoutingGribFixture short_fixture{20260714, 1200, 6};
+        const auto short_weather =
+            sailroute::WeatherDataset::load(short_fixture.path());
+        REQUIRE(short_weather.has_value());
+        const sailroute::Router short_router{short_weather.value()};
+
+        sailroute::RouteRequest forecast_limited =
+            routing_request(1U, false);
+        forecast_limited.start = {1.0, 0.25};
+        forecast_limited.destination = {1.0, 1.75};
+        forecast_limited.options.solver =
+            sailroute::RoutingSolver::time_dependent_lattice;
+        forecast_limited.options.lattice.subdivision_level = 7U;
+        forecast_limited.options.lattice.refinement_levels = 0U;
+        const auto partial = short_router.optimize(forecast_limited);
+        REQUIRE(partial.has_value());
+        REQUIRE(
+            partial.value().completion ==
+            sailroute::RouteCompletion::forecast_exhausted);
+        require_monotonic_route(partial.value());
+
+        const RoutingGribFixture full_fixture;
+        const auto full_weather =
+            sailroute::WeatherDataset::load(full_fixture.path());
+        REQUIRE(full_weather.has_value());
+        const sailroute::Router full_router{full_weather.value()};
+        auto duration_limited = forecast_limited;
+        duration_limited.options.maximum_route_duration =
+            std::chrono::hours{1};
+        const auto exhausted = full_router.optimize(duration_limited);
+        REQUIRE(!exhausted.has_value());
+        REQUIRE(exhausted.error().code == sailroute::ErrorCode::no_route);
+    }
+
+    TEST_CASE("lattice callback exceptions propagate synchronously") {
+        const RoutingGribFixture fixture;
+        const auto weather = sailroute::WeatherDataset::load(fixture.path());
+        REQUIRE(weather.has_value());
+        const sailroute::Router router{weather.value()};
+
+        sailroute::RouteRequest request = routing_request(1U, false);
+        request.start = {1.0, 0.1};
+        request.destination = {1.0, 1.4};
+        request.options.solver =
+            sailroute::RoutingSolver::time_dependent_lattice;
+        request.options.lattice.subdivision_level = 7U;
+        request.options.lattice.refinement_levels = 0U;
+        request.options.lattice.progress_every_n_expansions = 1U;
+
+        bool propagated = false;
+        try {
+            static_cast<void>(router.optimize_view(
+                request,
+                [](const sailroute::RoutingProgressView&) ->
+                    sailroute::RoutingProgressDecision {
+                    throw std::runtime_error(
+                        "lattice progress callback failure");
+                }));
+        } catch (const std::runtime_error& error) {
+            propagated =
+                std::string_view{error.what()} ==
+                "lattice progress callback failure";
+        }
+        REQUIRE(propagated);
     }
 
     TEST_CASE("lattice routing rejects isochrone-specific outputs") {

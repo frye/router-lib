@@ -65,6 +65,18 @@ struct SolverLabelIdentity {
     std::size_t ordinal{};
 };
 
+struct ContinuationStateKey {
+    std::size_t spatial{};
+    OperationalConfiguration configuration;
+
+    friend bool operator<(
+        const ContinuationStateKey& left,
+        const ContinuationStateKey& right) noexcept {
+        return std::tie(left.spatial, left.configuration) <
+            std::tie(right.spatial, right.configuration);
+    }
+};
+
 [[nodiscard]] inline bool dominates(
     const SolverLabelIdentity& left,
     const SolverLabelIdentity& right) noexcept {

@@ -179,6 +179,11 @@ Result<SearchOutcome> search_lattice(
         no_label,
         0U});
     std::map<SolverStateKey, LabelIndex> best{{labels.front().state, 0U}};
+    std::map<ContinuationStateKey, TimePoint> earliest_arrival{
+        {ContinuationStateKey{
+             labels.front().state.spatial,
+             labels.front().state.configuration},
+         departure}};
     std::priority_queue<
         QueueEntry,
         std::vector<QueueEntry>,
@@ -214,6 +219,16 @@ Result<SearchOutcome> search_lattice(
             return;
         }
         const LabelIndex index = labels.size();
+        const ContinuationStateKey continuation{
+            label.state.spatial,
+            label.state.configuration};
+        const auto earliest = earliest_arrival.find(continuation);
+        if (earliest == earliest_arrival.end()) {
+            earliest_arrival.emplace(continuation, label.point.time);
+        } else if (label.point.time < earliest->second) {
+            earliest->second = label.point.time;
+            ++diagnostics.re_relaxed_labels;
+        }
         labels.push_back(std::move(label));
         best[labels.back().state] = index;
         const double elapsed = std::chrono::duration<double>(
@@ -239,6 +254,7 @@ Result<SearchOutcome> search_lattice(
         queue.pop();
         const auto current_best = best.find(entry.state);
         if (current_best == best.end() || current_best->second != entry.label) {
+            ++diagnostics.stale_queue_entries;
             continue;
         }
         // Relaxation appends to labels and may reallocate it, so expansion must
@@ -321,8 +337,10 @@ Result<SearchOutcome> search_lattice(
                 current.state.configuration,
                 lattice.coordinate(target),
                 route_end);
-            if (!transition_result ||
-                !transition_result.value().has_value()) {
+            if (!transition_result) {
+                return transition_result.error();
+            }
+            if (!transition_result.value().has_value()) {
                 continue;
             }
             VariableTransition transition =
@@ -519,6 +537,10 @@ Result<RouteResult> optimize_lattice_route(
                     refined.value().diagnostics.relaxed_labels;
                 cumulative.wait_transitions +=
                     refined.value().diagnostics.wait_transitions;
+                cumulative.re_relaxed_labels +=
+                    refined.value().diagnostics.re_relaxed_labels;
+                cumulative.stale_queue_entries +=
+                    refined.value().diagnostics.stale_queue_entries;
                 ++cumulative.accepted_refinements;
                 cumulative.subdivision_level =
                     lattice.value().subdivision_level();

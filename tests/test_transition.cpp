@@ -3,7 +3,11 @@
 #include "test_support.hpp"
 
 #include <chrono>
+#include <algorithm>
 #include <limits>
+#include <map>
+#include <random>
+#include <vector>
 
 using namespace std::chrono_literals;
 
@@ -108,4 +112,48 @@ TEST_CASE("maneuver delay retains reserved sail and reef identities") {
             45.0,
             port,
             45.0) == 0s);
+}
+
+TEST_CASE("state ordering is independent of insertion order") {
+    std::vector<sailroute::detail::SolverStateKey> states;
+    for (std::size_t index = 0U; index < 32U; ++index) {
+        states.push_back(sailroute::detail::SolverStateKey{
+            index % 7U,
+            static_cast<std::int64_t>(index % 5U),
+            sailroute::TimePoint{
+                std::chrono::seconds{static_cast<std::int64_t>(index * 11U)}},
+            sailroute::detail::OperationalConfiguration{
+                static_cast<std::int8_t>(
+                    static_cast<int>(index % 3U) - 1),
+                static_cast<std::uint32_t>(index % 2U),
+                static_cast<std::uint32_t>(index % 4U)}});
+    }
+
+    std::map<sailroute::detail::SolverStateKey, std::size_t> reference;
+    for (std::size_t index = 0U; index < states.size(); ++index) {
+        reference.emplace(states[index], index);
+    }
+    const std::vector<sailroute::detail::SolverStateKey> expected = [&] {
+        std::vector<sailroute::detail::SolverStateKey> ordered;
+        for (const auto& [state, index] : reference) {
+            static_cast<void>(index);
+            ordered.push_back(state);
+        }
+        return ordered;
+    }();
+
+    std::mt19937 generator{42U};
+    for (std::size_t repetition = 0U; repetition < 16U; ++repetition) {
+        std::shuffle(states.begin(), states.end(), generator);
+        std::map<sailroute::detail::SolverStateKey, std::size_t> shuffled;
+        for (std::size_t index = 0U; index < states.size(); ++index) {
+            shuffled.emplace(states[index], index);
+        }
+        std::vector<sailroute::detail::SolverStateKey> actual;
+        for (const auto& [state, index] : shuffled) {
+            static_cast<void>(index);
+            actual.push_back(state);
+        }
+        REQUIRE(actual == expected);
+    }
 }

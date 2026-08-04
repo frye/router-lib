@@ -87,6 +87,8 @@ TEST_CASE("JSON conditionally includes lattice diagnostics") {
         .accepted_refinements = 1U,
         .subdivision_level = 5U,
         .refinement_fallback = true,
+        .re_relaxed_labels = 4U,
+        .stale_queue_entries = 2U,
     };
     const auto serialized = sailroute::route_to_json(route);
     REQUIRE(serialized.has_value());
@@ -98,6 +100,12 @@ TEST_CASE("JSON conditionally includes lattice diagnostics") {
         std::string::npos);
     REQUIRE(
         serialized.value().find("\"refinementFallback\":true") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"reRelaxedLabels\":4") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"staleQueueEntries\":2") !=
         std::string::npos);
 }
 

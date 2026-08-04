@@ -354,6 +354,8 @@ struct LatticeRouteDiagnostics {
     std::size_t accepted_refinements{};
     std::size_t subdivision_level{};
     bool refinement_fallback{};
+    std::size_t re_relaxed_labels{};
+    std::size_t stale_queue_entries{};
 };
 
 /// Lattice-only callback counters for the currently active search pass.

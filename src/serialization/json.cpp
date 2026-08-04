@@ -115,6 +115,10 @@ Result<std::string> route_to_json(const RouteResult& route) {
         output.append(std::to_string(lattice.subdivision_level));
         output.append(",\"refinementFallback\":");
         output.append(lattice.refinement_fallback ? "true" : "false");
+        output.append(",\"reRelaxedLabels\":");
+        output.append(std::to_string(lattice.re_relaxed_labels));
+        output.append(",\"staleQueueEntries\":");
+        output.append(std::to_string(lattice.stale_queue_entries));
         output.push_back('}');
     }
     output.append(",\n  \"points\":[");
