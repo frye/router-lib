@@ -44,6 +44,11 @@ struct Grid {
 struct DecodedField {
     Grid grid;
     std::vector<double> values;
+    // Maximum absolute reconstruction error introduced by GRIB packing for a
+    // single value (half of the quantization step), expressed in decoded units.
+    // Independently packed tiles that describe the same field can legitimately
+    // disagree at a shared cell by up to the sum of their packing errors.
+    double packing_error{0.0};
 };
 
 struct PendingTimeSlice {
@@ -512,6 +517,28 @@ using HandlePtr = std::unique_ptr<codes_handle, HandleDeleter>;
     }
     const double conversion = conversion_result.value();
 
+    // Derive the packing quantization error so overlap comparisons can use a
+    // tolerance grounded in GRIB precision rather than an arbitrary epsilon.
+    // For grid_simple packing the representable values are spaced by
+    // 2^binaryScaleFactor * 10^-decimalScaleFactor; the worst-case rounding
+    // error for any single value is half of that spacing. A constant field
+    // (bitsPerValue == 0) is stored exactly and carries no packing error.
+    double packing_error = 0.0;
+    long bits_per_value = 0;
+    long decimal_scale_factor = 0;
+    long binary_scale_factor = 0;
+    if (optional_long(handle, "bitsPerValue", bits_per_value) &&
+        bits_per_value > 0 &&
+        optional_long(handle, "decimalScaleFactor", decimal_scale_factor) &&
+        optional_long(handle, "binaryScaleFactor", binary_scale_factor)) {
+        const double quantum =
+            std::ldexp(1.0, static_cast<int>(binary_scale_factor)) *
+            std::pow(10.0, -static_cast<double>(decimal_scale_factor));
+        if (std::isfinite(quantum)) {
+            packing_error = 0.5 * std::abs(quantum) * std::abs(conversion);
+        }
+    }
+
     long i_scans_negatively = 0;
     long j_scans_positively = 0;
     long j_points_are_consecutive = 0;
@@ -567,7 +594,7 @@ using HandlePtr = std::unique_ptr<codes_handle, HandleDeleter>;
             missing ? std::numeric_limits<double>::quiet_NaN() : value * conversion;
     }
 
-    return DecodedField{grid, std::move(normalized_values)};
+    return DecodedField{grid, std::move(normalized_values), packing_error};
 }
 
 struct CropWindow {
@@ -760,7 +787,8 @@ struct CropWindow {
         field.grid.latitude_step_degrees,
         false,
         false};
-    return DecodedField{cropped_grid, std::move(cropped_values)};
+    return DecodedField{
+        cropped_grid, std::move(cropped_values), field.packing_error};
 }
 
 [[nodiscard]] std::string component_name(WindComponent component) {
@@ -779,14 +807,31 @@ struct CropWindow {
     return difference;
 }
 
-/// Two mosaic cell values conflict only when both are finite and disagree.
-[[nodiscard]] bool values_conflict(double existing, double incoming) noexcept {
+/// Two mosaic cell values conflict only when both are finite and disagree by
+/// more than the supplied tolerance. NaN (missing) values never conflict.
+[[nodiscard]] bool values_conflict(
+    double existing,
+    double incoming,
+    double tolerance) noexcept {
     if (!std::isfinite(existing) || !std::isfinite(incoming)) {
         return false;
     }
-    const double tolerance =
-        1.0e-6 * std::max({1.0, std::abs(existing), std::abs(incoming)});
     return std::abs(existing - incoming) > tolerance;
+}
+
+/// Largest legitimate disagreement between two independently packed tiles at a
+/// shared cell: the sum of their packing errors, plus a small relative margin
+/// that absorbs floating-point reconstruction noise from differing reference
+/// values. Values that differ by more than this describe genuinely conflicting
+/// data.
+[[nodiscard]] double overlap_tolerance(
+    double existing,
+    double incoming,
+    double existing_error,
+    double incoming_error) noexcept {
+    const double reconstruction_margin =
+        1.0e-6 * std::max({1.0, std::abs(existing), std::abs(incoming)});
+    return existing_error + incoming_error + reconstruction_margin;
 }
 
 /// Rounds a lattice displacement to an integer number of steps, or reports
@@ -924,9 +969,14 @@ struct CropWindow {
     std::vector<double> mosaic(
         cell_count, std::numeric_limits<double>::quiet_NaN());
     std::vector<char> covered(cell_count, 0);
+    // Packing error of whichever tile currently owns each mosaic cell, so a
+    // later overlapping tile can be compared against a precision-aware bound.
+    std::vector<double> cell_error(cell_count, 0.0);
+    double mosaic_packing_error = 0.0;
 
     for (std::size_t index = 0; index < tiles.size(); ++index) {
         const DecodedField& tile = tiles[index];
+        mosaic_packing_error = std::max(mosaic_packing_error, tile.packing_error);
         const auto row_base = static_cast<std::size_t>(row_offsets[index]);
         const auto column_base = static_cast<std::size_t>(column_offsets[index]);
         for (std::size_t j = 0; j < tile.grid.latitude_count; ++j) {
@@ -936,7 +986,10 @@ struct CropWindow {
                 const double value =
                     tile.values[j * tile.grid.longitude_count + i];
                 if (covered[cell] != 0) {
-                    if (values_conflict(mosaic[cell], value)) {
+                    const double tolerance = overlap_tolerance(
+                        mosaic[cell], value, cell_error[cell],
+                        tile.packing_error);
+                    if (values_conflict(mosaic[cell], value, tolerance)) {
                         return Error{
                             ErrorCode::grib_decode,
                             "10 m " + name +
@@ -944,10 +997,12 @@ struct CropWindow {
                     }
                     if (!std::isfinite(mosaic[cell])) {
                         mosaic[cell] = value;
+                        cell_error[cell] = tile.packing_error;
                     }
                 } else {
                     covered[cell] = 1;
                     mosaic[cell] = value;
+                    cell_error[cell] = tile.packing_error;
                 }
             }
         }
@@ -978,7 +1033,7 @@ struct CropWindow {
         latitude_step,
         global_coverage,
         false};
-    return DecodedField{mosaic_grid, std::move(mosaic)};
+    return DecodedField{mosaic_grid, std::move(mosaic), mosaic_packing_error};
 }
 
 struct SpatialBracket {

@@ -236,6 +236,11 @@ struct TileMessage {
     double longitude_step{};
     double latitude_step{};
     std::vector<double> values;
+    // GRIB decimal precision (number of preserved decimal places). Zero leaves
+    // the ecCodes sample default; a positive value quantizes the tile, which
+    // lets a test reproduce independently packed tiles whose shared edge
+    // disagrees slightly.
+    long decimal_precision{0};
 };
 
 /// Fills a north-to-south, west-to-east scan for value function f(lat, lon).
@@ -344,6 +349,12 @@ private:
                     handle, "shortName", tile.short_name, &short_name_size),
                 "set wind component");
             require_codes(codes_set_long(handle, "level", 10), "set wind level");
+            if (tile.decimal_precision != 0) {
+                require_codes(
+                    codes_set_long(
+                        handle, "decimalPrecision", tile.decimal_precision),
+                    "set decimal precision");
+            }
             require_codes(
                 codes_set_double_array(
                     handle, "values", tile.values.data(), tile.values.size()),
@@ -384,6 +395,30 @@ TileMessage make_tile(
     tile.values = scan_values(
         ni, nj, first_latitude, first_longitude, longitude_step, latitude_step,
         value_at);
+    return tile;
+}
+
+/// A value function whose shared-edge (latitude 1) samples have fractional
+/// parts that quantize differently at coarse versus fine decimal precision,
+/// producing a small but non-zero decoded disagreement.
+double sample_seam(double latitude, double longitude) {
+    return 3.0 * latitude + longitude + 0.033 * (longitude + 1.0);
+}
+
+TileMessage make_tile_prec(
+    const char* short_name,
+    long ni,
+    long nj,
+    double first_latitude,
+    double first_longitude,
+    double longitude_step,
+    double latitude_step,
+    double (*value_at)(double, double),
+    long decimal_precision) {
+    TileMessage tile = make_tile(
+        short_name, ni, nj, first_latitude, first_longitude, longitude_step,
+        latitude_step, value_at);
+    tile.decimal_precision = decimal_precision;
     return tile;
 }
 
@@ -517,6 +552,50 @@ TEST_CASE("weather rejects tiles that leave a gap") {
     REQUIRE(!weather.has_value());
     REQUIRE(
         weather.error().code == sailroute::ErrorCode::incomplete_forecast);
+}
+
+TEST_CASE("weather mosaics tiles that disagree within GRIB packing error") {
+    // Reproduces the real NOAA GFS assembly: adjacent tiles are packed
+    // independently (here a coarse and a fine decimal precision), so their
+    // shared lat=1 edge decodes to slightly different values. The overlap is a
+    // legitimate quantization artifact, not a conflict, so the mosaic must be
+    // accepted. Under a fixed 1e-6 epsilon this load failed with
+    // "10 m V wind tiles disagree where they overlap".
+    const MosaicFixture fixture({
+        make_tile_prec("10u", 3, 2, 2.0, 0.0, 1.0, 1.0, sample_seam, 1),
+        make_tile_prec("10v", 3, 2, 2.0, 0.0, 1.0, 1.0, sample_seam, 1),
+        make_tile_prec("10u", 3, 2, 1.0, 0.0, 1.0, 1.0, sample_seam, 3),
+        make_tile_prec("10v", 3, 2, 1.0, 0.0, 1.0, 1.0, sample_seam, 3),
+    });
+
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    if (!weather.has_value()) {
+        throw std::runtime_error(weather.error().message);
+    }
+    REQUIRE(weather.value().metadata().latitude_count == 3);
+    REQUIRE(weather.value().metadata().longitude_count == 3);
+}
+
+TEST_CASE("weather still rejects overlaps beyond GRIB packing error") {
+    // Both tiles are packed at the same precision but the southern band's
+    // shared row is offset far beyond any quantization error, so this remains a
+    // genuine conflict even with the precision-aware tolerance.
+    TileMessage northern =
+        make_tile_prec("10u", 3, 2, 2.0, 0.0, 1.0, 1.0, sample_seam, 3);
+    TileMessage southern =
+        make_tile_prec("10u", 3, 2, 1.0, 0.0, 1.0, 1.0, sample_seam, 3);
+    for (double& value : southern.values) {
+        value += 0.5;
+    }
+    const MosaicFixture fixture({
+        northern,
+        southern,
+        make_tile_prec("10v", 3, 3, 2.0, 0.0, 1.0, 1.0, sample_seam, 3),
+    });
+
+    const auto weather = sailroute::WeatherDataset::load(fixture.path());
+    REQUIRE(!weather.has_value());
+    REQUIRE(weather.error().code == sailroute::ErrorCode::grib_decode);
 }
 
 TEST_CASE("weather rejects tiles that conflict where they overlap") {
