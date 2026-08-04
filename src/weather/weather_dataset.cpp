@@ -856,7 +856,7 @@ struct CropWindow {
 /// single regular_ll field. A lone tile is returned unchanged (fast path).
 /// Compatible tiles are validated for shared resolution and lattice alignment,
 /// assembled into their union grid, deduplicated across shared edges, and
-/// rejected when they leave gaps, conflict, or exceed a single hemisphere arc.
+/// rejected when they leave gaps, conflict, or exceed a full circle of longitude.
 [[nodiscard]] Result<DecodedField> assemble_component(
     std::vector<DecodedField> tiles,
     WindComponent component) {
@@ -949,7 +949,7 @@ struct CropWindow {
                 " wind tiles overlap the antimeridian ambiguously; mosaic exceeds a full circle"};
     }
     if (!longitude_is_periodic &&
-        static_cast<double>(union_columns) * longitude_step >
+        static_cast<double>(union_columns - 1) * longitude_step >
             kLongitudePeriod + 1.0e-6) {
         return Error{
             ErrorCode::unsupported_grib,
