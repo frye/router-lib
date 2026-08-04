@@ -1,6 +1,7 @@
 #include "routing/lattice_solver.hpp"
 
 #include "routing/geodesy.hpp"
+#include "routing/environment_context.hpp"
 #include "routing/lattice.hpp"
 #include "routing/transition.hpp"
 
@@ -72,6 +73,7 @@ struct LaterQueueEntry {
 struct SearchOutcome {
     RouteResult result;
     LatticeRouteDiagnostics diagnostics;
+    EnvironmentDiagnostics environment;
 };
 
 std::vector<RoutePoint> reconstruct(
@@ -112,6 +114,7 @@ std::int64_t bucket_for(
 Result<SearchOutcome> search_lattice(
     const WeatherDataset& weather,
     const VesselPolar& polar,
+    const RoutingEnvironment& environment,
     const RouteRequest& request,
     TimePoint departure,
     DepartureSource departure_source,
@@ -151,12 +154,13 @@ Result<SearchOutcome> search_lattice(
             0.0,
             start_wind.value().speed_knots(),
             start_wind.value().direction_from_degrees(),
-            0.0});
+            0.0,
+            std::nullopt});
         result.completion = RouteCompletion::destination_reached;
         const LatticeRouteDiagnostics diagnostics{
             0U, 0U, 0U, 0U, 0U, 0U, lattice.subdivision_level(), false};
         result.lattice_diagnostics = diagnostics;
-        return SearchOutcome{std::move(result), diagnostics};
+        return SearchOutcome{std::move(result), diagnostics, {}};
     }
     const auto start_cell = lattice.nearest_cell(request.start);
     if (!start_cell.has_value()) {
@@ -174,7 +178,8 @@ Result<SearchOutcome> search_lattice(
             0.0,
             start_wind.value().speed_knots(),
             start_wind.value().direction_from_degrees(),
-            0.0},
+            0.0,
+            std::nullopt},
         no_label,
         0U});
     std::map<StateKey, LabelIndex> best{{labels.front().state, 0U}};
@@ -195,6 +200,7 @@ Result<SearchOutcome> search_lattice(
         0U});
 
     LatticeRouteDiagnostics diagnostics;
+    EnvironmentDiagnostics environment_diagnostics;
     diagnostics.queued_labels = 1U;
     diagnostics.subdivision_level = lattice.subdivision_level();
     RouteDiagnostics route_diagnostics;
@@ -259,6 +265,8 @@ Result<SearchOutcome> search_lattice(
                     weather,
                     polar,
                     request.options,
+                    environment,
+                    environment_diagnostics,
                     current.point,
                     current.state.board,
                     request.destination,
@@ -288,7 +296,8 @@ Result<SearchOutcome> search_lattice(
                 result.diagnostics = route_diagnostics;
                 result.completion = RouteCompletion::destination_reached;
                 result.lattice_diagnostics = diagnostics;
-                return SearchOutcome{std::move(result), diagnostics};
+                return SearchOutcome{
+                    std::move(result), diagnostics, environment_diagnostics};
             }
         }
 
@@ -310,6 +319,8 @@ Result<SearchOutcome> search_lattice(
                 weather,
                 polar,
                 request.options,
+                environment,
+                environment_diagnostics,
                 current.point,
                 current.state.board,
                 lattice.coordinate(target),
@@ -335,15 +346,36 @@ Result<SearchOutcome> search_lattice(
         const TimePoint wait_until =
             departure + bucket_width * next_bucket;
         if (wait_until > current.point.time && wait_until <= route_end) {
+            // Waiting still has to be legal: an exclusion zone can open around
+            // a stationary vessel, so the degenerate segment is checked too.
+            bool waiting_allowed = true;
+            if (environment.active()) {
+                const SegmentCheckResult waiting = check_segment_geometry(
+                    environment,
+                    current.point.position,
+                    current.point.time,
+                    current.point.position,
+                    wait_until,
+                    environment_diagnostics);
+                if (waiting.outcome == EnvironmentOutcome::failed) {
+                    return *waiting.error;
+                }
+                waiting_allowed =
+                    waiting.outcome == EnvironmentOutcome::accepted;
+            }
             RoutePoint waited = current.point;
             waited.time = wait_until;
             waited.boat_speed_knots = 0.0;
-            push_label(Label{
-                StateKey{current.state.cell, next_bucket, current.state.board},
-                std::move(waited),
-                entry.label,
-                next_ordinal++});
-            ++diagnostics.wait_transitions;
+            waited.environment.reset();
+            if (waiting_allowed) {
+                push_label(Label{
+                    StateKey{
+                        current.state.cell, next_bucket, current.state.board},
+                    std::move(waited),
+                    entry.label,
+                    next_ordinal++});
+                ++diagnostics.wait_transitions;
+            }
         }
 
         if (on_progress &&
@@ -397,7 +429,8 @@ Result<SearchOutcome> search_lattice(
         result.diagnostics = route_diagnostics;
         result.completion = RouteCompletion::forecast_exhausted;
         result.lattice_diagnostics = diagnostics;
-        return SearchOutcome{std::move(result), diagnostics};
+        return SearchOutcome{
+            std::move(result), diagnostics, environment_diagnostics};
     }
     return Error{
         ErrorCode::no_route,
@@ -427,6 +460,7 @@ std::vector<std::uint8_t> corridor_cells(
 Result<RouteResult> optimize_lattice_route(
     const WeatherDataset& weather,
     const VesselPolar& polar,
+    const RoutingEnvironment& environment,
     const RouteRequest& request,
     TimePoint departure,
     DepartureSource departure_source,
@@ -447,6 +481,7 @@ Result<RouteResult> optimize_lattice_route(
     auto incumbent = search_lattice(
         weather,
         polar,
+        environment,
         request,
         departure,
         departure_source,
@@ -460,6 +495,9 @@ Result<RouteResult> optimize_lattice_route(
 
     RouteResult result = std::move(incumbent.value().result);
     LatticeRouteDiagnostics cumulative = incumbent.value().diagnostics;
+    // Environmental work is counted for every search run, including refinement
+    // passes that were ultimately rejected, because it was genuinely performed.
+    EnvironmentDiagnostics environment_totals = incumbent.value().environment;
     for (std::size_t refinement = 1U;
          refinement <= request.options.lattice.refinement_levels;
          ++refinement) {
@@ -481,6 +519,7 @@ Result<RouteResult> optimize_lattice_route(
             auto refined = search_lattice(
                 weather,
                 polar,
+                environment,
                 request,
                 departure,
                 departure_source,
@@ -494,6 +533,7 @@ Result<RouteResult> optimize_lattice_route(
                 }
                 return refined.error();
             }
+            merge(environment_totals, refined.value().environment);
             const RouteResult& candidate = refined.value().result;
             if (candidate.completion == RouteCompletion::destination_reached &&
                 (result.completion != RouteCompletion::destination_reached ||
@@ -520,6 +560,10 @@ Result<RouteResult> optimize_lattice_route(
         }
     }
     result.lattice_diagnostics = cumulative;
+    if (environment.active()) {
+        result.environment_diagnostics = environment_totals;
+        result.environment = describe_environment(environment);
+    }
     return result;
 }
 

@@ -27,12 +27,19 @@ add_library(sailroute STATIC
     src/time.cpp
     src/weather/weather_dataset.cpp
     src/polar/vessel_polar.cpp
+    src/environment/environment.cpp
+    src/environment/exclusions.cpp
+    src/environment/fields.cpp
+    src/environment/grid.cpp
+    src/environment/landmask.cpp
+    src/environment/spherical.cpp
     src/routing/contours.cpp
     src/routing/front.cpp
     src/routing/geodesy.cpp
     src/routing/intervals.cpp
     src/routing/lattice.cpp
     src/routing/lattice_solver.cpp
+    src/routing/environment_context.cpp
     src/routing/router.cpp
     src/routing/transition.cpp
     src/serialization/json.cpp
@@ -74,8 +81,12 @@ if(SAILROUTE_BUILD_TESTS)
     add_executable(sailroute_tests
         tests/test_main.cpp
         tests/test_contours.cpp
+        tests/test_environment.cpp
+        tests/test_exclusions.cpp
         tests/test_front.cpp
+        tests/test_landmask.cpp
         tests/test_lattice.cpp
+        tests/test_physics_routing.cpp
         tests/test_polar.cpp
         tests/test_routing.cpp
         tests/test_serialization.cpp

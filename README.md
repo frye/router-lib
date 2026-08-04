@@ -7,9 +7,13 @@ provides deterministic isochrone-beam and time-dependent geodesic-lattice
 routing.
 
 > [!WARNING]
-> The MVP does not model land, shorelines, currents, waves, traffic, restricted
-> areas, or safety limits. Routes may cross land. The built-in polar is an
-> approximate demonstration model, not navigation-certified data.
+> Currents, sea state, land avoidance, and exclusion zones are opt-in and must
+> be configured with providers the application supplies; see
+> [Environmental physics](#environmental-physics). With none configured, the
+> library does not model land, shorelines, currents, waves, traffic, restricted
+> areas, or safety limits, and routes may cross land. It never models traffic or
+> bathymetry. The built-in polar and the built-in sea-state derating model are
+> approximate demonstration models, not navigation-certified data.
 
 ## Supported MVP data
 
@@ -17,6 +21,8 @@ routing.
 - Paired 10-metre U/V wind fields at one or more valid forecast times
 - CSV matrix and common Expedition-style `.pol` vessel polars
 - UTC departure timestamps formatted as `YYYY-MM-DDTHH:MM:SSZ`
+- In-memory current, sea-state, landmask, and exclusion-zone providers supplied
+  by the application; no environmental file formats are read
 
 An explicit departure outside forecast coverage is rejected. If departure is
 omitted, the library uses current UTC time when it can be interpolated from the
@@ -223,7 +229,8 @@ failures. Exceptions thrown by application callbacks are not caught.
 Error categories distinguish invalid arguments, file I/O, GRIB decoding and
 support, incomplete forecasts, invalid polars, coordinates or departures
 outside forecast coverage, unavailable routes, exhausted forecasts, output
-failures, and callback cancellation.
+failures, callback cancellation, contradictory environment configuration, and
+unavailable environmental data.
 
 ### Weather and polar data
 
@@ -291,6 +298,11 @@ the following `RoutingOptions`:
 | `capture_isochrones` | `false` | Retain every completed frontier in `RouteResult` |
 | `progress` | every step, points + route | View callback cadence and payload selection |
 | `segment_eligibility` | empty | Optional synchronous candidate predicate |
+
+Currents, sea state, land, and exclusion zones are configured on the `Router`
+rather than per request, because they are immutable data reusable across
+optimizations in the same way weather and polars are. See
+[Environmental physics](#environmental-physics).
 
 #### Time-dependent lattice solver
 
@@ -522,6 +534,204 @@ cmake --build build
 ./build/sailroute_benchmarks samples/sample.grib
 ```
 
+### Environmental physics
+
+Currents, sea state, land, and time-varying exclusion zones are optional. A
+`Router` built without a `RoutingEnvironment`, or with one that configures no
+provider, evaluates exactly the arithmetic it evaluated before these providers
+existed, down to the last bit of every route point, diagnostic counter, and
+serialized value.
+
+```cpp
+sailroute::RoutingEnvironment environment;
+environment.currents.provider =
+    sailroute::make_uniform_current_provider(
+        {.east_knots = 0.8, .north_knots = -0.2},
+        {"gulf_stream_climatology", "internal dataset", "2026.07"})
+        .value();
+environment.waves.provider = my_wave_field;
+environment.waves.model = sailroute::make_wave_height_derating_model().value();
+environment.land.landmask = my_landmask;
+environment.land.clearance_nautical_miles = 2.0;
+environment.exclusions.zones = my_zones;
+
+sailroute::Router router{
+    std::move(weather.value()),
+    sailroute::VesselPolar::default_racer_cruiser_45ft(),
+    std::move(environment)};
+```
+
+Providers are supplied programmatically. The library ships deterministic
+in-memory fields — uniform values and bilinearly interpolated regular grids —
+so applications and tests can configure physics without any external dataset.
+File-format adapters for current and wave GRIB, landmask rasters, and exclusion
+records are deliberately not part of this stage; see
+[Deferred work](#deferred-work).
+
+#### Units and reference frames
+
+| Quantity | Units | Convention |
+| --- | --- | --- |
+| Current | knots, east/north components | Vector points where the water flows *to* |
+| Significant wave height | metres | — |
+| Wave period | seconds | Representative or peak period |
+| Wave direction | degrees true | Direction the waves come *from*, as for wind |
+| Signed land distance | nautical miles | Positive over water, negative over land |
+| Relative wave angle | degrees | 0 is a following sea, 180 a head sea |
+
+`RoutePoint::heading_degrees` and `RoutePoint::boat_speed_knots` stay
+water-relative whatever is configured, because that is the frame the polar and
+the apparent wind are defined in. Ground motion lives in the optional
+`RoutePoint::environment` audit record.
+
+#### Transition evaluation order
+
+Every transition, in both solvers, is evaluated in this fixed order:
+
+1. sample the configured current and wave fields at the position and time;
+2. evaluate true wind, polar speed, board, and maneuver delay in the water
+   frame;
+3. apply the sea-state model to the flat-water polar speed;
+4. translate the water-frame velocity into ground velocity using the current;
+5. derive ground position, arrival-radius crossing, and cumulative ground
+   distance;
+6. certify the segment against the landmask, then against active exclusion
+   zones;
+7. invoke the caller's `segment_eligibility` callback.
+
+Land and exclusion rejection therefore happens strictly before retention,
+progress output, and the caller callback. A rejected transition is never
+visible to an application.
+
+The two solvers differ only in what is held fixed. The isochrone beam fixes the
+water heading and lets the current decide where the candidate lands. The
+time-dependent lattice fixes the ground target, so it solves for the water
+heading whose ground track reaches that target: the cross-track current is
+cancelled by a heading offset and the along-track component is added to ground
+speed. Because the through-water speed itself depends on the heading, that
+solve is a bounded, deterministic fixed-point iteration rather than a single
+step, and a cross-track current stronger than the vessel makes the transition
+infeasible instead of merely slow.
+
+Set `RoutingEnvironment::sampling` to `EnvironmentSampling::midpoint` to sample
+the environment a second time at the provisional segment midpoint, matching
+what `WindSampling::midpoint` does for wind.
+
+#### Missing data
+
+Each provider carries a `MissingDataPolicy`. `fail_route` fails the whole
+optimization with `ErrorCode::environment_data_unavailable`; `reject_transition`
+drops the affected transition as if it were infeasible. There is no third
+option, and in particular missing data is never reinterpreted as zero current,
+a calm sea, or open water. A provider that reports `available` while returning a
+non-finite or out-of-range value is treated as invalid data, not as a value.
+
+`fail_route` is the default because silently narrowing a search is worse than
+stopping. It does mean a bounded field fails as soon as the search fans outside
+it, so a provider whose coverage is smaller than the search area normally wants
+`reject_transition`.
+
+#### Sea-state derating
+
+`SeaStatePerformanceModel` is an interface, not a formula. It receives the
+flat-water polar speed together with the water-frame wind and wave state and
+returns a derated through-water speed. The router validates that result: it
+must be finite, non-negative, and no greater than the flat-water speed. A model
+that accelerates the vessel in waves fails the optimization with
+`ErrorCode::invalid_environment` rather than being silently clamped, because
+that is a configuration fault.
+
+`make_wave_height_derating_model()` supplies a documented, bounded default: the
+loss grows with significant wave height, scales between a following and a head
+sea through the cosine of the relative wave angle, optionally sharpens for short
+steep seas, and saturates at a configured maximum. Its coefficients are
+approximate demonstration values, not a validated seakeeping prediction. Zero
+wave height returns the flat-water speed exactly, so a calm-sea field reproduces
+the flat-water route bit for bit.
+
+#### Signed-distance landmask
+
+`SignedDistanceLandmask` holds signed distance to the nearest coastline on a
+regular grid, positive over water and negative over land, and interpolates it
+bilinearly. It declares its own node spacing and an upper bound on its
+interpolation error; that error is added to the configured clearance before any
+decision, so a coarse mask can never round toward accepting land.
+
+Segment certification uses the defining property of a distance field: it is
+1-Lipschitz along a path, so no point on a segment of length `L` whose endpoints
+sit at signed distances `a` and `b` can be nearer land than `(a + b - L) / 2`.
+When that bound already clears the requirement the whole segment is certified
+from two samples. Otherwise the segment is halved and each half is certified
+recursively up to `maximum_subdivision_depth`. Running out of depth rejects the
+segment, so two water endpoints can never hide a crossing between them. Leaving
+the mask is reported as `outside_coverage` and handled by the configured policy
+rather than assumed to be open water.
+
+#### Time-varying exclusion zones
+
+`ExclusionZoneSet` takes versioned records with a stable identifier, source
+attribution, a revision, an optional half-open `[active_from, active_until)`
+activation window, and one or more polygons with holes. Rings are closed
+implicitly, are made of great-circle arcs, and need no special encoding for the
+antimeridian or the poles, because every test runs in earth-centred Cartesian
+coordinates. A ring's interior is the side of it that does not contain the
+region outside its bounding cap, which is what makes a ring drawn along a
+parallel — an Antarctic Exclusion Zone, say — enclose the polar cap it is meant
+to.
+
+Construction validates topology and rejects rings with fewer than three distinct
+vertices, coordinates outside canonical bounds, holes that escape their outer
+ring, duplicate identifier and revision pairs, inverted activation windows, and
+rings so large that their interior is ambiguous. Zones are then sorted by
+identifier and revision, so input order cannot change a route, a diagnostic, or
+the identifier reported for a rejection.
+
+A segment is tested only over the part of its traversal during which a zone is
+actually active: the activation window is clipped against the traversal interval
+and converted to a fraction of the segment. A zone that opens midway through a
+leg constrains only the part still to be sailed. `ExclusionBoundaryPolicy`
+decides whether touching a boundary counts as entering: `boundary_excluded`, the
+default, treats contact as a violation, while `boundary_allowed` requires some
+point of the segment to be strictly inside, which lets a route run along a
+shared boundary between adjacent zones.
+
+Waiting is checked too. The lattice solver's wait transitions are tested as
+degenerate segments, so a vessel cannot legally sit still inside a zone that
+opens around it.
+
+The spatial index is a precomputed bounding cap per zone, compared against the
+segment's own cap with a dot product. Cost is therefore linear in zone count but
+with a very small constant; the benchmark reports the scaling directly.
+
+#### Audit output
+
+When an environment is configured, `RouteResult::environment` records the
+sources, model names, policies, landmask resolution and clearance, and exclusion
+revision that were actually applied, and `RouteResult::environment_diagnostics`
+counts samples, evaluations, checks, and rejections per provider. The counters
+are sums, so they are identical for any worker count. Each affected
+`RoutePoint` carries an optional `RoutePointEnvironment` with speed and course
+over ground, the applied current, the flat-water polar speed before derating,
+and the applied sea state.
+
+All of this is additive. With no environment configured every existing JSON key,
+GPX element, and diagnostic value is unchanged, and the new ones are absent
+rather than empty.
+
+#### Cost
+
+Providers are sampled from the isochrone solver's worker threads, so every
+provider must be immutable after construction and safe for concurrent sampling.
+Provider input order and worker count cannot affect route selection or
+diagnostics.
+
+`sailroute_benchmarks` reports the no-provider baseline, each provider
+individually, exclusion scaling, and all providers combined, with arrival deltas
+and per-provider counters. Carrying the optional per-point audit record costs
+roughly five percent on the no-provider isochrone path, because it widens every
+candidate in the search array; that is the only measurable cost of Stage 3 when
+nothing is configured, and route results remain bit-identical.
+
 ### Known limitations
 
 The search is a forward beam. Pruning freezes each surviving candidate's parent
@@ -572,6 +782,12 @@ appended in a fixed order after the heading grid, maneuver penalties and
 midpoint sampling are pure functions of the candidate and the forecast, and both
 pruning strategies sort their retained set by expansion ordinal. Every
 configuration therefore produces identical results for any `worker_count`.
+
+Built-in landmask and exclusion checks compose in front of this callback rather
+than replacing it. They run first, so the callback is only ever shown segments
+that already cleared them, and it retains full veto power over the rest. Its
+thread, ordering, lifetime, cancellation, and exception behavior are unchanged
+by any provider configuration.
 
 The `RouteSegmentView` and its references are valid only until the callback
 returns. Eligibility runs serially for every generated candidate, so predicates
@@ -664,6 +880,11 @@ data as `ErrorCode::output_error`; callers are responsible for writing files.
 | `isochrones_to_json` | GeoJSON `FeatureCollection` of display contours |
 | `isochrones_to_gpx` | GPX 1.1 track per isochrone and segment per component |
 
+`route_to_json` and `route_to_gpx` add an environment block, environment
+diagnostics, and per-point audit values only when a Stage 3 environment was
+configured; with none, their output is byte-for-byte what it was before those
+providers existed.
+
 Isochrone serializers operate on `RouteResult::isochrones`; set
 `capture_isochrones` before routing or the output collection is empty.
 `parse_utc_time()` accepts exactly `YYYY-MM-DDTHH:MM:SSZ`, and
@@ -716,15 +937,11 @@ rerouting, and it removes the limitation described under
 
 ### Physics
 
-- **Currents**, in the correct frames. The boat sails in the water frame and
-  translates in the ground frame, and apparent wind is generated relative to the
-  water. Adding current to speed over ground is a common and material error.
-- **Sea-state-derated polars**, as a function of wind speed, wind angle,
-  significant wave height, period, and wave direction. Upwind in a seaway the
-  loss against a flat-water polar is first-order offshore.
-- **Land and exclusion zones**: a precomputed signed-distance landmask for O(1)
-  segment rejection, and time-varying exclusion polygons such as an Antarctic
-  Exclusion Zone. Today this is the caller's job via `segment_eligibility`.
+Implemented and documented under
+[Environmental physics](#environmental-physics): currents in the correct water
+and ground frames, replaceable sea-state derating, a signed-distance landmask
+with conservative segment certification, and time-varying exclusion polygons.
+What remains is listed under [Deferred work](#deferred-work).
 
 ### Ensemble and risk-adjusted routing
 
@@ -740,6 +957,25 @@ Remove lattice discretization error with direct collocation or multiple
 shooting, or apply the Zermelo steering law from Pontryagin's Minimum Principle.
 Run on a rolling horizon, warm-started from the previous solution each forecast
 cycle.
+
+## Deferred work
+
+The physics stage deliberately stops at programmatic providers. The following
+are explicit follow-ups rather than omissions:
+
+- **Format adapters.** Current and wave GRIB decoding, landmask raster loading,
+  and exclusion-record parsing. The sampling interfaces are separate from
+  loading precisely so adapters can be added without changing the physics.
+- **Remote data acquisition** for any environmental field.
+- **CLI configuration.** The CLI takes no environment options, because there are
+  no file formats to point them at yet. CLI routes remain the no-provider
+  compatibility path, while serialization already emits the audit output for
+  programmatically configured routes.
+- **Time-varying currents and waves.** The provider interfaces already take a
+  time, and the in-memory fields ignore it; time-dependent fields are an
+  implementation detail of a future adapter.
+- **Downstream bridge adoption.** Native and managed integration of the Stage 3
+  audit fields.
 
 ## Portability
 
