@@ -224,8 +224,8 @@ enum class EnvironmentSampling {
 
 /// Optional per-point audit of the environment applied to reach a route point.
 ///
-/// Present only when a Stage 3 environment was configured. It records what the
-/// route point's own fields cannot: `RoutePoint::heading_degrees` and
+/// Present only when current or wave data was applied. It records what the route
+/// point's own fields cannot: `RoutePoint::heading_degrees` and
 /// `RoutePoint::boat_speed_knots` stay water-relative, so the ground track is
 /// only recoverable from the values below.
 struct RoutePointEnvironment {
@@ -244,6 +244,9 @@ struct RoutePointEnvironment {
     /// Angle between the water-frame heading and the direction the waves
     /// travel toward: 0 is a following sea and 180 a head sea.
     double relative_wave_angle_degrees{};
+    /// Identify which optional components supplied the values above.
+    bool current_applied{};
+    bool wave_applied{};
 };
 
 /// One timestamped point in a selected or provisional route.

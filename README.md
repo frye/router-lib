@@ -712,7 +712,8 @@ counts samples, evaluations, checks, and rejections per provider. The counters
 are sums, so they are identical for any worker count. Each affected
 `RoutePoint` carries an optional `RoutePointEnvironment` with speed and course
 over ground, the applied current, the flat-water polar speed before derating,
-and the applied sea state.
+and/or the applied sea state, with presence flags distinguishing configured
+components from zero-valued samples.
 
 All of this is additive. With no environment configured every existing JSON key,
 GPX element, and diagnostic value is unchanged, and the new ones are absent

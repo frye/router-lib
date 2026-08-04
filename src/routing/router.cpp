@@ -852,6 +852,8 @@ void expand_candidate_range(
                     wave.significant_height_metres;
                 audit.wave_period_seconds = wave.peak_period_seconds;
                 audit.relative_wave_angle_degrees = relative_wave_angle;
+                audit.current_applied = has_current;
+                audit.wave_applied = has_wave;
                 candidate.point.environment = audit;
             }
 

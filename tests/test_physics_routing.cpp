@@ -311,6 +311,11 @@ TEST_CASE("zero current is exactly equivalent to configuring no current") {
         REQUIRE(actual.environment_diagnostics.has_value());
         REQUIRE(actual.environment_diagnostics->current_samples > 0U);
         REQUIRE(actual.environment_diagnostics->current_rejections == 0U);
+        for (std::size_t index = 1U; index < actual.points.size(); ++index) {
+            REQUIRE(actual.points[index].environment.has_value());
+            REQUIRE(actual.points[index].environment->current_applied);
+            REQUIRE(!actual.points[index].environment->wave_applied);
+        }
     }
 }
 
@@ -853,6 +858,9 @@ TEST_CASE("serialization adds environment data only when it exists") {
     REQUIRE(
         plain_gpx.value().find("sailroute:speedOverGroundKnots") ==
         std::string::npos);
+    REQUIRE(
+        plain_gpx.value().find("sailroute:currentSamples") ==
+        std::string::npos);
 
     RoutingEnvironment environment =
         current_environment(CurrentVector{1.0, 0.5});
@@ -869,6 +877,9 @@ TEST_CASE("serialization adds environment data only when it exists") {
     REQUIRE(json.value().find("\"boundary_excluded\"") != std::string::npos);
     REQUIRE(json.value().find("\"speedOverGroundKnots\"") != std::string::npos);
     REQUIRE(json.value().find("\"waveProvider\":null") != std::string::npos);
+    REQUIRE(
+        json.value().find("\"significantWaveHeightMetres\"") ==
+        std::string::npos);
 
     const auto gpx = sailroute::route_to_gpx(with);
     REQUIRE(gpx.has_value());
@@ -878,6 +889,11 @@ TEST_CASE("serialization adds environment data only when it exists") {
         std::string::npos);
     REQUIRE(gpx.value().find("sailroute:speedOverGroundKnots") != std::string::npos);
     REQUIRE(gpx.value().find("sailroute:exclusionZoneCount") != std::string::npos);
+    REQUIRE(gpx.value().find("sailroute:currentSamples") != std::string::npos);
+    REQUIRE(gpx.value().find("sailroute:exclusionChecks") != std::string::npos);
+    REQUIRE(
+        gpx.value().find("sailroute:significantWaveHeightMetres") ==
+        std::string::npos);
     REQUIRE(
         gpx.value().find("sailroute:landClearanceNauticalMiles") ==
         std::string::npos);

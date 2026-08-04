@@ -328,6 +328,8 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
         audit.wave_period_seconds = applied.wave.peak_period_seconds;
         audit.relative_wave_angle_degrees =
             solution->relative_wave_angle_degrees;
+        audit.current_applied = applied.has_current;
+        audit.wave_applied = applied.has_wave;
         point.environment = audit;
     }
     if (options.segment_eligibility &&

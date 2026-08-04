@@ -303,6 +303,7 @@ TEST_CASE("serialization rejects non-finite route values") {
 
     route = sample_route();
     route.points.front().environment = sailroute::RoutePointEnvironment{};
+    route.points.front().environment->current_applied = true;
     route.points.front().environment->current_east_knots =
         std::numeric_limits<double>::infinity();
     const auto current_json = sailroute::route_to_json(route);

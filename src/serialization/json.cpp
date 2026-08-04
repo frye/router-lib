@@ -46,23 +46,27 @@ Result<std::string> validate_environment_numbers(const RoutePoint& point) {
     if (!std::isfinite(environment.course_over_ground_degrees)) {
         return invalid_numeric_value("course_over_ground_degrees");
     }
-    if (!std::isfinite(environment.current_east_knots)) {
-        return invalid_numeric_value("current_east_knots");
-    }
-    if (!std::isfinite(environment.current_north_knots)) {
-        return invalid_numeric_value("current_north_knots");
+    if (environment.current_applied) {
+        if (!std::isfinite(environment.current_east_knots)) {
+            return invalid_numeric_value("current_east_knots");
+        }
+        if (!std::isfinite(environment.current_north_knots)) {
+            return invalid_numeric_value("current_north_knots");
+        }
     }
     if (!std::isfinite(environment.flat_water_speed_knots)) {
         return invalid_numeric_value("flat_water_speed_knots");
     }
-    if (!std::isfinite(environment.significant_wave_height_metres)) {
-        return invalid_numeric_value("significant_wave_height_metres");
-    }
-    if (!std::isfinite(environment.wave_period_seconds)) {
-        return invalid_numeric_value("wave_period_seconds");
-    }
-    if (!std::isfinite(environment.relative_wave_angle_degrees)) {
-        return invalid_numeric_value("relative_wave_angle_degrees");
+    if (environment.wave_applied) {
+        if (!std::isfinite(environment.significant_wave_height_metres)) {
+            return invalid_numeric_value("significant_wave_height_metres");
+        }
+        if (!std::isfinite(environment.wave_period_seconds)) {
+            return invalid_numeric_value("wave_period_seconds");
+        }
+        if (!std::isfinite(environment.relative_wave_angle_degrees)) {
+            return invalid_numeric_value("relative_wave_angle_degrees");
+        }
     }
     return std::string{};
 }
@@ -312,24 +316,28 @@ Result<std::string> route_to_json(const RouteResult& route) {
             output.append(",\"courseOverGroundDegrees\":");
             serialization_detail::append_number(
                 output, environment.course_over_ground_degrees);
-            output.append(",\"currentEastKnots\":");
-            serialization_detail::append_number(
-                output, environment.current_east_knots);
-            output.append(",\"currentNorthKnots\":");
-            serialization_detail::append_number(
-                output, environment.current_north_knots);
+            if (environment.current_applied) {
+                output.append(",\"currentEastKnots\":");
+                serialization_detail::append_number(
+                    output, environment.current_east_knots);
+                output.append(",\"currentNorthKnots\":");
+                serialization_detail::append_number(
+                    output, environment.current_north_knots);
+            }
             output.append(",\"flatWaterSpeedKnots\":");
             serialization_detail::append_number(
                 output, environment.flat_water_speed_knots);
-            output.append(",\"significantWaveHeightMetres\":");
-            serialization_detail::append_number(
-                output, environment.significant_wave_height_metres);
-            output.append(",\"wavePeriodSeconds\":");
-            serialization_detail::append_number(
-                output, environment.wave_period_seconds);
-            output.append(",\"relativeWaveAngleDegrees\":");
-            serialization_detail::append_number(
-                output, environment.relative_wave_angle_degrees);
+            if (environment.wave_applied) {
+                output.append(",\"significantWaveHeightMetres\":");
+                serialization_detail::append_number(
+                    output, environment.significant_wave_height_metres);
+                output.append(",\"wavePeriodSeconds\":");
+                serialization_detail::append_number(
+                    output, environment.wave_period_seconds);
+                output.append(",\"relativeWaveAngleDegrees\":");
+                serialization_detail::append_number(
+                    output, environment.relative_wave_angle_degrees);
+            }
             output.push_back('}');
         }
         output.push_back('}');
