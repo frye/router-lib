@@ -61,7 +61,6 @@ void print_help(std::ostream& output) {
         "  --max-nodes-per-bucket N            Nodes retained per bucket (> 0)\n"
         "  --tack-penalty-seconds N            Time lost to a tack (default 0)\n"
         "  --gybe-penalty-seconds N            Time lost to a gybe (default 0)\n"
-        "  --upwind-twa-degrees N              Upwind TWA threshold (default 90)\n"
         "  --downwind-twa-degrees N            Downwind TWA threshold (default 150)\n"
         "  --heading-augmentation MODE         none|destination-bearing|vmg|both\n"
         "  --wind-sampling MODE                segment-start|midpoint\n"
@@ -257,7 +256,6 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
     bool minimum_speed_seen = false;
     bool tack_penalty_seen = false;
     bool gybe_penalty_seen = false;
-    bool upwind_threshold_seen = false;
     bool downwind_threshold_seen = false;
     bool heading_augmentation_seen = false;
     bool wind_sampling_seen = false;
@@ -532,13 +530,9 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
             } else {
                 options.routing.maneuver.gybe_penalty = penalty;
             }
-        } else if (
-            argument == "--upwind-twa-degrees" ||
-            argument == "--downwind-twa-degrees") {
-            const bool is_upwind = argument == "--upwind-twa-degrees";
-            if (const auto duplicate = reject_duplicate(
-                    is_upwind ? upwind_threshold_seen : downwind_threshold_seen,
-                    argument)) {
+        } else if (argument == "--downwind-twa-degrees") {
+            if (const auto duplicate =
+                    reject_duplicate(downwind_threshold_seen, argument)) {
                 return *duplicate;
             }
             auto value = value_after(argument);
@@ -550,11 +544,7 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
                 parsed > 180.0) {
                 return usage_error(std::string{argument} + " must be in [0,180]");
             }
-            if (is_upwind) {
-                options.routing.maneuver.upwind_true_wind_angle_degrees = parsed;
-            } else {
-                options.routing.maneuver.downwind_true_wind_angle_degrees = parsed;
-            }
+            options.routing.maneuver.downwind_true_wind_angle_degrees = parsed;
         } else if (argument == "--heading-augmentation") {
             if (const auto duplicate =
                     reject_duplicate(heading_augmentation_seen, argument)) {

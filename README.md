@@ -109,7 +109,6 @@ the behavior described above:
 | --- | --- |
 | `--tack-penalty-seconds N` | non-negative integer, default `0` |
 | `--gybe-penalty-seconds N` | non-negative integer, default `0` |
-| `--upwind-twa-degrees N` | `[0,180]`, default `90` |
 | `--downwind-twa-degrees N` | `[0,180]`, default `150` |
 | `--heading-augmentation MODE` | `none`, `destination-bearing`, `vmg`, `both` |
 | `--wind-sampling MODE` | `segment-start`, `midpoint` |
@@ -299,7 +298,6 @@ leaves routes bit-identical.
 | --- | --- | --- |
 | `maneuver.tack_penalty` | `0s` | Time lost to a tack, deducted from the step |
 | `maneuver.gybe_penalty` | `0s` | Time lost to a gybe, deducted from the step |
-| `maneuver.upwind_true_wind_angle_degrees` | `90` | At or below this a board change is a tack |
 | `maneuver.downwind_true_wind_angle_degrees` | `150` | At or above this a board change is a gybe |
 | `heading_augmentation` | `none` | Extra headings beyond the fixed grid |
 | `wind_sampling` | `segment_start` | Where along a step wind is sampled |
@@ -350,9 +348,9 @@ A candidate's board is the sign of its heading relative to the wind direction;
 dead upwind and dead downwind count as neither board and are never penalized.
 The maneuver is classified by the mean of the parent and candidate true wind
 angles: at or above `downwind_true_wind_angle_degrees` it is a gybe, otherwise
-it is a tack, so a board change between the two thresholds is charged as a
-tack. The penalty is deducted from the usable step time before any distance is
-made, and a penalty at least as long as the step removes the candidate.
+it is a tack. The penalty is deducted from the usable step time before any
+distance is made, and a penalty at least as long as the step removes the
+candidate.
 
 Activating penalties also splits each pruning bucket by board, so a candidate
 on the favorable tack is no longer displaced by a marginally closer one on the

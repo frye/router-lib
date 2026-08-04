@@ -140,6 +140,10 @@ if(SAILROUTE_BUILD_TESTS)
         --start 0,0
         --destination 0,1
         --routing-intervals 5m@10m,)
+    add_cli_failure_test(
+        sailroute_cli_removed_upwind_twa
+        "unknown option: --upwind-twa-degrees"
+        --upwind-twa-degrees 90)
     set_tests_properties(
         sailroute_cli_help
         PROPERTIES PASS_REGULAR_EXPRESSION "--routing-intervals SPEC")

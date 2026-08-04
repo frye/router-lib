@@ -182,11 +182,8 @@ enum class RouteCompletion {
 struct ManeuverPenalties {
     std::chrono::seconds tack_penalty{0};
     std::chrono::seconds gybe_penalty{0};
-    /// A true wind angle at or below this counts as upwind, so a board change
-    /// is a tack.
-    double upwind_true_wind_angle_degrees{90.0};
     /// A true wind angle at or above this counts as downwind, so a board change
-    /// is a gybe. Between the two thresholds a board change is charged as a tack.
+    /// is a gybe. At smaller angles a board change is charged as a tack.
     double downwind_true_wind_angle_degrees{150.0};
 
     [[nodiscard]] bool active() const noexcept {
