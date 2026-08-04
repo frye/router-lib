@@ -88,6 +88,13 @@ if(SAILROUTE_BUILD_TESTS)
         sailroute_tests
         PRIVATE SAILROUTE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 
+    add_executable(
+        sailroute_compatibility_corpus
+        tests/compatibility_corpus.cpp)
+    target_link_libraries(
+        sailroute_compatibility_corpus
+        PRIVATE sailroute::sailroute ECCODES::eccodes)
+
     function(add_cli_failure_test test_name expected_output)
         add_test(
             NAME ${test_name}
@@ -101,6 +108,14 @@ if(SAILROUTE_BUILD_TESTS)
     endfunction()
 
     add_test(NAME sailroute_tests COMMAND sailroute_tests)
+    add_test(
+        NAME sailroute_v032_compatibility
+        COMMAND
+            ${CMAKE_COMMAND}
+            "-DCOMMAND_PATH=$<TARGET_FILE:sailroute_compatibility_corpus>"
+            "-DEXPECTED_FILE=${CMAKE_CURRENT_SOURCE_DIR}/tests/compatibility/v0.3.2.txt"
+            -P
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompareCommandOutput.cmake")
     add_test(NAME sailroute_cli_help COMMAND sailroute_cli --help)
     add_cli_failure_test(
         sailroute_cli_custom_intervals
@@ -162,6 +177,17 @@ if(SAILROUTE_BUILD_TESTS)
 endif()
 
 if(SAILROUTE_BUILD_BENCHMARKS)
+    execute_process(
+        COMMAND git rev-parse HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE sailroute_git_result
+        OUTPUT_VARIABLE sailroute_git_revision
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+    if(NOT sailroute_git_result EQUAL 0)
+        set(sailroute_git_revision "unknown")
+    endif()
+
     add_executable(sailroute_benchmarks
         benchmarks/benchmark_main.cpp
         benchmarks/lattice_comparison.cpp
@@ -170,6 +196,14 @@ if(SAILROUTE_BUILD_BENCHMARKS)
     target_include_directories(
         sailroute_benchmarks
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(
+        sailroute_benchmarks
+        PRIVATE
+            SAILROUTE_BASELINE_REVISION="cd99342cdaeb6725639f6ae53a384db50b0e0ad0"
+            SAILROUTE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+            SAILROUTE_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+            SAILROUTE_SOURCE_REVISION="${sailroute_git_revision}"
+            SAILROUTE_SYSTEM="${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
 install(TARGETS sailroute sailroute_cli

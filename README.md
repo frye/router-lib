@@ -355,6 +355,40 @@ cmake --build build-bench --parallel
 For external peak-memory measurements, run the same command under
 `/usr/bin/time -l` on macOS or `/usr/bin/time -v` on Linux.
 
+### v0.3.2 compatibility corpus
+
+The offline compatibility corpus compiles against both the current tree and the
+immutable pre-Stage-2 baseline at
+`cd99342cdaeb6725639f6ae53a384db50b0e0ad0`. It creates deterministic regional
+and global GRIB fixtures locally and covers antimeridian and high-latitude
+routes, constant and scheduled intervals, accuracy controls, forecast
+exhaustion, cancellation, segment eligibility, progress ordering, and worker
+counts 1, 4, and automatic. CTest compares the complete route JSON, diagnostics,
+errors, progress sequence, and callback counts byte-for-byte with the committed
+v0.3.2 output:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build -R sailroute_v032_compatibility --output-on-failure
+```
+
+The golden output is generated only by compiling
+`tests/compatibility_corpus.cpp` unchanged against the v0.3.2 tag. A mismatch
+writes the candidate output to `build/compatibility-actual.txt`; do not replace
+the golden file to approve an intentional behavior change.
+
+The benchmark header records the candidate revision, compatibility baseline,
+build type, compiler, operating system/architecture, and hardware concurrency.
+Record the CPU model alongside published results with
+`sysctl -n machdep.cpu.brand_string` on macOS or `lscpu` on Linux. Measure the
+corpus peak resident memory independently with:
+
+```sh
+/usr/bin/time -l ./build/sailroute_compatibility_corpus  # macOS
+/usr/bin/time -v ./build/sailroute_compatibility_corpus  # Linux
+```
+
 The following accuracy controls are opt-in. Every default reproduces the search
 exactly as it behaved before these options existed, so enabling none of them
 leaves routes bit-identical.
