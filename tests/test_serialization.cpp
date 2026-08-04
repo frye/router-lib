@@ -101,6 +101,41 @@ TEST_CASE("JSON conditionally includes lattice diagnostics") {
         std::string::npos);
 }
 
+TEST_CASE("JSON omits details for unconfigured environment providers") {
+    auto route = sample_route();
+    route.environment = sailroute::RouteEnvironmentMetadata{};
+    route.environment->current_provider =
+        sailroute::ProviderMetadata{"current", "unit test", "1"};
+
+    const auto serialized = sailroute::route_to_json(route);
+    REQUIRE(serialized.has_value());
+    REQUIRE(
+        serialized.value().find("\"currentProvider\":{\"name\":\"current\"") !=
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"landmask\":null") != std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"exclusions\":null") != std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"landResolutionNauticalMiles\"") ==
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"landInterpolationErrorNauticalMiles\"") ==
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"landClearanceNauticalMiles\"") ==
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"exclusionBoundaryPolicy\"") ==
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"exclusionZoneCount\"") ==
+        std::string::npos);
+    REQUIRE(
+        serialized.value().find("\"exclusionRevision\"") ==
+        std::string::npos);
+}
+
 TEST_CASE("GPX serialization escapes XML and emits timestamped track points") {
     auto route = sample_route();
     route.points.front().position = {0.0000001, -0.0000001};

@@ -107,7 +107,8 @@ Result<std::string> validate_route_numbers(const RouteResult& route) {
             return environment.error();
         }
     }
-    if (route.environment.has_value()) {
+    if (route.environment.has_value() &&
+        route.environment->landmask.has_value()) {
         const RouteEnvironmentMetadata& environment = *route.environment;
         if (!std::isfinite(environment.land_resolution_nautical_miles)) {
             return invalid_numeric_value("land_resolution_nautical_miles");
@@ -237,22 +238,27 @@ Result<std::string> route_to_json(const RouteResult& route) {
         output.append(",\"exclusion\":");
         serialization_detail::append_json_string(
             output, to_string(environment.exclusion_policy));
-        output.append("},\"landResolutionNauticalMiles\":");
-        serialization_detail::append_number(
-            output, environment.land_resolution_nautical_miles);
-        output.append(",\"landInterpolationErrorNauticalMiles\":");
-        serialization_detail::append_number(
-            output, environment.land_interpolation_error_nautical_miles);
-        output.append(",\"landClearanceNauticalMiles\":");
-        serialization_detail::append_number(
-            output, environment.land_clearance_nautical_miles);
-        output.append(",\"exclusionBoundaryPolicy\":");
-        serialization_detail::append_json_string(
-            output, to_string(environment.exclusion_boundary_policy));
-        output.append(",\"exclusionZoneCount\":");
-        output.append(std::to_string(environment.exclusion_zone_count));
-        output.append(",\"exclusionRevision\":");
-        output.append(std::to_string(environment.exclusion_revision));
+        output.push_back('}');
+        if (environment.landmask.has_value()) {
+            output.append(",\"landResolutionNauticalMiles\":");
+            serialization_detail::append_number(
+                output, environment.land_resolution_nautical_miles);
+            output.append(",\"landInterpolationErrorNauticalMiles\":");
+            serialization_detail::append_number(
+                output, environment.land_interpolation_error_nautical_miles);
+            output.append(",\"landClearanceNauticalMiles\":");
+            serialization_detail::append_number(
+                output, environment.land_clearance_nautical_miles);
+        }
+        if (environment.exclusions.has_value()) {
+            output.append(",\"exclusionBoundaryPolicy\":");
+            serialization_detail::append_json_string(
+                output, to_string(environment.exclusion_boundary_policy));
+            output.append(",\"exclusionZoneCount\":");
+            output.append(std::to_string(environment.exclusion_zone_count));
+            output.append(",\"exclusionRevision\":");
+            output.append(std::to_string(environment.exclusion_revision));
+        }
         output.push_back('}');
     }
     output.append(",\n  \"points\":[");
