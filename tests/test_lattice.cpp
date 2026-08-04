@@ -1,4 +1,5 @@
 #include "routing/lattice.hpp"
+#include "routing/mixed_lattice.hpp"
 
 #include "test_support.hpp"
 
@@ -8,12 +9,20 @@
 #include <limits>
 #include <numbers>
 #include <numeric>
+#include <queue>
 #include <vector>
 
 namespace {
 
 using sailroute::Coordinate;
 using sailroute::detail::GeodesicLattice;
+using sailroute::detail::MixedResolutionLattice;
+
+sailroute::RoutePoint route_point(Coordinate coordinate) {
+    sailroute::RoutePoint point;
+    point.position = coordinate;
+    return point;
+}
 
 void require_reciprocal_sorted_neighbors(const GeodesicLattice& lattice) {
     for (GeodesicLattice::CellIndex cell = 0U; cell < lattice.vertex_count(); ++cell) {
@@ -26,6 +35,33 @@ void require_reciprocal_sorted_neighbors(const GeodesicLattice& lattice) {
             REQUIRE(std::binary_search(reverse.begin(), reverse.end(), cell));
         }
     }
+}
+
+void require_connected(const MixedResolutionLattice& lattice) {
+    std::vector<std::uint8_t> visited(lattice.vertex_count(), 0U);
+    std::queue<MixedResolutionLattice::CellIndex> pending;
+    visited[0U] = 1U;
+    pending.push(0U);
+    std::size_t count = 0U;
+    while (!pending.empty()) {
+        const auto cell = pending.front();
+        pending.pop();
+        ++count;
+        const auto adjacent = lattice.neighbors(cell);
+        REQUIRE(std::is_sorted(adjacent.begin(), adjacent.end()));
+        REQUIRE(
+            std::adjacent_find(adjacent.begin(), adjacent.end()) ==
+            adjacent.end());
+        for (const auto neighbor : adjacent) {
+            const auto reverse = lattice.neighbors(neighbor);
+            REQUIRE(std::binary_search(reverse.begin(), reverse.end(), cell));
+            if (!visited[neighbor]) {
+                visited[neighbor] = 1U;
+                pending.push(neighbor);
+            }
+        }
+    }
+    REQUIRE(count == lattice.vertex_count());
 }
 
 }  // namespace
@@ -200,4 +236,92 @@ TEST_CASE("geodesic lattice rejects excessive subdivision levels") {
         GeodesicLattice::maximum_subdivision_level + 1U);
     REQUIRE(!excessive.has_value());
     REQUIRE(excessive.error().code == sailroute::ErrorCode::invalid_argument);
+}
+
+TEST_CASE("route segment distance handles seams poles and short routes") {
+    const std::array antimeridian{
+        route_point({0.0, 179.0}),
+        route_point({0.0, -179.0})};
+    REQUIRE_NEAR(
+        sailroute::detail::distance_to_route_nautical_miles(
+            {0.0, 180.0}, antimeridian),
+        0.0,
+        1.0e-6);
+
+    const std::array polar{
+        route_point({80.0, -90.0}),
+        route_point({80.0, 90.0})};
+    REQUIRE_NEAR(
+        sailroute::detail::distance_to_route_nautical_miles(
+            {90.0, 0.0}, polar),
+        0.0,
+        1.0e-6);
+
+    const std::array short_route{route_point({12.0, 34.0})};
+    REQUIRE_NEAR(
+        sailroute::detail::distance_to_route_nautical_miles(
+            {12.0, 34.0}, short_route),
+        0.0,
+        1.0e-6);
+}
+
+TEST_CASE("mixed lattice is deterministic connected and hierarchy local") {
+    const std::array route{
+        route_point({0.0, 179.0}),
+        route_point({0.0, -179.0})};
+    const auto first = MixedResolutionLattice::create(2U, 2U, route, 120.0);
+    const auto repeated = MixedResolutionLattice::create(2U, 2U, route, 120.0);
+    const auto coarse = GeodesicLattice::create(2U);
+    const auto global_fine = GeodesicLattice::create(4U);
+    REQUIRE(first.has_value());
+    REQUIRE(repeated.has_value());
+    REQUIRE(coarse.has_value());
+    REQUIRE(global_fine.has_value());
+    REQUIRE(first.value().coarse_vertex_count() == coarse.value().vertex_count());
+    REQUIRE(first.value().vertex_count() > coarse.value().vertex_count());
+    REQUIRE(first.value().vertex_count() < global_fine.value().vertex_count());
+    REQUIRE(first.value().vertex_count() == repeated.value().vertex_count());
+    REQUIRE(first.value().leaf_face_count() == repeated.value().leaf_face_count());
+
+    for (std::size_t cell = 0U; cell < first.value().vertex_count(); ++cell) {
+        const Coordinate left = first.value().coordinate(cell);
+        const Coordinate right = repeated.value().coordinate(cell);
+        REQUIRE(left.latitude_degrees == right.latitude_degrees);
+        REQUIRE(left.longitude_degrees == right.longitude_degrees);
+        REQUIRE(std::equal(
+            first.value().neighbors(cell).begin(),
+            first.value().neighbors(cell).end(),
+            repeated.value().neighbors(cell).begin(),
+            repeated.value().neighbors(cell).end()));
+        REQUIRE(
+            first.value().maximum_neighbor_edge_length_nautical_miles(cell) >
+            0.0);
+    }
+    for (std::size_t cell = 0U; cell < coarse.value().vertex_count(); ++cell) {
+        REQUIRE(
+            first.value().coordinate(cell).latitude_degrees ==
+            coarse.value().coordinate(cell).latitude_degrees);
+        REQUIRE(
+            first.value().coordinate(cell).longitude_degrees ==
+            coarse.value().coordinate(cell).longitude_degrees);
+    }
+    require_connected(first.value());
+}
+
+TEST_CASE("mixed lattice active domain scales with corridor width") {
+    const std::array route{
+        route_point({70.0, -20.0}),
+        route_point({85.0, 160.0}),
+        route_point({70.0, 20.0})};
+    const auto narrow = MixedResolutionLattice::create(2U, 2U, route, 60.0);
+    const auto wide = MixedResolutionLattice::create(2U, 2U, route, 600.0);
+    const auto global_fine = GeodesicLattice::create(4U);
+    REQUIRE(narrow.has_value());
+    REQUIRE(wide.has_value());
+    REQUIRE(global_fine.has_value());
+    REQUIRE(
+        narrow.value().vertex_count() <= wide.value().vertex_count());
+    REQUIRE(wide.value().vertex_count() < global_fine.value().vertex_count());
+    require_connected(narrow.value());
+    require_connected(wide.value());
 }

@@ -12,6 +12,21 @@
 namespace sailroute {
 namespace {
 
+std::string_view fallback_reason_name(
+    LatticeRefinementFallbackReason reason) noexcept {
+    switch (reason) {
+        case LatticeRefinementFallbackReason::none:
+            return "none";
+        case LatticeRefinementFallbackReason::disconnected:
+            return "disconnected";
+        case LatticeRefinementFallbackReason::regressed:
+            return "regressed";
+        case LatticeRefinementFallbackReason::retry_exhausted:
+            return "retry_exhausted";
+    }
+    return "none";
+}
+
 void append_coordinate(std::string& output, Coordinate coordinate) {
     output.append("{\"latitude\":");
     serialization_detail::append_number(output, coordinate.latitude_degrees);
@@ -92,6 +107,13 @@ void append_provider(
 }
 
 Result<std::string> validate_route_numbers(const RouteResult& route) {
+    if (route.lattice_diagnostics.has_value() &&
+        !std::isfinite(
+            route.lattice_diagnostics
+                ->accepted_corridor_width_nautical_miles)) {
+        return invalid_numeric_value(
+            "accepted_corridor_width_nautical_miles");
+    }
     for (const RoutePoint& point : route.points) {
         if (!std::isfinite(point.position.latitude_degrees)) {
             return invalid_numeric_value("latitude");
@@ -209,6 +231,24 @@ Result<std::string> route_to_json(const RouteResult& route) {
         output.append(std::to_string(lattice.subdivision_level));
         output.append(",\"refinementFallback\":");
         output.append(lattice.refinement_fallback ? "true" : "false");
+        output.append(",\"reRelaxedLabels\":");
+        output.append(std::to_string(lattice.re_relaxed_labels));
+        output.append(",\"staleQueueEntries\":");
+        output.append(std::to_string(lattice.stale_queue_entries));
+        output.append(",\"activeCells\":");
+        output.append(std::to_string(lattice.active_cells));
+        output.append(",\"activeFaces\":");
+        output.append(std::to_string(lattice.active_faces));
+        output.append(",\"acceptedCorridorWidthNauticalMiles\":");
+        serialization_detail::append_number(
+            output, lattice.accepted_corridor_width_nautical_miles);
+        output.append(",\"disconnectedRefinements\":");
+        output.append(std::to_string(lattice.disconnected_refinements));
+        output.append(",\"regressedRefinements\":");
+        output.append(std::to_string(lattice.regressed_refinements));
+        output.append(",\"fallbackReason\":\"");
+        output.append(fallback_reason_name(lattice.fallback_reason));
+        output.push_back('"');
         output.push_back('}');
     }
     if (route.environment_diagnostics.has_value()) {

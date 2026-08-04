@@ -14,8 +14,24 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
+#ifndef SAILROUTE_BASELINE_REVISION
+#define SAILROUTE_BASELINE_REVISION "unknown"
+#endif
+#ifndef SAILROUTE_BUILD_TYPE
+#define SAILROUTE_BUILD_TYPE "unknown"
+#endif
+#ifndef SAILROUTE_COMPILER
+#define SAILROUTE_COMPILER "unknown"
+#endif
+#ifndef SAILROUTE_SOURCE_REVISION
+#define SAILROUTE_SOURCE_REVISION "unknown"
+#endif
+#ifndef SAILROUTE_SYSTEM
+#define SAILROUTE_SYSTEM "unknown"
+#endif
 
 namespace {
 
@@ -40,9 +56,12 @@ void benchmark_routing(
     }
     volatile std::size_t checksum = 0U;
     std::size_t delivered_updates = 0U;
+    std::vector<double> route_milliseconds;
+    route_milliseconds.reserve(iterations);
 
     const auto start = std::chrono::steady_clock::now();
     for (std::size_t index = 0U; index < iterations; ++index) {
+        const auto route_start = std::chrono::steady_clock::now();
         auto route = [&]() -> sailroute::Result<sailroute::RouteResult> {
             switch (progress_mode) {
                 case ProgressMode::none:
@@ -79,13 +98,25 @@ void benchmark_routing(
         }
         checksum = checksum + route.value().diagnostics.generated_candidates +
                    route.value().points.size();
+        route_milliseconds.push_back(std::chrono::duration<double, std::milli>(
+                                         std::chrono::steady_clock::now() -
+                                         route_start)
+                                         .count());
     }
     const double seconds = std::chrono::duration<double>(
                                std::chrono::steady_clock::now() - start)
                                .count();
+    std::ranges::sort(route_milliseconds);
+    const double minimum = route_milliseconds.front();
+    const double median = route_milliseconds[route_milliseconds.size() / 2U];
+    const double percentile_95 =
+        route_milliseconds[(route_milliseconds.size() * 95U + 99U) / 100U - 1U];
+    const double maximum = route_milliseconds.back();
     std::cout << label << ": " << iterations / seconds << " routes/s ("
               << seconds * 1000.0 / static_cast<double>(iterations)
-              << " ms/route), updates: " << delivered_updates
+              << " ms/route; min/p50/p95/max " << minimum << '/' << median << '/'
+              << percentile_95 << '/' << maximum << " ms), updates: "
+              << delivered_updates
               << ", checksum: " << checksum << '\n';
 }
 
@@ -160,7 +191,19 @@ void report_route_quality(
         std::cout << "  settled "
                  << route.value().lattice_diagnostics->settled_labels
                  << "  level "
-                 << route.value().lattice_diagnostics->subdivision_level;
+                 << route.value().lattice_diagnostics->subdivision_level
+                 << "  active cells/faces "
+                 << route.value().lattice_diagnostics->active_cells << '/'
+                 << route.value().lattice_diagnostics->active_faces
+                 << "  refinement accepted/runs "
+                 << route.value().lattice_diagnostics->accepted_refinements
+                 << '/'
+                 << route.value().lattice_diagnostics->refinement_runs
+                 << "  corridor "
+                 << route.value()
+                        .lattice_diagnostics
+                        ->accepted_corridor_width_nautical_miles
+                 << " nm";
     }
     std::cout << '\n' << std::defaultfloat;
 }
@@ -325,6 +368,16 @@ double measure_baseline(
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::cout << "benchmark metadata\n"
+              << "  source revision: " << SAILROUTE_SOURCE_REVISION << '\n'
+              << "  compatibility baseline: " << SAILROUTE_BASELINE_REVISION
+              << '\n'
+              << "  build: " << SAILROUTE_BUILD_TYPE << '\n'
+              << "  compiler: " << SAILROUTE_COMPILER << '\n'
+              << "  system: " << SAILROUTE_SYSTEM << '\n'
+              << "  hardware concurrency: "
+              << std::thread::hardware_concurrency() << "\n\n";
+
     const auto polar = sailroute::VesselPolar::default_racer_cruiser_45ft();
     constexpr std::size_t iterations = 5'000'000;
     volatile double checksum = 0.0;

@@ -3,6 +3,8 @@
 #include "routing/geodesy.hpp"
 #include "routing/environment_context.hpp"
 #include "routing/lattice.hpp"
+#include "routing/mixed_lattice.hpp"
+#include "routing/state.hpp"
 #include "routing/transition.hpp"
 
 #include <algorithm>
@@ -25,28 +27,26 @@ using CellIndex = GeodesicLattice::CellIndex;
 using LabelIndex = std::size_t;
 constexpr LabelIndex no_label = std::numeric_limits<LabelIndex>::max();
 
-struct StateKey {
-    CellIndex cell{};
-    std::int64_t bucket{};
-    std::int8_t board{};
-
-    friend bool operator<(const StateKey& left, const StateKey& right) noexcept {
-        return std::tie(left.cell, left.bucket, left.board) <
-            std::tie(right.cell, right.bucket, right.board);
-    }
-};
-
 struct Label {
-    StateKey state;
+    SolverStateKey state;
     RoutePoint point;
     LabelIndex parent{no_label};
     std::size_t ordinal{};
 };
 
+SolverLabelIdentity label_identity(const Label& label) noexcept {
+    return SolverLabelIdentity{
+        label.state,
+        label.point.time,
+        label.parent,
+        label.ordinal,
+        label.ordinal};
+}
+
 struct QueueEntry {
     double estimated_total_seconds{};
     TimePoint arrival;
-    StateKey state;
+    SolverStateKey state;
     std::size_t ordinal{};
     LabelIndex label{};
 };
@@ -56,16 +56,18 @@ struct LaterQueueEntry {
         return std::tie(
                    left.estimated_total_seconds,
                    left.arrival,
-                   left.state.cell,
-                   left.state.bucket,
-                   left.state.board,
+                   left.state.spatial,
+                   left.state.time_bucket,
+                   left.state.arrival,
+                   left.state.configuration,
                    left.ordinal) >
             std::tie(
                    right.estimated_total_seconds,
                    right.arrival,
-                   right.state.cell,
-                   right.state.bucket,
-                   right.state.board,
+                   right.state.spatial,
+                   right.state.time_bucket,
+                   right.state.arrival,
+                   right.state.configuration,
                    right.ordinal);
     }
 };
@@ -111,6 +113,7 @@ std::int64_t bucket_for(
         width.count();
 }
 
+template <typename Lattice>
 Result<SearchOutcome> search_lattice(
     const WeatherDataset& weather,
     const VesselPolar& polar,
@@ -118,7 +121,7 @@ Result<SearchOutcome> search_lattice(
     const RouteRequest& request,
     TimePoint departure,
     DepartureSource departure_source,
-    const GeodesicLattice& lattice,
+    const Lattice& lattice,
     std::span<const std::uint8_t> allowed,
     std::size_t refinement_index,
     const RoutingViewControlCallback& on_progress) {
@@ -170,7 +173,7 @@ Result<SearchOutcome> search_lattice(
     std::vector<Label> labels;
     labels.reserve(lattice.vertex_count());
     labels.push_back(Label{
-        StateKey{*start_cell, 0, 0},
+        SolverStateKey{*start_cell, 0, departure, {}},
         RoutePoint{
             request.start,
             departure,
@@ -182,7 +185,12 @@ Result<SearchOutcome> search_lattice(
             std::nullopt},
         no_label,
         0U});
-    std::map<StateKey, LabelIndex> best{{labels.front().state, 0U}};
+    std::map<SolverStateKey, LabelIndex> best{{labels.front().state, 0U}};
+    std::map<ContinuationStateKey, TimePoint> earliest_arrival{
+        {ContinuationStateKey{
+             labels.front().state.spatial,
+             labels.front().state.configuration},
+         departure}};
     std::priority_queue<
         QueueEntry,
         std::vector<QueueEntry>,
@@ -213,10 +221,22 @@ Result<SearchOutcome> search_lattice(
     const auto push_label = [&](Label label) {
         const auto found = best.find(label.state);
         if (found != best.end() &&
-            labels[found->second].point.time <= label.point.time) {
+            dominates(
+                label_identity(labels[found->second]),
+                label_identity(label))) {
             return;
         }
         const LabelIndex index = labels.size();
+        const ContinuationStateKey continuation{
+            label.state.spatial,
+            label.state.configuration};
+        const auto earliest = earliest_arrival.find(continuation);
+        if (earliest == earliest_arrival.end()) {
+            earliest_arrival.emplace(continuation, label.point.time);
+        } else if (label.point.time < earliest->second) {
+            earliest->second = label.point.time;
+            ++diagnostics.re_relaxed_labels;
+        }
         labels.push_back(std::move(label));
         best[labels.back().state] = index;
         const double elapsed = std::chrono::duration<double>(
@@ -242,6 +262,7 @@ Result<SearchOutcome> search_lattice(
         queue.pop();
         const auto current_best = best.find(entry.state);
         if (current_best == best.end() || current_best->second != entry.label) {
+            ++diagnostics.stale_queue_entries;
             continue;
         }
         // Relaxation appends to labels and may reallocate it, so expansion must
@@ -260,7 +281,9 @@ Result<SearchOutcome> search_lattice(
         if (current_distance <=
             std::max(
                 request.options.arrival_radius_nautical_miles,
-                lattice.maximum_neighbor_edge_length_nautical_miles() * 1.75)) {
+                lattice.maximum_neighbor_edge_length_nautical_miles(
+                    current.state.spatial) *
+                    1.75)) {
             auto arrival_result = evaluate_variable_transition(
                     weather,
                     polar,
@@ -268,7 +291,7 @@ Result<SearchOutcome> search_lattice(
                     environment,
                     environment_diagnostics,
                     current.point,
-                    current.state.board,
+                    current.state.configuration,
                     request.destination,
                     route_end);
             if (!arrival_result) {
@@ -302,12 +325,16 @@ Result<SearchOutcome> search_lattice(
         }
 
         std::vector<CellIndex> targets;
-        const Coordinate cell_coordinate = lattice.coordinate(current.state.cell);
+        const Coordinate cell_coordinate =
+            lattice.coordinate(current.state.spatial);
         if (great_circle_distance_nautical_miles(
                 current.point.position, cell_coordinate) > 1.0e-9) {
-            targets.push_back(current.state.cell);
+            targets.push_back(
+                static_cast<CellIndex>(current.state.spatial));
         }
-        for (const CellIndex neighbor : lattice.neighbors(current.state.cell)) {
+        for (const CellIndex neighbor :
+             lattice.neighbors(
+                 static_cast<CellIndex>(current.state.spatial))) {
             targets.push_back(neighbor);
         }
         for (const CellIndex target : targets) {
@@ -322,27 +349,31 @@ Result<SearchOutcome> search_lattice(
                 environment,
                 environment_diagnostics,
                 current.point,
-                current.state.board,
+                current.state.configuration,
                 lattice.coordinate(target),
                 route_end);
-            if (!transition_result ||
-                !transition_result.value().has_value()) {
+            if (!transition_result) {
+                return transition_result.error();
+            }
+            if (!transition_result.value().has_value()) {
                 continue;
             }
             VariableTransition transition =
                 std::move(*transition_result.value());
             push_label(Label{
-                StateKey{
+                SolverStateKey{
                     target,
                     bucket_for(
                         transition.point.time, departure, bucket_width),
-                    transition.board},
+                    transition.point.time,
+                    transition.configuration},
                 std::move(transition.point),
                 entry.label,
                 next_ordinal++});
         }
 
-        const std::int64_t next_bucket = current.state.bucket + 1;
+        const std::int64_t next_bucket =
+            current.state.time_bucket + 1;
         const TimePoint wait_until =
             departure + bucket_width * next_bucket;
         if (wait_until > current.point.time && wait_until <= route_end) {
@@ -369,8 +400,11 @@ Result<SearchOutcome> search_lattice(
             waited.environment.reset();
             if (waiting_allowed) {
                 push_label(Label{
-                    StateKey{
-                        current.state.cell, next_bucket, current.state.board},
+                    SolverStateKey{
+                        current.state.spatial,
+                        next_bucket,
+                        wait_until,
+                        current.state.configuration},
                     std::move(waited),
                     entry.label,
                     next_ordinal++});
@@ -437,24 +471,6 @@ Result<SearchOutcome> search_lattice(
         "time-dependent lattice search exhausted every reachable state"};
 }
 
-std::vector<std::uint8_t> corridor_cells(
-    const GeodesicLattice& lattice,
-    std::span<const RoutePoint> route,
-    double width_nautical_miles) {
-    std::vector<std::uint8_t> allowed(lattice.vertex_count(), 0U);
-    for (CellIndex cell = 0U; cell < lattice.vertex_count(); ++cell) {
-        const Coordinate coordinate = lattice.coordinate(cell);
-        for (const RoutePoint& point : route) {
-            if (great_circle_distance_nautical_miles(
-                    coordinate, point.position) <= width_nautical_miles) {
-                allowed[cell] = 1U;
-                break;
-            }
-        }
-    }
-    return allowed;
-}
-
 }  // namespace
 
 Result<RouteResult> optimize_lattice_route(
@@ -498,15 +514,14 @@ Result<RouteResult> optimize_lattice_route(
     // Environmental work is counted for every search run, including refinement
     // passes that were ultimately rejected, because it was genuinely performed.
     EnvironmentDiagnostics environment_totals = incumbent.value().environment;
+    cumulative.active_cells = coarse.value().vertex_count();
+    cumulative.active_faces = coarse.value().faces().size();
     for (std::size_t refinement = 1U;
          refinement <= request.options.lattice.refinement_levels;
          ++refinement) {
-        auto lattice = GeodesicLattice::create(
-            request.options.lattice.subdivision_level + refinement);
-        if (!lattice) {
-            return lattice.error();
-        }
         bool accepted = false;
+        LatticeRefinementFallbackReason last_failure =
+            LatticeRefinementFallbackReason::none;
         for (std::size_t retry = 0U;
              retry <= request.options.lattice.corridor_widening_retries;
              ++retry) {
@@ -514,8 +529,14 @@ Result<RouteResult> optimize_lattice_route(
             const double width =
                 request.options.lattice.corridor_width_nautical_miles *
                 static_cast<double>(std::size_t{1U} << retry);
-            std::vector<std::uint8_t> allowed =
-                corridor_cells(lattice.value(), result.points, width);
+            auto lattice = MixedResolutionLattice::create(
+                request.options.lattice.subdivision_level,
+                refinement,
+                result.points,
+                width);
+            if (!lattice) {
+                return lattice.error();
+            }
             auto refined = search_lattice(
                 weather,
                 polar,
@@ -524,11 +545,14 @@ Result<RouteResult> optimize_lattice_route(
                 departure,
                 departure_source,
                 lattice.value(),
-                allowed,
+                {},
                 refinement,
                 on_progress);
             if (!refined) {
                 if (refined.error().code == ErrorCode::no_route) {
+                    ++cumulative.disconnected_refinements;
+                    last_failure =
+                        LatticeRefinementFallbackReason::disconnected;
                     continue;
                 }
                 return refined.error();
@@ -546,16 +570,31 @@ Result<RouteResult> optimize_lattice_route(
                     refined.value().diagnostics.relaxed_labels;
                 cumulative.wait_transitions +=
                     refined.value().diagnostics.wait_transitions;
+                cumulative.re_relaxed_labels +=
+                    refined.value().diagnostics.re_relaxed_labels;
+                cumulative.stale_queue_entries +=
+                    refined.value().diagnostics.stale_queue_entries;
                 ++cumulative.accepted_refinements;
                 cumulative.subdivision_level =
                     lattice.value().subdivision_level();
+                cumulative.active_cells = lattice.value().vertex_count();
+                cumulative.active_faces = lattice.value().leaf_face_count();
+                cumulative.accepted_corridor_width_nautical_miles = width;
+                cumulative.fallback_reason =
+                    LatticeRefinementFallbackReason::none;
                 result = std::move(refined.value().result);
                 accepted = true;
                 break;
             }
+            ++cumulative.regressed_refinements;
+            last_failure = LatticeRefinementFallbackReason::regressed;
         }
         if (!accepted) {
             cumulative.refinement_fallback = true;
+            cumulative.fallback_reason =
+                request.options.lattice.corridor_widening_retries == 0U
+                ? last_failure
+                : LatticeRefinementFallbackReason::retry_exhausted;
             break;
         }
     }

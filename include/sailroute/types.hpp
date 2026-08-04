@@ -457,6 +457,14 @@ struct RouteEnvironmentMetadata {
     std::uint64_t exclusion_revision{};
 };
 
+/// Why the accepted coarse incumbent was retained after refinement.
+enum class LatticeRefinementFallbackReason {
+    none,
+    disconnected,
+    regressed,
+    retry_exhausted,
+};
+
 /// Lattice-only search and refinement work. Absent for the isochrone solver.
 struct LatticeRouteDiagnostics {
     std::size_t settled_labels{};
@@ -467,6 +475,15 @@ struct LatticeRouteDiagnostics {
     std::size_t accepted_refinements{};
     std::size_t subdivision_level{};
     bool refinement_fallback{};
+    std::size_t re_relaxed_labels{};
+    std::size_t stale_queue_entries{};
+    std::size_t active_cells{};
+    std::size_t active_faces{};
+    double accepted_corridor_width_nautical_miles{};
+    std::size_t disconnected_refinements{};
+    std::size_t regressed_refinements{};
+    LatticeRefinementFallbackReason fallback_reason{
+        LatticeRefinementFallbackReason::none};
 };
 
 /// Lattice-only callback counters for the currently active search pass.

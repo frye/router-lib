@@ -10,17 +10,31 @@
 #include <utility>
 
 namespace sailroute::detail {
-namespace {
 
-// Fixed-point iterations used to solve for the water heading that holds a
-// required ground track under current. The map is a contraction whenever the
-// vessel can hold the track at all, and a fixed bound keeps the result
-// independent of evaluation order.
-constexpr int course_to_steer_iterations = 12;
-constexpr double course_to_steer_tolerance_degrees = 1.0e-10;
+Result<std::optional<EvaluatedWind>> evaluate_wind(
+    Wind wind,
+    const RoutingOptions& options) {
+    const double speed_knots = wind.speed_knots();
+    const double direction_from_degrees = wind.direction_from_degrees();
+    if (!std::isfinite(speed_knots) ||
+        !std::isfinite(direction_from_degrees)) {
+        return Error{
+            ErrorCode::incomplete_forecast,
+            "forecast interpolation produced non-finite wind"};
+    }
+    if (options.maximum_true_wind_speed_knots.has_value() &&
+        speed_knots > *options.maximum_true_wind_speed_knots) {
+        return std::optional<EvaluatedWind>{};
+    }
+    return std::optional<EvaluatedWind>{
+        EvaluatedWind{speed_knots, direction_from_degrees}};
+}
 
-std::int8_t board_for(double heading, double wind_from) noexcept {
-    const double delta = normalize_degrees(heading - wind_from);
+std::int8_t board_for_heading(
+    double heading_degrees,
+    double wind_from_degrees) noexcept {
+    const double delta =
+        normalize_degrees(heading_degrees - wind_from_degrees);
     if (delta == 0.0 || delta == 180.0) {
         return 0;
     }
@@ -29,22 +43,46 @@ std::int8_t board_for(double heading, double wind_from) noexcept {
 
 std::chrono::seconds maneuver_delay(
     const ManeuverPenalties& penalties,
-    std::int8_t parent_board,
-    double parent_heading,
-    std::int8_t candidate_board,
-    double candidate_twa,
-    double wind_from) noexcept {
-    if (parent_board == 0 || candidate_board == 0 ||
-        parent_board == candidate_board) {
+    OperationalConfiguration parent,
+    double parent_true_wind_angle_degrees,
+    OperationalConfiguration candidate,
+    double candidate_true_wind_angle_degrees) noexcept {
+    if (parent.board == 0 || candidate.board == 0 ||
+        parent.board == candidate.board) {
         return std::chrono::seconds::zero();
     }
-    const double parent_twa =
-        angular_difference_degrees(parent_heading, wind_from);
-    return 0.5 * (parent_twa + candidate_twa) >=
+    return 0.5 *
+                (parent_true_wind_angle_degrees +
+                 candidate_true_wind_angle_degrees) >=
             penalties.downwind_true_wind_angle_degrees
         ? penalties.gybe_penalty
         : penalties.tack_penalty;
 }
+
+std::optional<double> boat_speed_for_angle(
+    const PolarSlice& slice,
+    const RoutingOptions& options,
+    double true_wind_angle_degrees) noexcept {
+    if (options.above_polar_range == AbovePolarRangePolicy::no_speed &&
+        slice.above_tabulated_wind_speed()) {
+        return std::nullopt;
+    }
+    const double speed_knots = slice.speed_knots(true_wind_angle_degrees);
+    if (!std::isfinite(speed_knots) || speed_knots <= 0.0 ||
+        speed_knots < options.minimum_boat_speed_knots) {
+        return std::nullopt;
+    }
+    return speed_knots;
+}
+
+namespace {
+
+// Fixed-point iterations used to solve for the water heading that holds a
+// required ground track under current. The map is a contraction whenever the
+// vessel can hold the track at all, and a fixed bound keeps the result
+// independent of evaluation order.
+constexpr int course_to_steer_iterations = 12;
+constexpr double course_to_steer_tolerance_degrees = 1.0e-10;
 
 // One solved leg toward a fixed ground target.
 struct LegSolution {
@@ -66,7 +104,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
     const RoutingEnvironment& environment,
     EnvironmentDiagnostics& diagnostics,
     const RoutePoint& parent,
-    std::int8_t parent_board,
+    OperationalConfiguration parent_configuration,
     Coordinate destination,
     TimePoint route_end) {
     const double distance =
@@ -78,16 +116,22 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
         initial_bearing_degrees(parent.position, destination);
     auto wind_result = weather.interpolate(parent.position, parent.time);
     if (!wind_result) {
+        if (wind_result.error().code ==
+            ErrorCode::coordinate_outside_forecast) {
+            return std::optional<VariableTransition>{};
+        }
         return wind_result.error();
     }
-    const Wind& wind = wind_result.value();
-    const double wind_speed = wind.speed_knots();
-    const double wind_from = wind.direction_from_degrees();
-    if (!std::isfinite(wind_speed) || !std::isfinite(wind_from)) {
-        return Error{
-            ErrorCode::incomplete_forecast,
-            "forecast interpolation produced non-finite wind"};
+    auto evaluated_wind = evaluate_wind(wind_result.value(), options);
+    if (!evaluated_wind) {
+        return evaluated_wind.error();
     }
+    if (!evaluated_wind.value().has_value()) {
+        return std::optional<VariableTransition>{};
+    }
+    const double wind_speed = evaluated_wind.value()->speed_knots;
+    const double wind_from =
+        evaluated_wind.value()->direction_from_degrees;
 
     const bool environment_active = environment.active();
     const bool environment_fields_active =
@@ -119,10 +163,6 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
         }
         const PolarSlice slice =
             polar.slice_at(sample_wind_speed, options.polar_angle_interpolation);
-        if (options.above_polar_range == AbovePolarRangePolicy::no_speed &&
-            slice.above_tabulated_wind_speed()) {
-            return std::nullopt;
-        }
 
         // Speed through the water on one candidate water heading, after the
         // flat-water polar and any sea-state derating.
@@ -133,12 +173,12 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
                 normalize_degrees(ground_course + offset_degrees);
             leg.true_wind_angle_degrees = angular_difference_degrees(
                 leg.water_heading_degrees, sample_wind_from);
-            leg.flat_water_speed_knots =
-                slice.speed_knots(leg.true_wind_angle_degrees);
-            if (!std::isfinite(leg.flat_water_speed_knots) ||
-                !(leg.flat_water_speed_knots > 0.0)) {
+            const auto flat_water_speed = boat_speed_for_angle(
+                slice, options, leg.true_wind_angle_degrees);
+            if (!flat_water_speed.has_value()) {
                 return std::nullopt;
             }
+            leg.flat_water_speed_knots = *flat_water_speed;
             leg.water_speed_knots = leg.flat_water_speed_knots;
             if (state.has_wave) {
                 leg.relative_wave_angle_degrees = relative_wave_angle_degrees(
@@ -163,7 +203,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
                 return std::nullopt;
             }
             leg.board =
-                board_for(leg.water_heading_degrees, sample_wind_from);
+                board_for_heading(leg.water_heading_degrees, sample_wind_from);
             leg.ground_speed_knots = leg.water_speed_knots;
             return leg;
         };
@@ -226,14 +266,18 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
     // The board a transition is recorded on, and the maneuver it is charged
     // for, both come from the segment-start wind; a midpoint refinement
     // adjusts speed, not which side of the wind the vessel ends up on.
-    const std::int8_t board = solution->board;
+    const OperationalConfiguration configuration{
+        solution->board,
+        parent_configuration.sail,
+        parent_configuration.reef};
     const auto delay = maneuver_delay(
         options.maneuver,
-        parent_board,
-        parent.heading_degrees,
-        board,
-        solution->true_wind_angle_degrees,
-        wind_from);
+        parent_configuration,
+        angular_difference_degrees(
+            parent.heading_degrees,
+            wind_from),
+        configuration,
+        solution->true_wind_angle_degrees);
 
     EnvironmentSamples applied = samples;
     double sailing_seconds = distance / solution->ground_speed_knots * 3600.0;
@@ -256,11 +300,23 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
         if (midpoint_wind) {
             auto sampled_wind = weather.interpolate(midpoint, midpoint_time);
             if (!sampled_wind) {
+                if (sampled_wind.error().code ==
+                    ErrorCode::coordinate_outside_forecast) {
+                    return std::optional<VariableTransition>{};
+                }
                 return sampled_wind.error();
             }
-            refined_wind_speed = sampled_wind.value().speed_knots();
+            auto evaluated_midpoint =
+                evaluate_wind(sampled_wind.value(), options);
+            if (!evaluated_midpoint) {
+                return evaluated_midpoint.error();
+            }
+            if (!evaluated_midpoint.value().has_value()) {
+                return std::optional<VariableTransition>{};
+            }
+            refined_wind_speed = evaluated_midpoint.value()->speed_knots;
             refined_wind_from =
-                sampled_wind.value().direction_from_degrees();
+                evaluated_midpoint.value()->direction_from_degrees;
         }
         if (midpoint_environment) {
             EnvironmentSampleResult sampled = sample_environment(
@@ -339,7 +395,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
         return std::optional<VariableTransition>{};
     }
     return std::optional<VariableTransition>{
-        VariableTransition{std::move(point), board}};
+        VariableTransition{std::move(point), configuration}};
 }
 
 }  // namespace sailroute::detail
