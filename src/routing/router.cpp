@@ -229,6 +229,14 @@ std::optional<Error> validate_request(const RouteRequest& request) {
             ErrorCode::invalid_argument,
             "destination front half_angle_degrees must be finite and in (0, 180]"};
     }
+    if (options.progress.destination_front.segment_policy !=
+            DestinationFrontSegmentPolicy::provisional_component &&
+        options.progress.destination_front.segment_policy !=
+            DestinationFrontSegmentPolicy::all_meaningful_components) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "destination front segment_policy is unsupported"};
+    }
     if (options.pruning_strategy == PruningStrategy::bearing_sectors &&
         (!std::isfinite(options.pruning_sector_degrees) ||
          options.pruning_sector_degrees <= 0.0 ||
@@ -1110,6 +1118,7 @@ Isochrone capture_isochrone(
 }
 
 struct ProgressScratch {
+    std::vector<Coordinate> candidate_points;
     std::vector<Coordinate> retained_points;
     std::vector<RoutePoint> provisional_route;
     std::vector<Coordinate> contour_points;
@@ -1580,6 +1589,54 @@ Result<RouteResult> Router::optimize_view_controlled(
         prune_candidates_into(
             candidates, request.destination, request.options, prune_scratch);
         const std::vector<std::size_t>& retained = prune_scratch.retained;
+        const bool deliver_progress =
+            on_progress &&
+            diagnostics.time_steps %
+                    request.options.progress.every_n_steps ==
+                0U;
+        const RoutingProgressPayload payload =
+            request.options.progress.payload;
+
+        std::size_t provisional_candidate_index = retained.front();
+        for (const std::size_t candidate_index : retained) {
+            if (candidates[candidate_index].distance_to_destination <
+                candidates[provisional_candidate_index]
+                    .distance_to_destination) {
+                provisional_candidate_index = candidate_index;
+            }
+        }
+
+        const bool build_pre_prune_front =
+            deliver_progress &&
+            has_payload(
+                payload,
+                RoutingProgressPayload::destination_front) &&
+            request.options.progress.destination_front.segment_policy ==
+                DestinationFrontSegmentPolicy::all_meaningful_components;
+        if (build_pre_prune_front) {
+            progress_scratch.candidate_points.clear();
+            progress_scratch.candidate_points.reserve(candidates.size());
+            for (const Candidate& candidate : candidates) {
+                progress_scratch.candidate_points.push_back(
+                    candidate.point.position);
+            }
+            if (const auto error = detail::build_destination_front_into(
+                    progress_scratch.candidate_points,
+                    request.destination,
+                    candidates[provisional_candidate_index].point.position,
+                    request.options.spatial_bucket_nautical_miles,
+                    request.options.progress.destination_front,
+                    progress_scratch.front_points,
+                    progress_scratch.front_segments);
+                error.has_value()) {
+                return *error;
+            }
+        } else if (deliver_progress) {
+            progress_scratch.candidate_points.clear();
+            progress_scratch.front_points.clear();
+            progress_scratch.front_segments.clear();
+        }
+
         next_frontier.clear();
         next_frontier.reserve(retained.size());
         // Reserving exactly nodes.size() + retained.size() would size the buffer
@@ -1591,30 +1648,21 @@ Result<RouteResult> Router::optimize_view_controlled(
             nodes.reserve(std::max(required, nodes.capacity() * 2U));
         }
         NodeIndex provisional_route_end = no_parent;
-        double provisional_distance = std::numeric_limits<double>::infinity();
         for (const std::size_t candidate_index : retained) {
             Candidate& candidate = candidates[candidate_index];
             nodes.push_back(SearchNode{std::move(candidate.point), candidate.parent});
             next_frontier.push_back(nodes.size() - 1U);
-            if (candidate.distance_to_destination < provisional_distance) {
-                provisional_distance = candidate.distance_to_destination;
+            if (candidate_index == provisional_candidate_index) {
                 provisional_route_end = nodes.size() - 1U;
             }
         }
         diagnostics.retained_candidates += retained.size();
         frontier.swap(next_frontier);
         best_route_end = provisional_route_end;
-        const bool deliver_progress =
-            on_progress &&
-            diagnostics.time_steps %
-                    request.options.progress.every_n_steps ==
-                0U;
         if (request.options.capture_isochrones) {
             isochrones.push_back(capture_isochrone(nodes, frontier));
         }
         if (deliver_progress) {
-            const RoutingProgressPayload payload =
-                request.options.progress.payload;
             const bool needs_retained_points =
                 has_payload(
                     payload,
@@ -1622,9 +1670,11 @@ Result<RouteResult> Router::optimize_view_controlled(
                 has_payload(
                     payload,
                     RoutingProgressPayload::display_contours) ||
-                has_payload(
-                    payload,
-                    RoutingProgressPayload::destination_front);
+                (has_payload(
+                     payload,
+                     RoutingProgressPayload::destination_front) &&
+                 request.options.progress.destination_front.segment_policy ==
+                     DestinationFrontSegmentPolicy::provisional_component);
             if (needs_retained_points) {
                 capture_retained_points(
                     nodes,
@@ -1660,7 +1710,8 @@ Result<RouteResult> Router::optimize_view_controlled(
             }
             if (has_payload(
                     payload,
-                    RoutingProgressPayload::destination_front)) {
+                    RoutingProgressPayload::destination_front) &&
+                !build_pre_prune_front) {
                 if (const auto error = detail::build_destination_front_into(
                         progress_scratch.retained_points,
                         request.destination,
@@ -1671,11 +1722,7 @@ Result<RouteResult> Router::optimize_view_controlled(
                     error.has_value()) {
                     return *error;
                 }
-            } else {
-                progress_scratch.front_points.clear();
-                progress_scratch.front_segments.clear();
             }
-
             const RoutingProgressView progress{
                 nodes[frontier.front()].point.time,
                 has_payload(

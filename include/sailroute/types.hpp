@@ -43,10 +43,26 @@ struct DisplayContourOptions {
     std::optional<double> alpha_nautical_miles;
 };
 
+/// Selects which contiguous destination-front components are emitted.
+enum class DestinationFrontSegmentPolicy {
+    /// Preserve the legacy behavior of emitting only the component containing
+    /// the provisional route endpoint.
+    provisional_component,
+    /// Also emit disconnected components that meet the configured minimum size.
+    /// Router progress fronts using this policy are sourced from the eligible
+    /// pre-pruning candidate cloud.
+    all_meaningful_components,
+};
+
 /// Controls destination-facing isochrone front construction for display.
 struct DestinationFrontOptions {
     // Angular extent on each side of the centroid-to-destination bearing.
     double half_angle_degrees{90.0};
+    DestinationFrontSegmentPolicy segment_policy{
+        DestinationFrontSegmentPolicy::provisional_component};
+    // The anchor component is always retained. This threshold applies only to
+    // disconnected secondary components.
+    std::size_t minimum_secondary_segment_points{3U};
 };
 
 /// References one contiguous component in a flattened display contour.
