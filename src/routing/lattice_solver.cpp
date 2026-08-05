@@ -32,6 +32,7 @@ struct Label {
     RoutePoint point;
     LabelIndex parent{no_label};
     std::size_t ordinal{};
+    bool goal{};
 };
 
 SolverLabelIdentity label_identity(const Label& label) noexcept {
@@ -124,6 +125,7 @@ Result<SearchOutcome> search_lattice(
     const Lattice& lattice,
     std::span<const std::uint8_t> allowed,
     std::size_t refinement_index,
+    bool direct_anchor_edge,
     const RoutingViewControlCallback& on_progress) {
     const ForecastMetadata& metadata = weather.metadata();
     const TimePoint horizon_end =
@@ -169,6 +171,23 @@ Result<SearchOutcome> search_lattice(
     if (!start_cell.has_value()) {
         return Error{ErrorCode::invalid_argument, "unable to locate start lattice cell"};
     }
+    const auto destination_face = lattice.containing_face(request.destination);
+    if (!destination_face.has_value()) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "unable to locate destination lattice face"};
+    }
+    std::vector<CellIndex> destination_connectors{
+        destination_face->begin(), destination_face->end()};
+    for (const CellIndex cell : *destination_face) {
+        const auto neighbors = lattice.neighbors(cell);
+        destination_connectors.insert(
+            destination_connectors.end(), neighbors.begin(), neighbors.end());
+    }
+    std::sort(destination_connectors.begin(), destination_connectors.end());
+    destination_connectors.erase(
+        std::unique(destination_connectors.begin(), destination_connectors.end()),
+        destination_connectors.end());
 
     std::vector<Label> labels;
     labels.reserve(lattice.vertex_count());
@@ -224,7 +243,7 @@ Result<SearchOutcome> search_lattice(
             dominates(
                 label_identity(labels[found->second]),
                 label_identity(label))) {
-            return;
+            return false;
         }
         const LabelIndex index = labels.size();
         const ContinuationStateKey continuation{
@@ -255,6 +274,7 @@ Result<SearchOutcome> search_lattice(
         ++diagnostics.queued_labels;
         ++diagnostics.relaxed_labels;
         ++route_diagnostics.retained_candidates;
+        return true;
     };
 
     while (!queue.empty()) {
@@ -271,6 +291,21 @@ Result<SearchOutcome> search_lattice(
         ++diagnostics.settled_labels;
         ++route_diagnostics.expanded_nodes;
 
+        if (current.goal) {
+            RouteResult result;
+            result.departure_time = departure;
+            result.arrival_time = current.point.time;
+            result.departure_source = departure_source;
+            result.forecast_source = metadata.source;
+            result.polar_source = polar.source();
+            result.points = reconstruct(labels, entry.label);
+            result.diagnostics = route_diagnostics;
+            result.completion = RouteCompletion::destination_reached;
+            result.lattice_diagnostics = diagnostics;
+            return SearchOutcome{
+                std::move(result), diagnostics, environment_diagnostics};
+        }
+
         const double current_distance = great_circle_distance_nautical_miles(
             current.point.position, request.destination);
         if (current_distance < closest_distance) {
@@ -278,57 +313,54 @@ Result<SearchOutcome> search_lattice(
             closest = entry.label;
         }
 
-        if (current_distance <=
-            std::max(
-                request.options.arrival_radius_nautical_miles,
-                lattice.maximum_neighbor_edge_length_nautical_miles(
-                    current.state.spatial) *
-                    1.75)) {
+        const Coordinate cell_coordinate =
+            lattice.coordinate(current.state.spatial);
+        const bool at_lattice_cell =
+            great_circle_distance_nautical_miles(
+                current.point.position, cell_coordinate) <= 1.0e-9;
+        const bool destination_connector =
+            at_lattice_cell &&
+            std::binary_search(
+                destination_connectors.begin(),
+                destination_connectors.end(),
+                current.state.spatial);
+        const bool same_face_anchor_edge =
+            entry.label == 0U && direct_anchor_edge;
+        if (destination_connector || same_face_anchor_edge) {
+            ++route_diagnostics.generated_candidates;
             auto arrival_result = evaluate_variable_transition(
-                    weather,
-                    polar,
-                    request.options,
-                    environment,
-                    environment_diagnostics,
-                    current.point,
-                    current.state.configuration,
-                    request.destination,
-                    route_end);
+                weather,
+                polar,
+                request.options,
+                environment,
+                environment_diagnostics,
+                current.point,
+                current.state.configuration,
+                request.destination,
+                route_end);
             if (!arrival_result) {
                 return arrival_result.error();
             }
             if (arrival_result.value().has_value()) {
                 VariableTransition arrival =
                     std::move(*arrival_result.value());
-                Label destination_label{
-                    current.state,
+                ++route_diagnostics.time_steps;
+                push_label(Label{
+                    SolverStateKey{
+                        lattice.vertex_count(),
+                        bucket_for(
+                            arrival.point.time, departure, bucket_width),
+                        arrival.point.time,
+                        arrival.configuration},
                     std::move(arrival.point),
                     entry.label,
-                    next_ordinal++};
-                labels.push_back(std::move(destination_label));
-                ++route_diagnostics.generated_candidates;
-                ++route_diagnostics.retained_candidates;
-                ++route_diagnostics.time_steps;
-                RouteResult result;
-                result.departure_time = departure;
-                result.arrival_time = labels.back().point.time;
-                result.departure_source = departure_source;
-                result.forecast_source = metadata.source;
-                result.polar_source = polar.source();
-                result.points = reconstruct(labels, labels.size() - 1U);
-                result.diagnostics = route_diagnostics;
-                result.completion = RouteCompletion::destination_reached;
-                result.lattice_diagnostics = diagnostics;
-                return SearchOutcome{
-                    std::move(result), diagnostics, environment_diagnostics};
+                    next_ordinal++,
+                    true});
             }
         }
 
         std::vector<CellIndex> targets;
-        const Coordinate cell_coordinate =
-            lattice.coordinate(current.state.spatial);
-        if (great_circle_distance_nautical_miles(
-                current.point.position, cell_coordinate) > 1.0e-9) {
+        if (!at_lattice_cell) {
             targets.push_back(
                 static_cast<CellIndex>(current.state.spatial));
         }
@@ -494,6 +526,18 @@ Result<RouteResult> optimize_lattice_route(
     if (!coarse) {
         return coarse.error();
     }
+    const auto coarse_start_face =
+        coarse.value().containing_face(request.start);
+    const auto coarse_destination_face =
+        coarse.value().containing_face(request.destination);
+    if (!coarse_start_face.has_value() ||
+        !coarse_destination_face.has_value()) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "unable to locate route anchors in the coarse lattice"};
+    }
+    const bool direct_anchor_edge =
+        *coarse_start_face == *coarse_destination_face;
     auto incumbent = search_lattice(
         weather,
         polar,
@@ -504,6 +548,7 @@ Result<RouteResult> optimize_lattice_route(
         coarse.value(),
         {},
         0U,
+        direct_anchor_edge,
         on_progress);
     if (!incumbent) {
         return incumbent.error();
@@ -547,6 +592,7 @@ Result<RouteResult> optimize_lattice_route(
                 lattice.value(),
                 {},
                 refinement,
+                direct_anchor_edge,
                 on_progress);
             if (!refined) {
                 if (refined.error().code == ErrorCode::no_route) {

@@ -79,6 +79,25 @@ double angular_distance(Vector3 left, Vector3 right) noexcept {
     return std::acos(std::clamp(dot(left, right), -1.0, 1.0));
 }
 
+bool contains(
+    Vector3 point,
+    Vector3 first,
+    Vector3 second,
+    Vector3 third) noexcept {
+    constexpr double boundary_tolerance = 1.0e-12;
+    const auto same_side = [point](Vector3 start, Vector3 end, Vector3 opposite) {
+        const Vector3 normal = cross(start, end);
+        const double reference = dot(normal, opposite);
+        const double candidate = dot(normal, point);
+        return reference >= 0.0
+            ? candidate >= -boundary_tolerance
+            : candidate <= boundary_tolerance;
+    };
+    return same_side(first, second, third) &&
+        same_side(second, third, first) &&
+        same_side(third, first, second);
+}
+
 double point_to_segment_radians(
     Vector3 point,
     Vector3 start,
@@ -256,6 +275,7 @@ Result<MixedResolutionLattice> MixedResolutionLattice::create(
         mixed.neighbors_[second].push_back(first);
     }
     mixed.leaf_face_count_ = faces.size();
+    mixed.faces_ = std::move(faces);
     return mixed;
 }
 
@@ -305,6 +325,29 @@ MixedResolutionLattice::nearest_cell(Coordinate coordinate) const noexcept {
         }
     }
     return closest;
+}
+
+std::optional<MixedResolutionLattice::Face>
+MixedResolutionLattice::containing_face(Coordinate coordinate) const noexcept {
+    if (!std::isfinite(coordinate.latitude_degrees) ||
+        !std::isfinite(coordinate.longitude_degrees) ||
+        coordinate.latitude_degrees < -90.0 ||
+        coordinate.latitude_degrees > 90.0 ||
+        coordinate.longitude_degrees < -180.0 ||
+        coordinate.longitude_degrees > 180.0) {
+        return std::nullopt;
+    }
+    const Vector3 query = vector_from(coordinate);
+    for (const Face face : faces_) {
+        if (contains(
+                query,
+                vector_from(coordinates_[face[0U]]),
+                vector_from(coordinates_[face[1U]]),
+                vector_from(coordinates_[face[2U]]))) {
+            return face;
+        }
+    }
+    return std::nullopt;
 }
 
 double MixedResolutionLattice::maximum_neighbor_edge_length_nautical_miles(

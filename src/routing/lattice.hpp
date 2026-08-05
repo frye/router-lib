@@ -44,6 +44,8 @@ public:
     /// yields std::nullopt. Ties are resolved by the lowest cell index.
     [[nodiscard]] std::optional<CellIndex> nearest_cell(
         Coordinate coordinate) const noexcept;
+    [[nodiscard]] std::optional<Face> containing_face(
+        Coordinate coordinate) const noexcept;
 
     /// Largest great-circle length of any lattice edge, in nautical miles.
     [[nodiscard]] double maximum_neighbor_edge_length_nautical_miles() const noexcept;

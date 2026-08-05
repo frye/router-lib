@@ -19,6 +19,17 @@ struct Vector3 {
     double z;
 };
 
+double dot(Vector3 left, Vector3 right) noexcept {
+    return left.x * right.x + left.y * right.y + left.z * right.z;
+}
+
+Vector3 cross(Vector3 left, Vector3 right) noexcept {
+    return {
+        left.y * right.z - left.z * right.y,
+        left.z * right.x - left.x * right.z,
+        left.x * right.y - left.y * right.x};
+}
+
 Vector3 normalized(Vector3 vector) noexcept {
     const double length = std::sqrt(
         vector.x * vector.x + vector.y * vector.y + vector.z * vector.z);
@@ -56,6 +67,25 @@ Vector3 vector_from(Coordinate coordinate) noexcept {
         cosine_latitude * std::cos(longitude),
         cosine_latitude * std::sin(longitude),
         std::sin(latitude)};
+}
+
+bool contains(
+    Vector3 point,
+    Vector3 first,
+    Vector3 second,
+    Vector3 third) noexcept {
+    constexpr double boundary_tolerance = 1.0e-12;
+    const auto same_side = [point](Vector3 start, Vector3 end, Vector3 opposite) {
+        const Vector3 normal = cross(start, end);
+        const double reference = dot(normal, opposite);
+        const double candidate = dot(normal, point);
+        return reference >= 0.0
+            ? candidate >= -boundary_tolerance
+            : candidate <= boundary_tolerance;
+    };
+    return same_side(first, second, third) &&
+        same_side(second, third, first) &&
+        same_side(third, first, second);
 }
 
 std::size_t vertex_count_for_level(std::size_t level) noexcept {
@@ -224,6 +254,30 @@ std::optional<GeodesicLattice::CellIndex> GeodesicLattice::nearest_cell(
         }
     }
     return closest;
+}
+
+std::optional<GeodesicLattice::Face> GeodesicLattice::containing_face(
+    Coordinate coordinate) const noexcept {
+    if (!is_valid_coordinate(coordinate)) {
+        return std::nullopt;
+    }
+    const Vector3 query = vector_from(coordinate);
+    for (const Face face : faces_) {
+        const auto vertex = [this](CellIndex cell) {
+            return Vector3{
+                unit_vectors_[3U * cell],
+                unit_vectors_[3U * cell + 1U],
+                unit_vectors_[3U * cell + 2U]};
+        };
+        if (contains(
+                query,
+                vertex(face[0U]),
+                vertex(face[1U]),
+                vertex(face[2U]))) {
+            return face;
+        }
+    }
+    return std::nullopt;
 }
 
 double GeodesicLattice::maximum_neighbor_edge_length_nautical_miles() const noexcept {
