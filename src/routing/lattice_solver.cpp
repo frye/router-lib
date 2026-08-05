@@ -8,11 +8,13 @@
 #include "routing/transition.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <numbers>
 #include <optional>
 #include <queue>
 #include <span>
@@ -57,6 +59,7 @@ struct LaterQueueEntry {
                    left.estimated_total_seconds,
                    left.arrival,
                    left.state.spatial,
+                   left.state.position,
                    left.state.time_bucket,
                    left.state.arrival,
                    left.state.configuration,
@@ -65,6 +68,7 @@ struct LaterQueueEntry {
                    right.estimated_total_seconds,
                    right.arrival,
                    right.state.spatial,
+                   right.state.position,
                    right.state.time_bucket,
                    right.state.arrival,
                    right.state.configuration,
@@ -113,6 +117,21 @@ std::int64_t bucket_for(
         width.count();
 }
 
+SphericalPositionKey position_key(
+    Coordinate position,
+    double bucket_width_nautical_miles) noexcept {
+    constexpr double degrees_to_radians = std::numbers::pi / 180.0;
+    const double latitude = position.latitude_degrees * degrees_to_radians;
+    const double longitude = position.longitude_degrees * degrees_to_radians;
+    const double scale =
+        earth_radius_nautical_miles / bucket_width_nautical_miles;
+    const double cosine_latitude = std::cos(latitude);
+    return SphericalPositionKey{
+        std::llround(cosine_latitude * std::cos(longitude) * scale),
+        std::llround(cosine_latitude * std::sin(longitude) * scale),
+        std::llround(std::sin(latitude) * scale)};
+}
+
 template <typename Lattice>
 Result<SearchOutcome> search_lattice(
     const WeatherDataset& weather,
@@ -136,6 +155,12 @@ Result<SearchOutcome> search_lattice(
     if (!(maximum_speed > 0.0)) {
         return Error{ErrorCode::invalid_polar, "polar contains no positive boat speed"};
     }
+    const double bucket_hours =
+        std::chrono::duration<double, std::ratio<3600>>(bucket_width).count();
+    // VMG successors land off-vertex. Half a maximum-speed bucket keeps nearby
+    // endpoints distinct while still merging equivalent continuous paths.
+    const double position_bucket_width =
+        std::max(1.0, maximum_speed * bucket_hours * 0.5);
 
     auto start_wind = weather.interpolate(request.start, departure);
     if (!start_wind) {
@@ -173,7 +198,12 @@ Result<SearchOutcome> search_lattice(
     std::vector<Label> labels;
     labels.reserve(lattice.vertex_count());
     labels.push_back(Label{
-        SolverStateKey{*start_cell, 0, departure, {}},
+        SolverStateKey{
+            *start_cell,
+            0,
+            departure,
+            {},
+            position_key(request.start, position_bucket_width)},
         RoutePoint{
             request.start,
             departure,
@@ -189,7 +219,8 @@ Result<SearchOutcome> search_lattice(
     std::map<ContinuationStateKey, TimePoint> earliest_arrival{
         {ContinuationStateKey{
              labels.front().state.spatial,
-             labels.front().state.configuration},
+             labels.front().state.configuration,
+             labels.front().state.position},
          departure}};
     std::priority_queue<
         QueueEntry,
@@ -229,7 +260,8 @@ Result<SearchOutcome> search_lattice(
         const LabelIndex index = labels.size();
         const ContinuationStateKey continuation{
             label.state.spatial,
-            label.state.configuration};
+            label.state.configuration,
+            label.state.position};
         const auto earliest = earliest_arrival.find(continuation);
         if (earliest == earliest_arrival.end()) {
             earliest_arrival.emplace(continuation, label.point.time);
@@ -337,6 +369,7 @@ Result<SearchOutcome> search_lattice(
                  static_cast<CellIndex>(current.state.spatial))) {
             targets.push_back(neighbor);
         }
+        bool has_spatial_successor = false;
         for (const CellIndex target : targets) {
             if (!allowed.empty() && !allowed[target]) {
                 continue;
@@ -360,13 +393,16 @@ Result<SearchOutcome> search_lattice(
             }
             VariableTransition transition =
                 std::move(*transition_result.value());
+            has_spatial_successor = true;
             push_label(Label{
                 SolverStateKey{
                     target,
                     bucket_for(
                         transition.point.time, departure, bucket_width),
                     transition.point.time,
-                    transition.configuration},
+                    transition.configuration,
+                    position_key(
+                        transition.point.position, position_bucket_width)},
                 std::move(transition.point),
                 entry.label,
                 next_ordinal++});
@@ -377,6 +413,87 @@ Result<SearchOutcome> search_lattice(
         const TimePoint wait_until =
             departure + bucket_width * next_bucket;
         if (wait_until > current.point.time && wait_until <= route_end) {
+            auto wind_result =
+                weather.interpolate(current.point.position, current.point.time);
+            if (!wind_result) {
+                if (wind_result.error().code !=
+                    ErrorCode::coordinate_outside_forecast) {
+                    return wind_result.error();
+                }
+            } else if (
+                !has_spatial_successor ||
+                current_distance <
+                    lattice.maximum_neighbor_edge_length_nautical_miles(
+                        current.state.spatial)) {
+                auto evaluated_wind =
+                    evaluate_wind(wind_result.value(), request.options);
+                if (!evaluated_wind) {
+                    return evaluated_wind.error();
+                }
+                if (evaluated_wind.value().has_value()) {
+                    const double wind_speed =
+                        evaluated_wind.value()->speed_knots;
+                    const double wind_from =
+                        evaluated_wind.value()->direction_from_degrees;
+                    const PolarSlice slice = polar.slice_at(
+                        wind_speed,
+                        request.options.polar_angle_interpolation);
+                    if (!(request.options.above_polar_range ==
+                              AbovePolarRangePolicy::no_speed &&
+                          slice.above_tabulated_wind_speed())) {
+                        const VelocityMadeGoodAngles optima =
+                            slice.velocity_made_good_angles();
+                        if (optima.valid && optima.upwind_degrees > 0.0) {
+                            const std::array headings{
+                                normalize_degrees(
+                                    wind_from + optima.upwind_degrees),
+                                normalize_degrees(
+                                    wind_from - optima.upwind_degrees)};
+                            for (const double heading : headings) {
+                                ++route_diagnostics.generated_candidates;
+                                auto transition_result =
+                                    evaluate_heading_transition(
+                                        weather,
+                                        polar,
+                                        request.options,
+                                        environment,
+                                        environment_diagnostics,
+                                        current.point,
+                                        current.state.configuration,
+                                        heading,
+                                        wait_until);
+                                if (!transition_result) {
+                                    return transition_result.error();
+                                }
+                                if (!transition_result.value().has_value()) {
+                                    continue;
+                                }
+                                VariableTransition transition =
+                                    std::move(*transition_result.value());
+                                const auto target = lattice.nearest_cell(
+                                    transition.point.position);
+                                if (!target.has_value() ||
+                                    (!allowed.empty() && !allowed[*target])) {
+                                    continue;
+                                }
+                                push_label(Label{
+                                    SolverStateKey{
+                                        *target,
+                                        next_bucket,
+                                        wait_until,
+                                        transition.configuration,
+                                        position_key(
+                                            transition.point.position,
+                                            position_bucket_width)},
+                                    std::move(transition.point),
+                                    entry.label,
+                                    next_ordinal++});
+                            }
+                        }
+                    }
+                }
+            }
+
             // Waiting still has to be legal: an exclusion zone can open around
             // a stationary vessel, so the degenerate segment is checked too.
             bool waiting_allowed = true;
@@ -404,7 +521,8 @@ Result<SearchOutcome> search_lattice(
                         current.state.spatial,
                         next_bucket,
                         wait_until,
-                        current.state.configuration},
+                        current.state.configuration,
+                        current.state.position},
                     std::move(waited),
                     entry.label,
                     next_ordinal++});

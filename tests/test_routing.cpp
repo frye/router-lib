@@ -2055,6 +2055,101 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
         REQUIRE(first_json.value() == parallel_json.value());
     }
 
+    TEST_CASE("lattice routing tacks instead of waiting for an upwind shift") {
+        const RoutingGribFixture fixture{20260714, 1200, 24};
+        const auto weather = sailroute::WeatherDataset::load(fixture.path());
+        REQUIRE(weather.has_value());
+        const sailroute::Router router{weather.value()};
+
+        sailroute::RouteRequest request = upwind_request();
+        request.destination = {0.9, 1.0};
+        request.options.maximum_route_duration = std::chrono::hours{24};
+        request.options.solver =
+            sailroute::RoutingSolver::time_dependent_lattice;
+        request.options.lattice.subdivision_level = 4U;
+        request.options.lattice.refinement_levels = 0U;
+
+        const sailroute::RouteResult route = must_route(router, request);
+        REQUIRE(
+            route.completion ==
+            sailroute::RouteCompletion::destination_reached);
+        REQUIRE(route.points.size() > 2U);
+        REQUIRE(
+            route.points[1U].position.latitude_degrees !=
+                request.start.latitude_degrees ||
+            route.points[1U].position.longitude_degrees !=
+                request.start.longitude_degrees);
+        REQUIRE(route.points[1U].boat_speed_knots > 0.0);
+        REQUIRE(count_board_changes(route) > 0U);
+
+        sailroute::RouteRequest beam = request;
+        beam.options.solver = sailroute::RoutingSolver::isochrone_beam;
+        beam.options.heading_augmentation =
+            sailroute::HeadingAugmentation::velocity_made_good;
+        const sailroute::RouteResult beam_route = must_route(router, beam);
+        const auto lattice_duration = route.arrival_time - route.departure_time;
+        const auto beam_duration =
+            beam_route.arrival_time - beam_route.departure_time;
+        REQUIRE(lattice_duration <= beam_duration * 2);
+
+        sailroute::RouteRequest dijkstra = request;
+        dijkstra.options.lattice.search_algorithm =
+            sailroute::LatticeSearchAlgorithm::dijkstra;
+        const sailroute::RouteResult dijkstra_route =
+            must_route(router, dijkstra);
+        REQUIRE(dijkstra_route.arrival_time == route.arrival_time);
+        require_same_route(route, must_route(router, request));
+
+        sailroute::RouteRequest penalised = request;
+        penalised.options.maneuver.tack_penalty =
+            std::chrono::minutes{5};
+        const sailroute::RouteResult penalised_route =
+            must_route(router, penalised);
+        REQUIRE(penalised_route.arrival_time > route.arrival_time);
+
+        std::size_t rejected_vmg_segments = 0U;
+        sailroute::RouteRequest rejected = request;
+        rejected.options.segment_eligibility =
+            [&rejected_vmg_segments](const sailroute::RouteSegmentView& segment) {
+                if (segment.candidate.boat_speed_knots > 0.0) {
+                    ++rejected_vmg_segments;
+                    return false;
+                }
+                return true;
+            };
+        const auto rejected_route = router.optimize(rejected);
+        REQUIRE(!rejected_route.has_value());
+        REQUIRE(rejected_vmg_segments > 0U);
+    }
+
+    TEST_CASE("lattice forecast exhaustion returns upwind VMG progress") {
+        const RoutingGribFixture fixture{20260714, 1200, 4};
+        const auto weather = sailroute::WeatherDataset::load(fixture.path());
+        REQUIRE(weather.has_value());
+        const sailroute::Router router{weather.value()};
+
+        sailroute::RouteRequest request = upwind_request();
+        request.options.maximum_route_duration = std::chrono::hours{24};
+        request.options.solver =
+            sailroute::RoutingSolver::time_dependent_lattice;
+        request.options.lattice.subdivision_level = 4U;
+        request.options.lattice.refinement_levels = 0U;
+
+        const sailroute::RouteResult route = must_route(router, request);
+        REQUIRE(
+            route.completion ==
+            sailroute::RouteCompletion::forecast_exhausted);
+        REQUIRE(route.points.size() > 1U);
+        REQUIRE(
+            sailroute::detail::great_circle_distance_nautical_miles(
+                route.points.back().position,
+                request.destination) <
+            sailroute::detail::great_circle_distance_nautical_miles(
+                request.start,
+                request.destination));
+        REQUIRE(route.points.back().cumulative_distance_nautical_miles > 0.0);
+    }
+
     TEST_CASE("lattice A star and Dijkstra agree on earliest arrival") {
         const RoutingGribFixture fixture;
         const auto weather = sailroute::WeatherDataset::load(fixture.path());

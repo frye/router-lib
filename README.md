@@ -339,10 +339,21 @@ deterministic A* over a hierarchical icosahedral lattice. The default remains
 `isochrone_beam`; unchanged callers retain their existing route, progress,
 diagnostic, and serialization behavior.
 
-Lattice states include the geodesic cell, exact arrival time, time bucket, and
-board. Neighbor edges use the same weather, polar, maneuver, wind-envelope,
-midpoint-sampling, and segment-eligibility controls as routing legs. Explicit
-wait transitions preserve later departure opportunities. A* uses remaining
+Lattice states include the geodesic cell, a seam-safe spherical position bucket,
+exact arrival time, time bucket, and board. In addition to fixed-target neighbor
+edges, the solver can sail a bucket-length successor on either of the polar's
+upwind VMG headings. These off-vertex moves are generated when no fixed-target
+edge is feasible or the destination is closer than one local edge, so a coarse
+lattice can tack without turning every settled label into a continuous heading
+fan. Their exact endpoints are associated with the nearest cell for subsequent
+neighbor expansion and are never snapped to its centre.
+
+Neighbor and VMG transitions share the same weather, polar, maneuver,
+wind-envelope, midpoint-sampling, current, wave, land, exclusion, and
+segment-eligibility rules. The VMG move ends at the next lattice time boundary
+after deducting any tack penalty; its internal position bucket is derived from
+the time bucket and polar speed bound. Explicit wait transitions remain
+available for genuine later-departure opportunities. A* uses remaining
 great-circle distance divided by the polar's global maximum boat speed; select
 `LatticeSearchAlgorithm::dijkstra` as a zero-heuristic oracle.
 
@@ -371,9 +382,10 @@ never allocated. A refined route is accepted only when it is complete and no
 later than the incumbent. If every bounded widening attempt disconnects or
 regresses, the previous route is retained and the lattice diagnostics report
 the fallback reason, failed attempts, accepted corridor width, and active
-cell/face counts. Start and destination remain exact virtual anchors; route
-endpoints are never snapped to cell centres. The solver is intentionally
-serial, so `worker_count` has no effect on its deterministic output.
+cell/face counts. Start and destination remain exact virtual anchors; neither
+anchors nor VMG endpoints are snapped to cell centres. The solver is
+intentionally serial, so `worker_count` has no effect on its deterministic
+output.
 
 Lattice callbacks identify
 `RoutingSolver::time_dependent_lattice`, populate the distinct
