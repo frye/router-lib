@@ -4,6 +4,7 @@
 #include "sailroute/time.hpp"
 
 #include "../src/routing/geodesy.hpp"
+#include "../src/routing/transition.hpp"
 #include "grib_fixture.hpp"
 #include "test_support.hpp"
 
@@ -461,6 +462,61 @@ TEST_CASE("the lattice solver steers a heading that holds the ground track") {
         }
     }
     REQUIRE(crabbed);
+}
+
+TEST_CASE("fixed-duration heading transitions apply current and exclusions") {
+    const sailroute::test::ConstantWindGribFixture fixture;
+    const WeatherDataset weather = load_weather(fixture);
+    const auto polar = sailroute::VesselPolar::default_racer_cruiser_45ft();
+    const auto departure =
+        sailroute::parse_utc_time("2026-07-14T12:00:00Z");
+    REQUIRE(departure.has_value());
+
+    RoutePoint parent;
+    parent.position = {0.4, 1.0};
+    parent.time = departure.value();
+    sailroute::RoutingOptions options;
+    sailroute::EnvironmentDiagnostics diagnostics;
+    const RoutingEnvironment current =
+        current_environment(CurrentVector{1.0, 0.0});
+    auto moved = sailroute::detail::evaluate_heading_transition(
+        weather,
+        polar,
+        options,
+        current,
+        diagnostics,
+        parent,
+        {},
+        45.0,
+        parent.time + std::chrono::minutes{30});
+    REQUIRE(moved.has_value());
+    REQUIRE(moved.value().has_value());
+    REQUIRE(moved.value()->point.time == parent.time + std::chrono::minutes{30});
+    REQUIRE(moved.value()->point.environment.has_value());
+    REQUIRE(moved.value()->point.environment->current_applied);
+    REQUIRE(
+        sailroute::detail::angular_difference_degrees(
+            moved.value()->point.heading_degrees,
+            moved.value()->point.environment->course_over_ground_degrees) >
+        1.0);
+
+    RoutingEnvironment blocked;
+    blocked.exclusions.zones =
+        barrier_zone(0.4, 0.6, 1.0, 1.2);
+    sailroute::EnvironmentDiagnostics blocked_diagnostics;
+    auto rejected = sailroute::detail::evaluate_heading_transition(
+        weather,
+        polar,
+        options,
+        blocked,
+        blocked_diagnostics,
+        parent,
+        {},
+        45.0,
+        parent.time + std::chrono::minutes{30});
+    REQUIRE(rejected.has_value());
+    REQUIRE(!rejected.value().has_value());
+    REQUIRE(blocked_diagnostics.exclusion_rejections == 1U);
 }
 
 TEST_CASE("a calm sea reproduces the flat-water route and waves slow it down") {

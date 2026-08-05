@@ -95,6 +95,58 @@ struct LegSolution {
     std::int8_t board{};
 };
 
+Result<std::optional<LegSolution>> evaluate_water_heading(
+    const VesselPolar& polar,
+    const RoutingOptions& options,
+    const RoutingEnvironment& environment,
+    EnvironmentDiagnostics& diagnostics,
+    double wind_speed,
+    double wind_from,
+    const EnvironmentSamples& state,
+    double water_heading_degrees) {
+    if (options.maximum_true_wind_speed_knots.has_value() &&
+        wind_speed > *options.maximum_true_wind_speed_knots) {
+        return std::optional<LegSolution>{};
+    }
+    const PolarSlice slice =
+        polar.slice_at(wind_speed, options.polar_angle_interpolation);
+    LegSolution leg;
+    leg.water_heading_degrees = normalize_degrees(water_heading_degrees);
+    leg.true_wind_angle_degrees =
+        angular_difference_degrees(leg.water_heading_degrees, wind_from);
+    const auto flat_water_speed =
+        boat_speed_for_angle(slice, options, leg.true_wind_angle_degrees);
+    if (!flat_water_speed.has_value()) {
+        return std::optional<LegSolution>{};
+    }
+    leg.flat_water_speed_knots = *flat_water_speed;
+    leg.water_speed_knots = leg.flat_water_speed_knots;
+    if (state.has_wave) {
+        leg.relative_wave_angle_degrees = relative_wave_angle_degrees(
+            leg.water_heading_degrees, state.wave.direction_from_degrees);
+        Result<double> derated = apply_sea_state(
+            environment,
+            leg.flat_water_speed_knots,
+            wind_speed,
+            leg.true_wind_angle_degrees,
+            leg.water_heading_degrees,
+            state.wave,
+            diagnostics);
+        if (!derated) {
+            return derated.error();
+        }
+        leg.water_speed_knots = derated.value();
+    }
+    if (!std::isfinite(leg.water_speed_knots) ||
+        !(leg.water_speed_knots > 0.0) ||
+        leg.water_speed_knots < options.minimum_boat_speed_knots) {
+        return std::optional<LegSolution>{};
+    }
+    leg.board = board_for_heading(leg.water_heading_degrees, wind_from);
+    leg.ground_speed_knots = leg.water_speed_knots;
+    return std::optional<LegSolution>{leg};
+}
+
 }  // namespace
 
 Result<std::optional<VariableTransition>> evaluate_variable_transition(
@@ -152,64 +204,20 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
     // Resolves the leg for one wind sample and one environmental sample. With
     // no current the water heading is the ground course and the solve collapses
     // to the pre-Stage 3 arithmetic.
-    std::optional<Error> solve_error;
     const auto solve = [&](double sample_wind_speed,
                            double sample_wind_from,
                            const EnvironmentSamples& state)
-        -> std::optional<LegSolution> {
-        if (options.maximum_true_wind_speed_knots.has_value() &&
-            sample_wind_speed > *options.maximum_true_wind_speed_knots) {
-            return std::nullopt;
-        }
-        const PolarSlice slice =
-            polar.slice_at(sample_wind_speed, options.polar_angle_interpolation);
-
-        // Speed through the water on one candidate water heading, after the
-        // flat-water polar and any sea-state derating.
-        const auto evaluate = [&](double offset_degrees)
-            -> std::optional<LegSolution> {
-            LegSolution leg;
-            leg.water_heading_degrees =
-                normalize_degrees(ground_course + offset_degrees);
-            leg.true_wind_angle_degrees = angular_difference_degrees(
-                leg.water_heading_degrees, sample_wind_from);
-            const auto flat_water_speed = boat_speed_for_angle(
-                slice, options, leg.true_wind_angle_degrees);
-            if (!flat_water_speed.has_value()) {
-                return std::nullopt;
-            }
-            leg.flat_water_speed_knots = *flat_water_speed;
-            leg.water_speed_knots = leg.flat_water_speed_knots;
-            if (state.has_wave) {
-                leg.relative_wave_angle_degrees = relative_wave_angle_degrees(
-                    leg.water_heading_degrees, state.wave.direction_from_degrees);
-                Result<double> derated = apply_sea_state(
-                    environment,
-                    leg.flat_water_speed_knots,
-                    sample_wind_speed,
-                    leg.true_wind_angle_degrees,
-                    leg.water_heading_degrees,
-                    state.wave,
-                    diagnostics);
-                if (!derated) {
-                    solve_error = derated.error();
-                    return std::nullopt;
-                }
-                leg.water_speed_knots = derated.value();
-            }
-            if (!std::isfinite(leg.water_speed_knots) ||
-                !(leg.water_speed_knots > 0.0) ||
-                leg.water_speed_knots < options.minimum_boat_speed_knots) {
-                return std::nullopt;
-            }
-            leg.board =
-                board_for_heading(leg.water_heading_degrees, sample_wind_from);
-            leg.ground_speed_knots = leg.water_speed_knots;
-            return leg;
-        };
-
+        -> Result<std::optional<LegSolution>> {
         if (!state.has_current) {
-            return evaluate(0.0);
+            return evaluate_water_heading(
+                polar,
+                options,
+                environment,
+                diagnostics,
+                sample_wind_speed,
+                sample_wind_from,
+                state,
+                ground_course);
         }
 
         const double course_radians = ground_course * std::numbers::pi / 180.0;
@@ -224,14 +232,26 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
         std::optional<LegSolution> leg;
         for (int iteration = 0; iteration < course_to_steer_iterations;
              ++iteration) {
-            leg = evaluate(offset_degrees);
+            auto evaluated = evaluate_water_heading(
+                polar,
+                options,
+                environment,
+                diagnostics,
+                sample_wind_speed,
+                sample_wind_from,
+                state,
+                ground_course + offset_degrees);
+            if (!evaluated) {
+                return evaluated.error();
+            }
+            leg = std::move(evaluated.value());
             if (!leg.has_value()) {
-                return std::nullopt;
+                return std::optional<LegSolution>{};
             }
             const std::optional<double> next = water_heading_offset_degrees(
                 ground_course, leg->water_speed_knots, state.current);
             if (!next.has_value()) {
-                return std::nullopt;
+                return std::optional<LegSolution>{};
             }
             const bool converged = std::abs(*next - offset_degrees) <=
                 course_to_steer_tolerance_degrees;
@@ -240,9 +260,21 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
                 break;
             }
         }
-        leg = evaluate(offset_degrees);
+        auto evaluated = evaluate_water_heading(
+            polar,
+            options,
+            environment,
+            diagnostics,
+            sample_wind_speed,
+            sample_wind_from,
+            state,
+            ground_course + offset_degrees);
+        if (!evaluated) {
+            return evaluated.error();
+        }
+        leg = std::move(evaluated.value());
         if (!leg.has_value()) {
-            return std::nullopt;
+            return std::optional<LegSolution>{};
         }
         const double offset_radians =
             offset_degrees * std::numbers::pi / 180.0;
@@ -250,15 +282,16 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
             leg->water_speed_knots * std::cos(offset_radians) + along_track;
         if (!std::isfinite(leg->ground_speed_knots) ||
             !(leg->ground_speed_knots > 0.0)) {
-            return std::nullopt;
+            return std::optional<LegSolution>{};
         }
-        return leg;
+        return std::optional<LegSolution>{leg};
     };
 
-    std::optional<LegSolution> solution = solve(wind_speed, wind_from, samples);
-    if (solve_error.has_value()) {
-        return *solve_error;
+    auto solved = solve(wind_speed, wind_from, samples);
+    if (!solved) {
+        return solved.error();
     }
+    std::optional<LegSolution> solution = std::move(solved.value());
     if (!solution.has_value()) {
         return std::optional<VariableTransition>{};
     }
@@ -329,11 +362,13 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
             }
             applied = sampled.samples;
         }
-        const std::optional<LegSolution> refined = solve(
+        auto refined_result = solve(
             refined_wind_speed, refined_wind_from, applied);
-        if (solve_error.has_value()) {
-            return *solve_error;
+        if (!refined_result) {
+            return refined_result.error();
         }
+        const std::optional<LegSolution> refined =
+            std::move(refined_result.value());
         if (!refined.has_value()) {
             return std::optional<VariableTransition>{};
         }
@@ -386,6 +421,228 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
         audit.wave_period_seconds = applied.wave.peak_period_seconds;
         audit.relative_wave_angle_degrees =
             solution->relative_wave_angle_degrees;
+        audit.current_applied = applied.has_current;
+        audit.wave_applied = applied.has_wave;
+        point.environment = audit;
+    }
+    if (options.segment_eligibility &&
+        !options.segment_eligibility(RouteSegmentView{parent, point})) {
+        return std::optional<VariableTransition>{};
+    }
+    return std::optional<VariableTransition>{
+        VariableTransition{std::move(point), configuration}};
+}
+
+Result<std::optional<VariableTransition>> evaluate_heading_transition(
+    const WeatherDataset& weather,
+    const VesselPolar& polar,
+    const RoutingOptions& options,
+    const RoutingEnvironment& environment,
+    EnvironmentDiagnostics& diagnostics,
+    const RoutePoint& parent,
+    OperationalConfiguration parent_configuration,
+    double water_heading_degrees,
+    TimePoint arrival) {
+    const auto total_duration =
+        std::chrono::duration_cast<std::chrono::seconds>(arrival - parent.time);
+    if (total_duration <= std::chrono::seconds::zero()) {
+        return std::optional<VariableTransition>{};
+    }
+
+    auto wind_result = weather.interpolate(parent.position, parent.time);
+    if (!wind_result) {
+        if (wind_result.error().code == ErrorCode::coordinate_outside_forecast) {
+            return std::optional<VariableTransition>{};
+        }
+        return wind_result.error();
+    }
+    auto evaluated_wind = evaluate_wind(wind_result.value(), options);
+    if (!evaluated_wind) {
+        return evaluated_wind.error();
+    }
+    if (!evaluated_wind.value().has_value()) {
+        return std::optional<VariableTransition>{};
+    }
+    const double wind_speed = evaluated_wind.value()->speed_knots;
+    const double wind_from =
+        evaluated_wind.value()->direction_from_degrees;
+
+    const bool environment_active = environment.active();
+    const bool environment_fields_active =
+        environment.currents.configured() || environment.waves.configured();
+    EnvironmentSamples samples;
+    if (environment_fields_active) {
+        EnvironmentSampleResult sampled = sample_environment(
+            environment, parent.position, parent.time, diagnostics);
+        if (sampled.outcome == EnvironmentOutcome::failed) {
+            return *sampled.error;
+        }
+        if (sampled.outcome == EnvironmentOutcome::rejected) {
+            return std::optional<VariableTransition>{};
+        }
+        samples = sampled.samples;
+    }
+
+    auto initial_result = evaluate_water_heading(
+        polar,
+        options,
+        environment,
+        diagnostics,
+        wind_speed,
+        wind_from,
+        samples,
+        water_heading_degrees);
+    if (!initial_result) {
+        return initial_result.error();
+    }
+    if (!initial_result.value().has_value()) {
+        return std::optional<VariableTransition>{};
+    }
+    LegSolution solution = std::move(*initial_result.value());
+    const OperationalConfiguration configuration{
+        solution.board,
+        parent_configuration.sail,
+        parent_configuration.reef};
+    const auto delay = maneuver_delay(
+        options.maneuver,
+        parent_configuration,
+        angular_difference_degrees(parent.heading_degrees, wind_from),
+        configuration,
+        solution.true_wind_angle_degrees);
+    if (delay >= total_duration) {
+        return std::optional<VariableTransition>{};
+    }
+    const auto sailing_duration = total_duration - delay;
+    const double sailing_hours =
+        std::chrono::duration<double, std::ratio<3600>>(sailing_duration).count();
+
+    EnvironmentSamples applied = samples;
+    GroundVelocity ground = applied.has_current
+        ? ground_velocity(
+              solution.water_heading_degrees,
+              solution.water_speed_knots,
+              applied.current)
+        : GroundVelocity{
+              solution.water_heading_degrees, solution.water_speed_knots};
+    if (!(ground.speed_knots > 0.0)) {
+        return std::optional<VariableTransition>{};
+    }
+
+    const bool midpoint_wind =
+        options.wind_sampling == WindSampling::midpoint &&
+        sailing_duration >= options.midpoint_wind_sampling_threshold;
+    const bool midpoint_environment = environment_fields_active &&
+        environment.sampling == EnvironmentSampling::midpoint;
+    if (midpoint_wind || midpoint_environment) {
+        const Coordinate midpoint = destination_point(
+            parent.position,
+            ground.course_degrees,
+            ground.speed_knots * sailing_hours * 0.5);
+        const TimePoint midpoint_time =
+            parent.time + delay + sailing_duration / 2;
+        double refined_wind_speed = wind_speed;
+        double refined_wind_from = wind_from;
+        if (midpoint_wind) {
+            auto sampled_wind = weather.interpolate(midpoint, midpoint_time);
+            if (!sampled_wind) {
+                if (sampled_wind.error().code ==
+                    ErrorCode::coordinate_outside_forecast) {
+                    return std::optional<VariableTransition>{};
+                }
+                return sampled_wind.error();
+            }
+            auto evaluated_midpoint =
+                evaluate_wind(sampled_wind.value(), options);
+            if (!evaluated_midpoint) {
+                return evaluated_midpoint.error();
+            }
+            if (!evaluated_midpoint.value().has_value()) {
+                return std::optional<VariableTransition>{};
+            }
+            refined_wind_speed = evaluated_midpoint.value()->speed_knots;
+            refined_wind_from =
+                evaluated_midpoint.value()->direction_from_degrees;
+        }
+        if (midpoint_environment) {
+            EnvironmentSampleResult sampled = sample_environment(
+                environment, midpoint, midpoint_time, diagnostics);
+            if (sampled.outcome == EnvironmentOutcome::failed) {
+                return *sampled.error;
+            }
+            if (sampled.outcome == EnvironmentOutcome::rejected) {
+                return std::optional<VariableTransition>{};
+            }
+            applied = sampled.samples;
+        }
+        auto refined_result = evaluate_water_heading(
+            polar,
+            options,
+            environment,
+            diagnostics,
+            refined_wind_speed,
+            refined_wind_from,
+            applied,
+            water_heading_degrees);
+        if (!refined_result) {
+            return refined_result.error();
+        }
+        if (!refined_result.value().has_value()) {
+            return std::optional<VariableTransition>{};
+        }
+        solution = std::move(*refined_result.value());
+        ground = applied.has_current
+            ? ground_velocity(
+                  solution.water_heading_degrees,
+                  solution.water_speed_knots,
+                  applied.current)
+            : GroundVelocity{
+                  solution.water_heading_degrees,
+                  solution.water_speed_knots};
+        if (!(ground.speed_knots > 0.0)) {
+            return std::optional<VariableTransition>{};
+        }
+    }
+
+    const double distance = ground.speed_knots * sailing_hours;
+    const Coordinate position = destination_point(
+        parent.position, ground.course_degrees, distance);
+    if (environment_active) {
+        const SegmentCheckResult geometry = check_segment_geometry(
+            environment,
+            parent.position,
+            parent.time,
+            position,
+            arrival,
+            diagnostics);
+        if (geometry.outcome == EnvironmentOutcome::failed) {
+            return *geometry.error;
+        }
+        if (geometry.outcome == EnvironmentOutcome::rejected) {
+            return std::optional<VariableTransition>{};
+        }
+    }
+
+    RoutePoint point{
+        position,
+        arrival,
+        solution.water_heading_degrees,
+        solution.water_speed_knots,
+        wind_speed,
+        wind_from,
+        parent.cumulative_distance_nautical_miles + distance,
+        std::nullopt};
+    if (applied.has_current || applied.has_wave) {
+        RoutePointEnvironment audit;
+        audit.speed_over_ground_knots = ground.speed_knots;
+        audit.course_over_ground_degrees = ground.course_degrees;
+        audit.current_east_knots = applied.current.east_knots;
+        audit.current_north_knots = applied.current.north_knots;
+        audit.flat_water_speed_knots = solution.flat_water_speed_knots;
+        audit.significant_wave_height_metres =
+            applied.wave.significant_height_metres;
+        audit.wave_period_seconds = applied.wave.peak_period_seconds;
+        audit.relative_wave_angle_degrees =
+            solution.relative_wave_angle_degrees;
         audit.current_applied = applied.has_current;
         audit.wave_applied = applied.has_wave;
         point.environment = audit;

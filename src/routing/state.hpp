@@ -31,11 +31,29 @@ struct OperationalConfiguration {
     }
 };
 
+struct SphericalPositionKey {
+    std::int64_t x{};
+    std::int64_t y{};
+    std::int64_t z{};
+
+    friend bool operator==(
+        const SphericalPositionKey&,
+        const SphericalPositionKey&) noexcept = default;
+
+    friend bool operator<(
+        const SphericalPositionKey& left,
+        const SphericalPositionKey& right) noexcept {
+        return std::tie(left.x, left.y, left.z) <
+            std::tie(right.x, right.y, right.z);
+    }
+};
+
 struct SolverStateKey {
     std::size_t spatial{};
     std::int64_t time_bucket{};
     TimePoint arrival;
     OperationalConfiguration configuration;
+    SphericalPositionKey position;
 
     friend bool operator==(
         const SolverStateKey&,
@@ -46,11 +64,13 @@ struct SolverStateKey {
         const SolverStateKey& right) noexcept {
         return std::tie(
                    left.spatial,
+                   left.position,
                    left.time_bucket,
                    left.arrival,
                    left.configuration) <
             std::tie(
                    right.spatial,
+                   right.position,
                    right.time_bucket,
                    right.arrival,
                    right.configuration);
@@ -68,12 +88,13 @@ struct SolverLabelIdentity {
 struct ContinuationStateKey {
     std::size_t spatial{};
     OperationalConfiguration configuration;
+    SphericalPositionKey position;
 
     friend bool operator<(
         const ContinuationStateKey& left,
         const ContinuationStateKey& right) noexcept {
-        return std::tie(left.spatial, left.configuration) <
-            std::tie(right.spatial, right.configuration);
+        return std::tie(left.spatial, left.position, left.configuration) <
+            std::tie(right.spatial, right.position, right.configuration);
     }
 };
 

@@ -49,6 +49,10 @@ TEST_CASE("solver state dominance preserves operational configurations") {
     auto other_time_bucket = later;
     other_time_bucket.state.time_bucket += 1;
     REQUIRE(!sailroute::detail::dominates(earlier, other_time_bucket));
+
+    auto other_position = later;
+    other_position.state.position.x = 1;
+    REQUIRE(!sailroute::detail::dominates(earlier, other_position));
 }
 
 TEST_CASE("transition primitives use knots and degrees true") {

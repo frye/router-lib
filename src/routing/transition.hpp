@@ -72,4 +72,20 @@ evaluate_variable_transition(
     Coordinate destination,
     TimePoint route_end);
 
+/// Evaluates one fixed-duration water heading. The transition sails until
+/// `arrival`, after deducting any maneuver delay, and lets current determine the
+/// resulting ground track. A successful empty result has the same infeasible
+/// meaning as `evaluate_variable_transition`.
+[[nodiscard]] Result<std::optional<VariableTransition>>
+evaluate_heading_transition(
+    const WeatherDataset& weather,
+    const VesselPolar& polar,
+    const RoutingOptions& options,
+    const RoutingEnvironment& environment,
+    EnvironmentDiagnostics& diagnostics,
+    const RoutePoint& parent,
+    OperationalConfiguration parent_configuration,
+    double water_heading_degrees,
+    TimePoint arrival);
+
 }  // namespace sailroute::detail
