@@ -33,6 +33,8 @@ public:
         CellIndex cell) const noexcept;
     [[nodiscard]] std::optional<CellIndex> nearest_cell(
         Coordinate coordinate) const noexcept;
+    [[nodiscard]] std::optional<Face> containing_face(
+        Coordinate coordinate) const noexcept;
     [[nodiscard]] double maximum_neighbor_edge_length_nautical_miles(
         CellIndex cell) const noexcept;
 
@@ -42,6 +44,7 @@ private:
     std::size_t leaf_face_count_{};
     std::vector<Coordinate> coordinates_;
     std::vector<std::vector<CellIndex>> neighbors_;
+    std::vector<Face> faces_;
 };
 
 }  // namespace sailroute::detail

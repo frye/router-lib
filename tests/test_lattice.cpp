@@ -24,6 +24,28 @@ sailroute::RoutePoint route_point(Coordinate coordinate) {
     return point;
 }
 
+Coordinate face_center(
+    const GeodesicLattice& lattice,
+    GeodesicLattice::Face face) {
+    std::array<double, 3U> sum{};
+    for (const auto cell : face) {
+        const Coordinate coordinate = lattice.coordinate(cell);
+        const double latitude =
+            coordinate.latitude_degrees * std::numbers::pi / 180.0;
+        const double longitude =
+            coordinate.longitude_degrees * std::numbers::pi / 180.0;
+        const double cosine_latitude = std::cos(latitude);
+        sum[0U] += cosine_latitude * std::cos(longitude);
+        sum[1U] += cosine_latitude * std::sin(longitude);
+        sum[2U] += std::sin(latitude);
+    }
+    const double length =
+        std::sqrt(sum[0U] * sum[0U] + sum[1U] * sum[1U] + sum[2U] * sum[2U]);
+    return {
+        std::asin(sum[2U] / length) * 180.0 / std::numbers::pi,
+        std::atan2(sum[1U], sum[0U]) * 180.0 / std::numbers::pi};
+}
+
 void require_reciprocal_sorted_neighbors(const GeodesicLattice& lattice) {
     for (GeodesicLattice::CellIndex cell = 0U; cell < lattice.vertex_count(); ++cell) {
         const auto adjacent = lattice.neighbors(cell);
@@ -204,6 +226,25 @@ TEST_CASE("geodesic lattice nearest lookup handles antimeridian and poles stably
         {std::numeric_limits<double>::quiet_NaN(), 0.0}).has_value());
 }
 
+TEST_CASE("geodesic lattice finds containing faces deterministically") {
+    const auto lattice = GeodesicLattice::create(4U);
+    REQUIRE(lattice.has_value());
+
+    for (const auto face : lattice.value().faces()) {
+        const auto found =
+            lattice.value().containing_face(face_center(lattice.value(), face));
+        REQUIRE(found.has_value());
+        REQUIRE(found.value() == face);
+    }
+    REQUIRE(lattice.value().containing_face({0.0, 180.0}).has_value());
+    REQUIRE(lattice.value().containing_face({90.0, -180.0}).has_value());
+    REQUIRE(
+        lattice.value().containing_face({90.0, -180.0}) ==
+        lattice.value().containing_face({90.0, 137.0}));
+    REQUIRE(!lattice.value().containing_face(
+        {0.0, std::numeric_limits<double>::infinity()}).has_value());
+}
+
 TEST_CASE("geodesic lattice edge lengths shrink with subdivision") {
     const auto coarse = GeodesicLattice::create(0U);
     const auto fine = GeodesicLattice::create(3U);
@@ -324,4 +365,29 @@ TEST_CASE("mixed lattice active domain scales with corridor width") {
     REQUIRE(wide.value().vertex_count() < global_fine.value().vertex_count());
     require_connected(narrow.value());
     require_connected(wide.value());
+}
+
+TEST_CASE("mixed lattice containing faces follow retained leaf topology") {
+    const std::array route{
+        route_point({1.0, 0.1}),
+        route_point({1.0, 1.9})};
+    const auto first = MixedResolutionLattice::create(4U, 2U, route, 120.0);
+    const auto repeated = MixedResolutionLattice::create(4U, 2U, route, 120.0);
+    REQUIRE(first.has_value());
+    REQUIRE(repeated.has_value());
+
+    for (const Coordinate sample :
+         std::array{
+             Coordinate{1.0, 0.1},
+             Coordinate{1.0, 1.9},
+             Coordinate{0.0, 180.0},
+             Coordinate{90.0, 0.0}}) {
+        const auto first_face = first.value().containing_face(sample);
+        const auto repeated_face = repeated.value().containing_face(sample);
+        REQUIRE(first_face.has_value());
+        REQUIRE(first_face == repeated_face);
+        for (const auto cell : *first_face) {
+            REQUIRE(cell < first.value().vertex_count());
+        }
+    }
 }
