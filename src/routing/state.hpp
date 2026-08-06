@@ -51,7 +51,6 @@ struct SphericalPositionKey {
 struct SolverStateKey {
     std::size_t spatial{};
     std::int64_t time_bucket{};
-    TimePoint arrival;
     OperationalConfiguration configuration;
     SphericalPositionKey position;
 
@@ -66,13 +65,11 @@ struct SolverStateKey {
                    left.spatial,
                    left.position,
                    left.time_bucket,
-                   left.arrival,
                    left.configuration) <
             std::tie(
                    right.spatial,
                    right.position,
                    right.time_bucket,
-                   right.arrival,
                    right.configuration);
     }
 };
@@ -102,6 +99,12 @@ struct ContinuationStateKey {
     const SolverLabelIdentity& left,
     const SolverLabelIdentity& right) noexcept {
     return left.state == right.state && left.arrival <= right.arrival;
+}
+
+[[nodiscard]] inline bool strictly_dominates(
+    const SolverLabelIdentity& left,
+    const SolverLabelIdentity& right) noexcept {
+    return dominates(left, right) && !dominates(right, left);
 }
 
 }  // namespace sailroute::detail

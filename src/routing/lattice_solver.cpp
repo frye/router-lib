@@ -61,7 +61,6 @@ struct LaterQueueEntry {
                    left.state.spatial,
                    left.state.position,
                    left.state.time_bucket,
-                   left.state.arrival,
                    left.state.configuration,
                    left.ordinal) >
             std::tie(
@@ -70,7 +69,6 @@ struct LaterQueueEntry {
                    right.state.spatial,
                    right.state.position,
                    right.state.time_bucket,
-                   right.state.arrival,
                    right.state.configuration,
                    right.ordinal);
     }
@@ -201,7 +199,6 @@ Result<SearchOutcome> search_lattice(
         SolverStateKey{
             *start_cell,
             0,
-            departure,
             {},
             position_key(request.start, position_bucket_width)},
         RoutePoint{
@@ -251,11 +248,13 @@ Result<SearchOutcome> search_lattice(
 
     const auto push_label = [&](Label label) {
         const auto found = best.find(label.state);
-        if (found != best.end() &&
-            dominates(
-                label_identity(labels[found->second]),
-                label_identity(label))) {
-            return;
+        if (found != best.end()) {
+            const SolverLabelIdentity incumbent =
+                label_identity(labels[found->second]);
+            const SolverLabelIdentity candidate = label_identity(label);
+            if (!strictly_dominates(candidate, incumbent)) {
+                return;
+            }
         }
         const LabelIndex index = labels.size();
         const ContinuationStateKey continuation{
@@ -399,7 +398,6 @@ Result<SearchOutcome> search_lattice(
                     target,
                     bucket_for(
                         transition.point.time, departure, bucket_width),
-                    transition.point.time,
                     transition.configuration,
                     position_key(
                         transition.point.position, position_bucket_width)},
@@ -480,7 +478,6 @@ Result<SearchOutcome> search_lattice(
                                     SolverStateKey{
                                         *target,
                                         next_bucket,
-                                        wait_until,
                                         transition.configuration,
                                         position_key(
                                             transition.point.position,
@@ -520,7 +517,6 @@ Result<SearchOutcome> search_lattice(
                     SolverStateKey{
                         current.state.spatial,
                         next_bucket,
-                        wait_until,
                         current.state.configuration,
                         current.state.position},
                     std::move(waited),
