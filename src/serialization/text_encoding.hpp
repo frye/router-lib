@@ -6,6 +6,17 @@
 
 namespace sailroute::serialization_detail {
 
+inline bool needs_legacy_partial_reason(RouteCompletion completion) noexcept {
+    return completion == RouteCompletion::duration_exhausted;
+}
+
+inline RouteCompletion legacy_serialized_completion(
+    RouteCompletion completion) noexcept {
+    return completion == RouteCompletion::duration_exhausted
+        ? RouteCompletion::forecast_exhausted
+        : completion;
+}
+
 struct DecodedCodePoint {
     std::uint32_t value;
     std::size_t length;

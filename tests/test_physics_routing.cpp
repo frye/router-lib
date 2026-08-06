@@ -364,7 +364,7 @@ TEST_CASE("ground motion is the vector sum of water velocity and current") {
     REQUIRE(crabbed);
 }
 
-TEST_CASE("the isochrone solver rejects current-cancelled ground motion") {
+TEST_CASE("the isochrone solver excludes current-cancelled ground motion") {
     const sailroute::test::ConstantWindGribFixture fixture;
     const WeatherDataset weather = load_weather(fixture);
     const auto polar = sailroute::VesselPolar::default_racer_cruiser_45ft();
@@ -397,9 +397,12 @@ TEST_CASE("the isochrone solver rejects current-cancelled ground motion") {
         };
 
     const auto result = router.optimize(request);
-    REQUIRE(!result.has_value());
-    REQUIRE(result.error().code == ErrorCode::no_route);
-    REQUIRE(cancelled_segments == 0U);
+        REQUIRE(result.has_value());
+        REQUIRE(
+            result.value().completion ==
+            sailroute::RouteCompletion::duration_exhausted);
+        REQUIRE(result.value().points.size() > 1U);
+        REQUIRE(cancelled_segments == 0U);
 }
 
 TEST_CASE("a following current arrives sooner and an opposing one later") {
@@ -551,7 +554,7 @@ TEST_CASE("a calm sea reproduces the flat-water route and waves slow it down") {
     }
 }
 
-TEST_CASE("a landmask barrier across the route removes every candidate") {
+TEST_CASE("a landmask barrier returns the best duration-limited partial route") {
     const sailroute::test::ConstantWindGribFixture fixture;
     const WeatherDataset weather = load_weather(fixture);
 
@@ -564,8 +567,13 @@ TEST_CASE("a landmask barrier across the route removes every candidate") {
         environment};
 
     const auto blocked = router.optimize(base_request());
-    REQUIRE(!blocked.has_value());
-    REQUIRE(blocked.error().code == ErrorCode::no_route);
+    REQUIRE(blocked.has_value());
+    REQUIRE(
+        blocked.value().completion ==
+        sailroute::RouteCompletion::duration_exhausted);
+    REQUIRE(blocked.value().points.size() > 1U);
+    REQUIRE(blocked.value().environment_diagnostics.has_value());
+    REQUIRE(blocked.value().environment_diagnostics->land_rejections > 0U);
 }
 
 TEST_CASE("a landmask island forces a longer route around it") {

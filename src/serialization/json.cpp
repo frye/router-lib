@@ -179,7 +179,16 @@ Result<std::string> route_to_json(const RouteResult& route) {
     std::string output;
     output.reserve(512 + route.points.size() * 320);
     output.append("{\n  \"completion\":");
-    serialization_detail::append_json_string(output, to_string(route.completion));
+    serialization_detail::append_json_string(
+        output,
+        to_string(
+            serialization_detail::legacy_serialized_completion(
+                route.completion)));
+    if (serialization_detail::needs_legacy_partial_reason(route.completion)) {
+        output.append(",\n  \"partial_reason\":");
+        serialization_detail::append_json_string(
+            output, to_string(route.completion));
+    }
     output.append(",\n  \"departure\":{\"time\":");
     serialization_detail::append_json_string(output, format_utc_time(route.departure_time));
     output.append(",\"source\":");

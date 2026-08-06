@@ -451,6 +451,9 @@ TEST_CASE("departure sources have stable names") {
     REQUIRE(
         sailroute::to_string(sailroute::RouteCompletion::forecast_exhausted) ==
         std::string_view{"forecast_exhausted"});
+    REQUIRE(
+        sailroute::to_string(sailroute::RouteCompletion::duration_exhausted) ==
+        std::string_view{"duration_exhausted"});
 }
 
 TEST_CASE("routing defaults retain a wider configurable frontier") {
@@ -1114,7 +1117,7 @@ TEST_CASE("partial route ownership is independent of callbacks and payloads") {
     require_same_route(direct.value(), view.value());
 }
 
-TEST_CASE("maximum route duration remains an error at the forecast boundary") {
+TEST_CASE("maximum route duration returns the best partial isochrone route") {
     {
         const RoutingGribFixture fixture;
         const auto weather = sailroute::WeatherDataset::load(fixture.path());
@@ -1125,8 +1128,15 @@ TEST_CASE("maximum route duration remains an error at the forecast boundary") {
         request.options.maximum_route_duration = std::chrono::hours{1};
         const auto result = router.optimize(request);
 
-        REQUIRE(!result.has_value());
-        REQUIRE(result.error().code == sailroute::ErrorCode::no_route);
+        REQUIRE(result.has_value());
+        REQUIRE(
+            result.value().completion ==
+            sailroute::RouteCompletion::duration_exhausted);
+        REQUIRE(result.value().points.size() > 1U);
+        REQUIRE(
+            result.value().arrival_time ==
+            result.value().departure_time + std::chrono::hours{1});
+        require_monotonic_route(result.value());
     }
 
     {
@@ -1139,8 +1149,15 @@ TEST_CASE("maximum route duration remains an error at the forecast boundary") {
         request.options.maximum_route_duration = std::chrono::hours{1};
         const auto result = router.optimize(request);
 
-        REQUIRE(!result.has_value());
-        REQUIRE(result.error().code == sailroute::ErrorCode::no_route);
+        REQUIRE(result.has_value());
+        REQUIRE(
+            result.value().completion ==
+            sailroute::RouteCompletion::duration_exhausted);
+        REQUIRE(result.value().points.size() > 1U);
+        REQUIRE(
+            result.value().arrival_time ==
+            result.value().departure_time + std::chrono::hours{1});
+        require_monotonic_route(result.value());
     }
 }
 
@@ -2415,8 +2432,22 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
         duration_limited.options.maximum_route_duration =
             std::chrono::hours{1};
         const auto exhausted = full_router.optimize(duration_limited);
-        REQUIRE(!exhausted.has_value());
-        REQUIRE(exhausted.error().code == sailroute::ErrorCode::no_route);
+        REQUIRE(exhausted.has_value());
+        REQUIRE(
+            exhausted.value().completion ==
+            sailroute::RouteCompletion::duration_exhausted);
+        REQUIRE(exhausted.value().points.size() > 1U);
+        REQUIRE(
+            exhausted.value().arrival_time <=
+            exhausted.value().departure_time + std::chrono::hours{1});
+        REQUIRE(
+            sailroute::detail::great_circle_distance_nautical_miles(
+                exhausted.value().points.back().position,
+                duration_limited.destination) <
+            sailroute::detail::great_circle_distance_nautical_miles(
+                duration_limited.start,
+                duration_limited.destination));
+        require_monotonic_route(exhausted.value());
     }
 
     TEST_CASE("lattice callback exceptions propagate synchronously") {

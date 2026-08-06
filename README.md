@@ -28,10 +28,11 @@ An explicit departure outside forecast coverage is rejected. If departure is
 omitted, the library uses current UTC time when it can be interpolated from the
 forecast, otherwise it uses the forecast's first valid time.
 
-If forecast coverage ends before the destination is reached, routing succeeds
-with the best forecast-supported partial route and
-`RouteCompletion::forecast_exhausted`. Other incomplete searches, including
-maximum-duration exhaustion, remain routing errors.
+If forecast coverage or `maximum_route_duration` ends before the destination is
+reached, routing succeeds with the best supported partial route and completion
+`RouteCompletion::forecast_exhausted` or
+`RouteCompletion::duration_exhausted`. A search that cannot advance from the
+start remains a routing error.
 
 ## Requirements and build
 
@@ -100,9 +101,12 @@ resolution controls. Isochrone output is optional and contains the retained
 post-pruning search frontier at each completed routing time step. The JSON
 output is a GeoJSON `FeatureCollection` of `LineString` or `MultiLineString`
 contours; the GPX output contains one track per frontier and one track segment
-per contour component. When the forecast is exhausted, the CLI writes the
-partial route and emits a warning on standard error. Route JSON and GPX include
-the completion status so downstream consumers can distinguish partial output.
+per contour component. When the forecast or maximum route duration is
+exhausted, the CLI writes the partial route and emits a warning on standard
+error. For duration-limited output, route JSON and GPX retain the legacy
+`forecast_exhausted` completion value and add a precise `partial_reason`.
+Older consumers continue to load the route; newer consumers can distinguish
+the binding limit. Forecast-limited output keeps its existing wire shape.
 
 The router retains up to 10 nodes per spatial bucket by default. Increase
 `--max-nodes-per-bucket` to preserve a larger set of alternate paths, or reduce
@@ -168,7 +172,8 @@ the polar peak with a shape-preserving fit:
   --wind-sampling midpoint
 ```
 
-The CLI returns `0` on success (including a forecast-exhausted partial route),
+The CLI returns `0` on success (including a forecast- or duration-exhausted
+partial route),
 `2` for command-line usage errors, `3` for weather or polar input errors, `4`
 for routing errors, and `5` for serialization or file-output errors.
 
@@ -240,10 +245,10 @@ Loaded weather and polar objects are immutable and reusable across route
 requests, avoiding repeated GRIB decoding and polar preprocessing. Isochrone
 capture is disabled by default so route-only callers do not retain the full
 search frontier history. A successful `RouteResult` has completion
-`destination_reached` or `forecast_exhausted`. For a forecast-exhausted result,
-`points` owns the best route through the final supported frontier,
-`arrival_time` is the final point's time, and diagnostics and requested
-isochrones cover all completed routing steps.
+`destination_reached`, `forecast_exhausted`, or `duration_exhausted`. For a
+partial result, `points` owns the best route through the final supported
+frontier, `arrival_time` is the final point's time, and diagnostics and
+requested isochrones cover all completed routing steps.
 
 ### Error handling
 
@@ -917,7 +922,7 @@ only whether isochrones are retained in the final `RouteResult`. Validation
 failures and requests already within the arrival radius produce no progress
 updates. The callback reports intermediate frontiers only: the consuming
 application must still inspect the `Result<RouteResult>` returned by `optimize`
-for the final complete or forecast-exhausted route, or for a routing error.
+for the final complete or partial route, or for a routing error.
 Partial-route ownership does not depend on installing a callback, callback
 cadence, or callback payload selection.
 

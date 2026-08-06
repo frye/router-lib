@@ -606,7 +606,7 @@ Result<SearchOutcome> search_lattice(
         }
     }
 
-    if (forecast_limited && closest != 0U) {
+    if (closest != 0U) {
         RouteResult result;
         result.departure_time = departure;
         result.arrival_time = labels[closest].point.time;
@@ -615,7 +615,9 @@ Result<SearchOutcome> search_lattice(
         result.polar_source = polar.source();
         result.points = reconstruct(labels, closest);
         result.diagnostics = route_diagnostics;
-        result.completion = RouteCompletion::forecast_exhausted;
+        result.completion = forecast_limited
+            ? RouteCompletion::forecast_exhausted
+            : RouteCompletion::duration_exhausted;
         result.lattice_diagnostics = diagnostics;
         return SearchOutcome{
             std::move(result), diagnostics, environment_diagnostics};
