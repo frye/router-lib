@@ -2202,6 +2202,47 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
         }
     }
 
+    TEST_CASE("short cross-face lattice routes settle a queued destination") {
+        const RoutingGribFixture fixture{20260714, 1200, 24};
+        const auto weather = sailroute::WeatherDataset::load(fixture.path());
+        REQUIRE(weather.has_value());
+        const sailroute::Router router{weather.value()};
+
+        sailroute::RouteRequest a_star = routing_request(0U, false);
+        a_star.start = {1.0, 0.1};
+        a_star.destination = {1.0, 1.9};
+        a_star.options.maximum_route_duration = std::chrono::hours{24};
+        a_star.options.solver =
+            sailroute::RoutingSolver::time_dependent_lattice;
+        a_star.options.lattice.subdivision_level = 4U;
+        a_star.options.lattice.refinement_levels = 0U;
+        sailroute::RouteRequest dijkstra = a_star;
+        dijkstra.options.lattice.search_algorithm =
+            sailroute::LatticeSearchAlgorithm::dijkstra;
+
+        const auto a_star_result = router.optimize(a_star);
+        const auto dijkstra_result = router.optimize(dijkstra);
+        REQUIRE(a_star_result.has_value());
+        REQUIRE(dijkstra_result.has_value());
+        REQUIRE(
+            a_star_result.value().arrival_time ==
+            dijkstra_result.value().arrival_time);
+        REQUIRE(a_star_result.value().points.size() > 2U);
+        REQUIRE(dijkstra_result.value().points.size() > 2U);
+        REQUIRE(a_star_result.value().lattice_diagnostics.has_value());
+        REQUIRE(dijkstra_result.value().lattice_diagnostics.has_value());
+        REQUIRE(
+            a_star_result.value().lattice_diagnostics->settled_labels > 2U);
+        REQUIRE(
+            dijkstra_result.value().lattice_diagnostics->settled_labels > 2U);
+        REQUIRE(
+            a_star_result.value().points.back().position.latitude_degrees ==
+            a_star.destination.latitude_degrees);
+        REQUIRE(
+            a_star_result.value().points.back().position.longitude_degrees ==
+            a_star.destination.longitude_degrees);
+    }
+
     TEST_CASE("failed mixed refinement retains the coarse incumbent") {
         const RoutingGribFixture fixture{
             20260714,
