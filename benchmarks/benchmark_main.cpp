@@ -17,6 +17,13 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#if defined(_WIN32)
+#include <windows.h>
+
+#include <psapi.h>
+#else
+#include <sys/resource.h>
+#endif
 #ifndef SAILROUTE_BASELINE_REVISION
 #define SAILROUTE_BASELINE_REVISION "unknown"
 #endif
@@ -290,6 +297,40 @@ sailroute::ExclusionZoneSet benchmark_zones(
     return std::move(set.value());
 }
 
+// Process high-water mark. Providers are configured immediately before the case
+// that uses them, so the growth since the previous reading covers both provider
+// construction and the route that consumed it.
+double peak_resident_mebibytes() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters)) ==
+        0) {
+        return 0.0;
+    }
+    const double bytes = static_cast<double>(counters.PeakWorkingSetSize);
+#else
+    rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        return 0.0;
+    }
+#if defined(__APPLE__)
+    const double bytes = static_cast<double>(usage.ru_maxrss);
+#else
+    const double bytes = static_cast<double>(usage.ru_maxrss) * 1024.0;
+#endif
+#endif
+    return bytes / (1024.0 * 1024.0);
+}
+
+void report_peak_resident(double& watermark_mebibytes) {
+    const double peak = peak_resident_mebibytes();
+    std::cout << "  peak " << std::fixed << std::setprecision(1) << std::setw(6)
+              << peak << " MiB " << std::showpos << std::setprecision(2)
+              << std::setw(6) << peak - watermark_mebibytes << std::noshowpos
+              << std::defaultfloat;
+    watermark_mebibytes = peak;
+}
+
 void report_environment(
     const sailroute::WeatherDataset& weather,
     const sailroute::VesselPolar& polar,
@@ -297,7 +338,8 @@ void report_environment(
     const sailroute::RouteRequest& request,
     std::string_view label,
     double baseline_milliseconds,
-    double baseline_hours) {
+    double baseline_hours,
+    double& peak_watermark_mebibytes) {
     const sailroute::Router router{weather, polar, environment};
     const auto start = std::chrono::steady_clock::now();
     auto route = router.optimize(request);
@@ -344,6 +386,7 @@ void report_environment(
                   << counters.exclusion_geometry_tests << '/'
                   << counters.exclusion_rejections;
     }
+    report_peak_resident(peak_watermark_mebibytes);
     std::cout << '\n' << std::defaultfloat;
 }
 
@@ -363,6 +406,61 @@ double measure_baseline(
               .count()
         : 0.0;
     return milliseconds;
+}
+
+// Sea-state response across wave height and direction. Height 0.0 is the
+// flat-water equivalence check: it must reproduce the no-provider arrival
+// exactly, not merely closely.
+void report_sea_state_matrix(
+    const sailroute::WeatherDataset& weather,
+    const sailroute::VesselPolar& polar,
+    const sailroute::RouteRequest& request,
+    double baseline_hours) {
+    constexpr double heights[] = {0.0, 0.5, 1.0, 2.0, 4.0};
+    constexpr double directions[] = {0.0, 90.0, 180.0, 270.0};
+
+    std::cout << "\nsea-state parameter matrix (arrival hours, period 9.0 s)\n"
+              << "  flat-water baseline " << std::fixed << std::setprecision(4)
+              << baseline_hours << " h\n  " << std::left << std::setw(10)
+              << "Hs (m)" << std::right;
+    for (const double direction : directions) {
+        std::cout << std::setw(11) << std::setprecision(0) << direction
+                  << " deg";
+    }
+    std::cout << '\n';
+
+    for (const double height : heights) {
+        std::cout << "  " << std::left << std::setw(10) << std::setprecision(1)
+                  << height << std::right;
+        for (const double direction : directions) {
+            auto waves = sailroute::make_uniform_wave_provider(
+                sailroute::WaveState{height, 9.0, direction},
+                sailroute::ProviderMetadata{
+                    "benchmark_wave", "synthetic benchmark sea state", "1"});
+            auto model = sailroute::make_wave_height_derating_model();
+            if (!waves.has_value() || !model.has_value()) {
+                std::cout << std::setw(15) << "error";
+                continue;
+            }
+            sailroute::RoutingEnvironment environment;
+            environment.waves.provider = waves.value();
+            environment.waves.model = model.value();
+            const sailroute::Router router{weather, polar, environment};
+            auto route = router.optimize(request);
+            if (!route.has_value()) {
+                std::cout << std::setw(15) << "no route";
+                continue;
+            }
+            const double hours =
+                std::chrono::duration<double, std::ratio<3600>>(
+                    route.value().arrival_time - route.value().departure_time)
+                    .count();
+            std::cout << std::setw(11) << std::setprecision(4) << hours;
+            std::cout << (height == 0.0 && hours == baseline_hours ? "  ==" : "    ");
+        }
+        std::cout << '\n';
+    }
+    std::cout << std::defaultfloat;
 }
 
 }  // namespace
@@ -604,14 +702,18 @@ int main(int argc, char** argv) {
     std::cout << "\nStage 3 environment overhead\n";
     const EnvironmentFootprint footprint{south, north, west, east};
     double baseline_hours = 0.0;
+    double peak_watermark = peak_resident_mebibytes();
     const double baseline_milliseconds =
         measure_baseline(router, request, baseline_hours);
     std::cout << "  " << std::left << std::setw(28) << "no providers"
               << std::right << "  " << std::fixed << std::setprecision(4)
               << std::setw(9) << baseline_hours << " h"
               << "                          " << std::setprecision(1)
-              << std::setw(8) << baseline_milliseconds << " ms\n"
+              << std::setw(8) << baseline_milliseconds << " ms"
               << std::defaultfloat;
+    std::cout << std::string(63, ' ');
+    report_peak_resident(peak_watermark);
+    std::cout << '\n' << std::defaultfloat;
 
     auto current = sailroute::make_uniform_current_provider(
         sailroute::CurrentVector{0.6, -0.3},
@@ -636,7 +738,8 @@ int main(int argc, char** argv) {
         request,
         "currents",
         baseline_milliseconds,
-        baseline_hours);
+        baseline_hours,
+        peak_watermark);
 
     sailroute::RoutingEnvironment waves_only;
     waves_only.waves.provider = waves.value();
@@ -648,7 +751,8 @@ int main(int argc, char** argv) {
         request,
         "sea-state derating",
         baseline_milliseconds,
-        baseline_hours);
+        baseline_hours,
+        peak_watermark);
 
     sailroute::RoutingEnvironment land_only;
     land_only.land.landmask = open_water_landmask(footprint, 256U);
@@ -661,7 +765,8 @@ int main(int argc, char** argv) {
         request,
         "landmask",
         baseline_milliseconds,
-        baseline_hours);
+        baseline_hours,
+        peak_watermark);
 
     for (const std::size_t zone_count : {4U, 32U, 128U}) {
         sailroute::RoutingEnvironment zones_only;
@@ -673,7 +778,8 @@ int main(int argc, char** argv) {
             request,
             "exclusions x" + std::to_string(zone_count),
             baseline_milliseconds,
-            baseline_hours);
+            baseline_hours,
+            peak_watermark);
     }
 
     sailroute::RoutingEnvironment combined;
@@ -691,7 +797,8 @@ int main(int argc, char** argv) {
         request,
         "all providers",
         baseline_milliseconds,
-        baseline_hours);
+        baseline_hours,
+        peak_watermark);
 
     sailroute::RoutingEnvironment combined_midpoint = combined;
     combined_midpoint.sampling = sailroute::EnvironmentSampling::midpoint;
@@ -704,6 +811,9 @@ int main(int argc, char** argv) {
         midpoint_request,
         "all providers, midpoint",
         baseline_milliseconds,
-        baseline_hours);
+        baseline_hours,
+        peak_watermark);
+
+    report_sea_state_matrix(weather.value(), polar, request, baseline_hours);
     return 0;
 }

@@ -624,6 +624,13 @@ cmake --build build
 ./build/sailroute_benchmarks samples/sample.grib
 ```
 
+The same run reports Stage 3 provider overhead against a no-provider baseline —
+arrival delta, wall time, `EnvironmentDiagnostics` counters, and process peak
+resident size for each provider combination — followed by a sea-state matrix of
+arrival time over significant wave height and wave direction. The zero-height row
+of that matrix is an equality check against the flat-water arrival, not an
+approximate comparison.
+
 ### Environmental physics
 
 Currents, sea state, land, and time-varying exclusion zones are optional. A
@@ -1069,8 +1076,6 @@ are explicit follow-ups rather than omissions:
 - **Time-varying currents and waves.** The provider interfaces already take a
   time, and the in-memory fields ignore it; time-dependent fields are an
   implementation detail of a future adapter.
-- **Downstream bridge adoption.** Native and managed integration of the Stage 3
-  audit fields.
 
 ## Portability
 
