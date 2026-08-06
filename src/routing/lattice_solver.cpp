@@ -62,7 +62,6 @@ struct LaterQueueEntry {
                    left.state.spatial,
                    left.state.position,
                    left.state.time_bucket,
-                   left.state.arrival,
                    left.state.configuration,
                    left.ordinal) >
             std::tie(
@@ -71,7 +70,6 @@ struct LaterQueueEntry {
                    right.state.spatial,
                    right.state.position,
                    right.state.time_bucket,
-                   right.state.arrival,
                    right.state.configuration,
                    right.ordinal);
     }
@@ -220,7 +218,6 @@ Result<SearchOutcome> search_lattice(
         SolverStateKey{
             *start_cell,
             0,
-            departure,
             {},
             position_key(request.start, position_bucket_width)},
         RoutePoint{
@@ -270,11 +267,13 @@ Result<SearchOutcome> search_lattice(
 
     const auto push_label = [&](Label label) {
         const auto found = best.find(label.state);
-        if (found != best.end() &&
-            dominates(
-                label_identity(labels[found->second]),
-                label_identity(label))) {
-            return false;
+        if (found != best.end()) {
+            const SolverLabelIdentity incumbent =
+                label_identity(labels[found->second]);
+            const SolverLabelIdentity candidate = label_identity(label);
+            if (!strictly_dominates(candidate, incumbent)) {
+                return false;
+            }
         }
         const LabelIndex index = labels.size();
         const ContinuationStateKey continuation{
@@ -350,12 +349,19 @@ Result<SearchOutcome> search_lattice(
         const bool at_lattice_cell =
             great_circle_distance_nautical_miles(
                 current.point.position, cell_coordinate) <= 1.0e-9;
+        const auto current_face = at_lattice_cell
+            ? std::optional<typename Lattice::Face>{}
+            : lattice.containing_face(current.point.position);
+        const bool same_destination_face =
+            current_face.has_value() &&
+            *current_face == *destination_face;
         const bool destination_connector =
-            at_lattice_cell &&
-            std::binary_search(
-                destination_connectors.begin(),
-                destination_connectors.end(),
-                current.state.spatial);
+            same_destination_face ||
+            (at_lattice_cell &&
+             std::binary_search(
+                 destination_connectors.begin(),
+                 destination_connectors.end(),
+                 current.state.spatial));
         const bool same_face_anchor_edge =
             entry.label == 0U && direct_anchor_edge;
         if (destination_connector || same_face_anchor_edge) {
@@ -382,8 +388,9 @@ Result<SearchOutcome> search_lattice(
                         lattice.vertex_count(),
                         bucket_for(
                             arrival.point.time, departure, bucket_width),
-                        arrival.point.time,
-                        arrival.configuration},
+                        arrival.configuration,
+                        position_key(
+                            arrival.point.position, position_bucket_width)},
                     std::move(arrival.point),
                     entry.label,
                     next_ordinal++,
@@ -431,7 +438,6 @@ Result<SearchOutcome> search_lattice(
                     target,
                     bucket_for(
                         transition.point.time, departure, bucket_width),
-                    transition.point.time,
                     transition.configuration,
                     position_key(
                         transition.point.position, position_bucket_width)},
@@ -512,7 +518,6 @@ Result<SearchOutcome> search_lattice(
                                     SolverStateKey{
                                         *target,
                                         next_bucket,
-                                        wait_until,
                                         transition.configuration,
                                         position_key(
                                             transition.point.position,
@@ -552,7 +557,6 @@ Result<SearchOutcome> search_lattice(
                     SolverStateKey{
                         current.state.spatial,
                         next_bucket,
-                        wait_until,
                         current.state.configuration,
                         current.state.position},
                     std::move(waited),

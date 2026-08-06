@@ -15,7 +15,6 @@ TEST_CASE("solver state dominance preserves operational configurations") {
     const sailroute::detail::SolverStateKey base{
         42U,
         3,
-        sailroute::TimePoint{100s},
         sailroute::detail::OperationalConfiguration{1, 0U, 0U}};
     const sailroute::detail::SolverLabelIdentity earlier{
         base,
@@ -25,14 +24,17 @@ TEST_CASE("solver state dominance preserves operational configurations") {
         3U};
     auto later = earlier;
     later.arrival += 1s;
-    later.state.arrival = later.arrival;
 
-    REQUIRE(!sailroute::detail::dominates(earlier, later));
+    REQUIRE(earlier.state == later.state);
+    REQUIRE(sailroute::detail::dominates(earlier, later));
     REQUIRE(!sailroute::detail::dominates(later, earlier));
+    REQUIRE(sailroute::detail::strictly_dominates(earlier, later));
+    REQUIRE(!sailroute::detail::strictly_dominates(later, earlier));
 
     auto duplicate = earlier;
     duplicate.ordinal += 1U;
     REQUIRE(sailroute::detail::dominates(earlier, duplicate));
+    REQUIRE(!sailroute::detail::strictly_dominates(earlier, duplicate));
 
     auto other_board = later;
     other_board.state.configuration.board = -1;
@@ -124,8 +126,6 @@ TEST_CASE("state ordering is independent of insertion order") {
         states.push_back(sailroute::detail::SolverStateKey{
             index % 7U,
             static_cast<std::int64_t>(index % 5U),
-            sailroute::TimePoint{
-                std::chrono::seconds{static_cast<std::int64_t>(index * 11U)}},
             sailroute::detail::OperationalConfiguration{
                 static_cast<std::int8_t>(
                     static_cast<int>(index % 3U) - 1),

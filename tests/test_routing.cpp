@@ -2305,6 +2305,12 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
         REQUIRE(a_star_result.value().lattice_diagnostics.has_value());
         REQUIRE(
             a_star_result.value().lattice_diagnostics->re_relaxed_labels > 0U);
+        REQUIRE(
+            a_star_result.value()
+                .lattice_diagnostics->stale_queue_entries > 0U);
+        REQUIRE(
+            a_star_result.value().lattice_diagnostics->queued_labels <
+            a_star_result.value().diagnostics.generated_candidates);
         require_monotonic_route(a_star_result.value());
 
         sailroute::RouteRequest beam = a_star;
