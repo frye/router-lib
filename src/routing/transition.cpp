@@ -334,7 +334,9 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
             auto sampled_wind = weather.interpolate(midpoint, midpoint_time);
             if (!sampled_wind) {
                 if (sampled_wind.error().code ==
-                    ErrorCode::coordinate_outside_forecast) {
+                        ErrorCode::coordinate_outside_forecast ||
+                    sampled_wind.error().code ==
+                        ErrorCode::departure_outside_forecast) {
                     return std::optional<VariableTransition>{};
                 }
                 return sampled_wind.error();

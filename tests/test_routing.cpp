@@ -2139,7 +2139,7 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
         REQUIRE(rejected_vmg_segments > 0U);
     }
 
-    TEST_CASE("lattice forecast exhaustion returns upwind VMG progress") {
+    TEST_CASE("lattice midpoint forecast exhaustion returns upwind VMG progress") {
         const RoutingGribFixture fixture{20260714, 1200, 4};
         const auto weather = sailroute::WeatherDataset::load(fixture.path());
         REQUIRE(weather.has_value());
@@ -2149,22 +2149,29 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
         request.options.maximum_route_duration = std::chrono::hours{24};
         request.options.solver =
             sailroute::RoutingSolver::time_dependent_lattice;
+        request.options.wind_sampling = sailroute::WindSampling::midpoint;
         request.options.lattice.subdivision_level = 4U;
         request.options.lattice.refinement_levels = 0U;
 
-        const sailroute::RouteResult route = must_route(router, request);
-        REQUIRE(
-            route.completion ==
-            sailroute::RouteCompletion::forecast_exhausted);
-        REQUIRE(route.points.size() > 1U);
-        REQUIRE(
-            sailroute::detail::great_circle_distance_nautical_miles(
-                route.points.back().position,
-                request.destination) <
-            sailroute::detail::great_circle_distance_nautical_miles(
-                request.start,
-                request.destination));
-        REQUIRE(route.points.back().cumulative_distance_nautical_miles > 0.0);
+        for (const auto algorithm :
+             {sailroute::LatticeSearchAlgorithm::a_star,
+              sailroute::LatticeSearchAlgorithm::dijkstra}) {
+            request.options.lattice.search_algorithm = algorithm;
+            const sailroute::RouteResult route = must_route(router, request);
+            REQUIRE(
+                route.completion ==
+                sailroute::RouteCompletion::forecast_exhausted);
+            REQUIRE(route.points.size() > 1U);
+            REQUIRE(
+                sailroute::detail::great_circle_distance_nautical_miles(
+                    route.points.back().position,
+                    request.destination) <
+                sailroute::detail::great_circle_distance_nautical_miles(
+                    request.start,
+                    request.destination));
+            REQUIRE(
+                route.points.back().cumulative_distance_nautical_miles > 0.0);
+        }
     }
 
     TEST_CASE("lattice A star and Dijkstra agree on earliest arrival") {
