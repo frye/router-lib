@@ -276,8 +276,9 @@ using RouteSegmentEligibilityCallback =
 
 /// Indicates whether a successful result reached the requested destination.
 enum class RouteCompletion {
-    destination_reached,
-    forecast_exhausted,
+    destination_reached = 0,
+    forecast_exhausted = 1,
+    duration_exhausted = 2,
 };
 
 /// Time deducted from a step when a candidate heading changes tack or gybe.
@@ -525,10 +526,10 @@ struct RoutingProgressView {
     LatticeSearchProgress search;
 };
 
-/// Successful complete or forecast-exhausted routing output.
+/// Successful complete or partial routing output.
 struct RouteResult {
     TimePoint departure_time;
-    // For partial results, this is the time of the final forecast-supported point.
+    // For partial results, this is the time of the final supported point.
     TimePoint arrival_time;
     DepartureSource departure_source;
     std::string forecast_source;

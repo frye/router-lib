@@ -181,8 +181,17 @@ Result<std::string> route_to_gpx(const RouteResult& route) {
     append_element(
         output,
         "sailroute:completion",
-        to_string(route.completion),
+        to_string(
+            serialization_detail::legacy_serialized_completion(
+                route.completion)),
         "      ");
+    if (serialization_detail::needs_legacy_partial_reason(route.completion)) {
+        append_element(
+            output,
+            "sailroute:partialReason",
+            to_string(route.completion),
+            "      ");
+    }
     if (route.environment.has_value()) {
         const RouteEnvironmentMetadata& environment = *route.environment;
         append_element(

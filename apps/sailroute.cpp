@@ -1015,6 +1015,12 @@ int run(const CliOptions& options) {
             << "sailroute: warning: forecast coverage ended before the "
                "destination was reached; writing the best supported partial "
                "route\n";
+    } else if (
+        route.value().completion ==
+        sailroute::RouteCompletion::duration_exhausted) {
+        std::cerr
+            << "sailroute: warning: maximum route duration ended before the "
+               "destination was reached; writing the best partial route\n";
     }
 
     auto json = sailroute::route_to_json(route.value());

@@ -53,6 +53,7 @@ std::string_view to_string(RouteCompletion completion) noexcept {
     switch (completion) {
         case RouteCompletion::destination_reached: return "destination_reached";
         case RouteCompletion::forecast_exhausted: return "forecast_exhausted";
+        case RouteCompletion::duration_exhausted: return "duration_exhausted";
     }
     return "unknown";
 }

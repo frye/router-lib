@@ -1356,15 +1356,6 @@ void capture_retained_points(
     }
 }
 
-Error route_duration_exhausted_error(const RouteDiagnostics& diagnostics) {
-    const std::string suffix =
-        " after " + std::to_string(diagnostics.time_steps) + " time steps and " +
-        std::to_string(diagnostics.expanded_nodes) + " expanded nodes";
-    return Error{
-        ErrorCode::no_route,
-        "maximum route duration ended before the destination was reached" + suffix};
-}
-
 Error cancelled_error(const RouteDiagnostics& diagnostics) {
     return Error{
         ErrorCode::cancelled,
@@ -1564,13 +1555,12 @@ Result<RouteResult> Router::optimize_view_controlled(
     ProgressScratch progress_scratch;
     NodeIndex best_route_end = 0U;
     auto finish_without_arrival = [&]() -> Result<RouteResult> {
-        if (!forecast_limited) {
-            return route_duration_exhausted_error(diagnostics);
-        }
         return make_route_result(
             departure,
             departure_source,
-            RouteCompletion::forecast_exhausted,
+            forecast_limited
+                ? RouteCompletion::forecast_exhausted
+                : RouteCompletion::duration_exhausted,
             metadata.source,
             polar_.source(),
             reconstruct_route(nodes, best_route_end),
