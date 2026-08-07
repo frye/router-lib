@@ -158,11 +158,19 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
     const RoutePoint& parent,
     OperationalConfiguration parent_configuration,
     Coordinate destination,
-    TimePoint route_end) {
+    TimePoint route_end,
+    VariableTransitionRejection* rejection) {
+    const auto reject = [rejection](VariableTransitionRejection reason)
+        -> Result<std::optional<VariableTransition>> {
+        if (rejection != nullptr) {
+            *rejection = reason;
+        }
+        return std::optional<VariableTransition>{};
+    };
     const double distance =
         great_circle_distance_nautical_miles(parent.position, destination);
     if (!(distance > 0.0)) {
-        return std::optional<VariableTransition>{};
+        return reject(VariableTransitionRejection::infeasible);
     }
     const double ground_course =
         initial_bearing_degrees(parent.position, destination);
@@ -170,7 +178,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
     if (!wind_result) {
         if (wind_result.error().code ==
             ErrorCode::coordinate_outside_forecast) {
-            return std::optional<VariableTransition>{};
+            return reject(VariableTransitionRejection::missing_data);
         }
         return wind_result.error();
     }
@@ -179,7 +187,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
         return evaluated_wind.error();
     }
     if (!evaluated_wind.value().has_value()) {
-        return std::optional<VariableTransition>{};
+        return reject(VariableTransitionRejection::infeasible);
     }
     const double wind_speed = evaluated_wind.value()->speed_knots;
     const double wind_from =
@@ -196,7 +204,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
             return *sampled.error;
         }
         if (sampled.outcome == EnvironmentOutcome::rejected) {
-            return std::optional<VariableTransition>{};
+            return reject(VariableTransitionRejection::infeasible);
         }
         samples = sampled.samples;
     }
@@ -293,7 +301,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
     }
     std::optional<LegSolution> solution = std::move(solved.value());
     if (!solution.has_value()) {
-        return std::optional<VariableTransition>{};
+        return reject(VariableTransitionRejection::infeasible);
     }
 
     // The board a transition is recorded on, and the maneuver it is charged
@@ -334,10 +342,13 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
             auto sampled_wind = weather.interpolate(midpoint, midpoint_time);
             if (!sampled_wind) {
                 if (sampled_wind.error().code ==
-                        ErrorCode::coordinate_outside_forecast ||
-                    sampled_wind.error().code ==
-                        ErrorCode::departure_outside_forecast) {
-                    return std::optional<VariableTransition>{};
+                    ErrorCode::coordinate_outside_forecast) {
+                    return reject(VariableTransitionRejection::missing_data);
+                }
+                if (sampled_wind.error().code ==
+                    ErrorCode::departure_outside_forecast) {
+                    return reject(
+                        VariableTransitionRejection::forecast_exhausted);
                 }
                 return sampled_wind.error();
             }
@@ -347,7 +358,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
                 return evaluated_midpoint.error();
             }
             if (!evaluated_midpoint.value().has_value()) {
-                return std::optional<VariableTransition>{};
+                return reject(VariableTransitionRejection::infeasible);
             }
             refined_wind_speed = evaluated_midpoint.value()->speed_knots;
             refined_wind_from =
@@ -360,7 +371,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
                 return *sampled.error;
             }
             if (sampled.outcome == EnvironmentOutcome::rejected) {
-                return std::optional<VariableTransition>{};
+                return reject(VariableTransitionRejection::infeasible);
             }
             applied = sampled.samples;
         }
@@ -372,7 +383,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
         const std::optional<LegSolution> refined =
             std::move(refined_result.value());
         if (!refined.has_value()) {
-            return std::optional<VariableTransition>{};
+            return reject(VariableTransitionRejection::infeasible);
         }
         solution = refined;
         sailing_seconds = distance / solution->ground_speed_knots * 3600.0;
@@ -382,7 +393,10 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
         static_cast<std::chrono::seconds::rep>(std::ceil(sailing_seconds))};
     if (duration <= std::chrono::seconds::zero() ||
         parent.time + duration > route_end) {
-        return std::optional<VariableTransition>{};
+        return reject(
+            duration <= std::chrono::seconds::zero()
+                ? VariableTransitionRejection::infeasible
+                : VariableTransitionRejection::duration_exhausted);
     }
     const TimePoint arrival = parent.time + duration;
 
@@ -398,7 +412,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
             return *geometry.error;
         }
         if (geometry.outcome == EnvironmentOutcome::rejected) {
-            return std::optional<VariableTransition>{};
+            return reject(VariableTransitionRejection::infeasible);
         }
     }
 
@@ -429,7 +443,7 @@ Result<std::optional<VariableTransition>> evaluate_variable_transition(
     }
     if (options.segment_eligibility &&
         !options.segment_eligibility(RouteSegmentView{parent, point})) {
-        return std::optional<VariableTransition>{};
+        return reject(VariableTransitionRejection::infeasible);
     }
     return std::optional<VariableTransition>{
         VariableTransition{std::move(point), configuration}};
@@ -444,17 +458,27 @@ Result<std::optional<VariableTransition>> evaluate_heading_transition(
     const RoutePoint& parent,
     OperationalConfiguration parent_configuration,
     double water_heading_degrees,
-    TimePoint arrival) {
+    TimePoint arrival,
+    std::optional<Coordinate> arrival_destination,
+    double arrival_radius_nautical_miles,
+    VariableTransitionRejection* rejection) {
+    const auto reject = [rejection](VariableTransitionRejection reason)
+        -> Result<std::optional<VariableTransition>> {
+        if (rejection != nullptr) {
+            *rejection = reason;
+        }
+        return std::optional<VariableTransition>{};
+    };
     const auto total_duration =
         std::chrono::duration_cast<std::chrono::seconds>(arrival - parent.time);
     if (total_duration <= std::chrono::seconds::zero()) {
-        return std::optional<VariableTransition>{};
+        return reject(VariableTransitionRejection::infeasible);
     }
 
     auto wind_result = weather.interpolate(parent.position, parent.time);
     if (!wind_result) {
         if (wind_result.error().code == ErrorCode::coordinate_outside_forecast) {
-            return std::optional<VariableTransition>{};
+            return reject(VariableTransitionRejection::missing_data);
         }
         return wind_result.error();
     }
@@ -463,7 +487,7 @@ Result<std::optional<VariableTransition>> evaluate_heading_transition(
         return evaluated_wind.error();
     }
     if (!evaluated_wind.value().has_value()) {
-        return std::optional<VariableTransition>{};
+        return reject(VariableTransitionRejection::infeasible);
     }
     const double wind_speed = evaluated_wind.value()->speed_knots;
     const double wind_from =
@@ -480,7 +504,7 @@ Result<std::optional<VariableTransition>> evaluate_heading_transition(
             return *sampled.error;
         }
         if (sampled.outcome == EnvironmentOutcome::rejected) {
-            return std::optional<VariableTransition>{};
+            return reject(VariableTransitionRejection::infeasible);
         }
         samples = sampled.samples;
     }
@@ -498,7 +522,7 @@ Result<std::optional<VariableTransition>> evaluate_heading_transition(
         return initial_result.error();
     }
     if (!initial_result.value().has_value()) {
-        return std::optional<VariableTransition>{};
+        return reject(VariableTransitionRejection::infeasible);
     }
     LegSolution solution = std::move(*initial_result.value());
     const OperationalConfiguration configuration{
@@ -512,7 +536,7 @@ Result<std::optional<VariableTransition>> evaluate_heading_transition(
         configuration,
         solution.true_wind_angle_degrees);
     if (delay >= total_duration) {
-        return std::optional<VariableTransition>{};
+        return reject(VariableTransitionRejection::infeasible);
     }
     const auto sailing_duration = total_duration - delay;
     const double sailing_hours =
@@ -527,7 +551,7 @@ Result<std::optional<VariableTransition>> evaluate_heading_transition(
         : GroundVelocity{
               solution.water_heading_degrees, solution.water_speed_knots};
     if (!(ground.speed_knots > 0.0)) {
-        return std::optional<VariableTransition>{};
+        return reject(VariableTransitionRejection::infeasible);
     }
 
     const bool midpoint_wind =
@@ -549,7 +573,12 @@ Result<std::optional<VariableTransition>> evaluate_heading_transition(
             if (!sampled_wind) {
                 if (sampled_wind.error().code ==
                     ErrorCode::coordinate_outside_forecast) {
-                    return std::optional<VariableTransition>{};
+                    return reject(VariableTransitionRejection::missing_data);
+                }
+                if (sampled_wind.error().code ==
+                    ErrorCode::departure_outside_forecast) {
+                    return reject(
+                        VariableTransitionRejection::forecast_exhausted);
                 }
                 return sampled_wind.error();
             }
@@ -559,7 +588,7 @@ Result<std::optional<VariableTransition>> evaluate_heading_transition(
                 return evaluated_midpoint.error();
             }
             if (!evaluated_midpoint.value().has_value()) {
-                return std::optional<VariableTransition>{};
+                return reject(VariableTransitionRejection::infeasible);
             }
             refined_wind_speed = evaluated_midpoint.value()->speed_knots;
             refined_wind_from =
@@ -572,7 +601,7 @@ Result<std::optional<VariableTransition>> evaluate_heading_transition(
                 return *sampled.error;
             }
             if (sampled.outcome == EnvironmentOutcome::rejected) {
-                return std::optional<VariableTransition>{};
+                return reject(VariableTransitionRejection::infeasible);
             }
             applied = sampled.samples;
         }
@@ -589,7 +618,7 @@ Result<std::optional<VariableTransition>> evaluate_heading_transition(
             return refined_result.error();
         }
         if (!refined_result.value().has_value()) {
-            return std::optional<VariableTransition>{};
+            return reject(VariableTransitionRejection::infeasible);
         }
         solution = std::move(*refined_result.value());
         ground = applied.has_current
@@ -601,32 +630,59 @@ Result<std::optional<VariableTransition>> evaluate_heading_transition(
                   solution.water_heading_degrees,
                   solution.water_speed_knots};
         if (!(ground.speed_knots > 0.0)) {
-            return std::optional<VariableTransition>{};
+            return reject(VariableTransitionRejection::infeasible);
         }
     }
 
-    const double distance = ground.speed_knots * sailing_hours;
-    const Coordinate position = destination_point(
-        parent.position, ground.course_degrees, distance);
+    double distance = ground.speed_knots * sailing_hours;
+    TimePoint actual_arrival = arrival;
+    const PreparedOrigin origin = prepare_origin(parent.position);
+    Coordinate position = destination_point_from(
+        origin, ground.course_degrees, distance);
+    if (arrival_destination.has_value()) {
+        const double destination_distance =
+            great_circle_distance_nautical_miles(
+                parent.position, *arrival_destination);
+        const std::optional<double> fraction = arrival_fraction(
+            origin,
+            destination_distance,
+            initial_bearing_degrees(parent.position, *arrival_destination),
+            ground.course_degrees,
+            distance,
+            *arrival_destination,
+            arrival_radius_nautical_miles);
+        if (fraction.has_value()) {
+            distance *= *fraction;
+            position = destination_point_from(
+                origin, ground.course_degrees, distance);
+            actual_arrival =
+                parent.time + delay +
+                std::chrono::seconds{
+                    static_cast<std::chrono::seconds::rep>(
+                        std::llround(
+                            static_cast<double>(sailing_duration.count()) *
+                            *fraction))};
+        }
+    }
     if (environment_active) {
         const SegmentCheckResult geometry = check_segment_geometry(
             environment,
             parent.position,
             parent.time,
             position,
-            arrival,
+            actual_arrival,
             diagnostics);
         if (geometry.outcome == EnvironmentOutcome::failed) {
             return *geometry.error;
         }
         if (geometry.outcome == EnvironmentOutcome::rejected) {
-            return std::optional<VariableTransition>{};
+            return reject(VariableTransitionRejection::infeasible);
         }
     }
 
     RoutePoint point{
         position,
-        arrival,
+        actual_arrival,
         solution.water_heading_degrees,
         solution.water_speed_knots,
         wind_speed,
@@ -651,7 +707,7 @@ Result<std::optional<VariableTransition>> evaluate_heading_transition(
     }
     if (options.segment_eligibility &&
         !options.segment_eligibility(RouteSegmentView{parent, point})) {
-        return std::optional<VariableTransition>{};
+        return reject(VariableTransitionRejection::infeasible);
     }
     return std::optional<VariableTransition>{
         VariableTransition{std::move(point), configuration}};

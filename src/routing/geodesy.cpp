@@ -164,5 +164,66 @@ Coordinate destination_point_from(
     return Coordinate{radians_to_degrees(destination_latitude), longitude};
 }
 
+std::optional<double> arrival_fraction(
+    const PreparedOrigin& origin,
+    double start_distance_nautical_miles,
+    double bearing_to_destination_degrees,
+    double heading_degrees,
+    double segment_distance_nautical_miles,
+    Coordinate destination,
+    double arrival_radius_nautical_miles) noexcept {
+    constexpr double arrival_bound_slack_nautical_miles = 1.0e-6;
+    constexpr int arrival_bisection_iterations = 60;
+    if (start_distance_nautical_miles <= arrival_radius_nautical_miles) {
+        return 0.0;
+    }
+    if (segment_distance_nautical_miles <= 0.0) {
+        return std::nullopt;
+    }
+    if (start_distance_nautical_miles - segment_distance_nautical_miles >
+        arrival_radius_nautical_miles + arrival_bound_slack_nautical_miles) {
+        return std::nullopt;
+    }
+
+    const double start_to_destination =
+        start_distance_nautical_miles / earth_radius_nautical_miles;
+    const double bearing_delta =
+        (bearing_to_destination_degrees - heading_degrees) *
+        std::numbers::pi / 180.0;
+    const double along_track_angle = std::atan2(
+        std::sin(start_to_destination) * std::cos(bearing_delta),
+        std::cos(start_to_destination));
+    const double segment_angle =
+        segment_distance_nautical_miles / earth_radius_nautical_miles;
+    const double closest_angle = std::clamp(
+        along_track_angle, 0.0, segment_angle);
+    const double closest_fraction = closest_angle / segment_angle;
+    const Coordinate closest = destination_point_from(
+        origin,
+        heading_degrees,
+        segment_distance_nautical_miles * closest_fraction);
+    if (great_circle_distance_nautical_miles(closest, destination) >
+        arrival_radius_nautical_miles) {
+        return std::nullopt;
+    }
+
+    double outside = 0.0;
+    double inside = closest_fraction;
+    for (int iteration = 0; iteration < arrival_bisection_iterations; ++iteration) {
+        const double middle = (outside + inside) / 2.0;
+        const Coordinate point = destination_point_from(
+            origin,
+            heading_degrees,
+            segment_distance_nautical_miles * middle);
+        if (great_circle_distance_nautical_miles(point, destination) <=
+            arrival_radius_nautical_miles) {
+            inside = middle;
+        } else {
+            outside = middle;
+        }
+    }
+    return inside;
+}
+
 }  // namespace detail
 }  // namespace sailroute

@@ -348,75 +348,20 @@ struct ParentGeometry {
         detail::initial_bearing_degrees(position, destination)};
 }
 
-// Slack applied to the exact triangle-inequality rejection below, large enough
-// to absorb rounding in the distance computation and far smaller than any
-// meaningful arrival radius, so a genuine arrival is never rejected.
-constexpr double arrival_bound_slack_nautical_miles = 1.0e-6;
-
-// Halvings used to locate the arrival radius crossing along a segment. Kept at
-// 60 so results stay bit-identical; the loop only runs for candidates that
-// actually reach the destination, so it is not on the hot path.
-constexpr int arrival_bisection_iterations = 60;
-
 std::optional<double> arrival_fraction(
     const ParentGeometry& parent,
     double heading_degrees,
     double segment_distance_nautical_miles,
     Coordinate destination,
     double arrival_radius_nautical_miles) {
-    const double start_distance = parent.distance_to_destination;
-    if (start_distance <= arrival_radius_nautical_miles) {
-        return 0.0;
-    }
-    if (segment_distance_nautical_miles <= 0.0) {
-        return std::nullopt;
-    }
-    // Great-circle distance is a metric, so no point on a segment of length d
-    // can be closer to the destination than start_distance - d. When even that
-    // bound stays outside the arrival radius the segment cannot arrive, and the
-    // projection, endpoint construction, and bisection below are all skipped.
-    if (start_distance - segment_distance_nautical_miles >
-        arrival_radius_nautical_miles + arrival_bound_slack_nautical_miles) {
-        return std::nullopt;
-    }
-
-    const double start_to_destination =
-        start_distance / detail::earth_radius_nautical_miles;
-    const double bearing_delta =
-        (parent.bearing_to_destination_degrees - heading_degrees) *
-        std::numbers::pi / 180.0;
-    const double along_track_angle = std::atan2(
-        std::sin(start_to_destination) * std::cos(bearing_delta),
-        std::cos(start_to_destination));
-    const double segment_angle =
-        segment_distance_nautical_miles / detail::earth_radius_nautical_miles;
-    const double closest_angle = std::clamp(along_track_angle, 0.0, segment_angle);
-    const double closest_fraction = closest_angle / segment_angle;
-    const Coordinate closest = detail::destination_point_from(
+    return detail::arrival_fraction(
         parent.origin,
+        parent.distance_to_destination,
+        parent.bearing_to_destination_degrees,
         heading_degrees,
-        segment_distance_nautical_miles * closest_fraction);
-    if (detail::great_circle_distance_nautical_miles(closest, destination) >
-        arrival_radius_nautical_miles) {
-        return std::nullopt;
-    }
-
-    double outside = 0.0;
-    double inside = closest_fraction;
-    for (int iteration = 0; iteration < arrival_bisection_iterations; ++iteration) {
-        const double middle = (outside + inside) / 2.0;
-        const Coordinate point = detail::destination_point_from(
-            parent.origin,
-            heading_degrees,
-            segment_distance_nautical_miles * middle);
-        if (detail::great_circle_distance_nautical_miles(point, destination) <=
-            arrival_radius_nautical_miles) {
-            inside = middle;
-        } else {
-            outside = middle;
-        }
-    }
-    return inside;
+        segment_distance_nautical_miles,
+        destination,
+        arrival_radius_nautical_miles);
 }
 
 bool better_arrival(const Arrival& left, const Arrival& right) noexcept {
