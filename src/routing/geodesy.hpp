@@ -2,6 +2,8 @@
 
 #include "sailroute/types.hpp"
 
+#include <optional>
+
 namespace sailroute::detail {
 
 inline constexpr double earth_radius_nautical_miles = 3440.065;
@@ -35,5 +37,14 @@ struct PreparedOrigin {
     const PreparedOrigin& origin,
     double bearing_degrees,
     double distance_nautical_miles) noexcept;
+
+[[nodiscard]] std::optional<double> arrival_fraction(
+    const PreparedOrigin& origin,
+    double start_distance_nautical_miles,
+    double bearing_to_destination_degrees,
+    double heading_degrees,
+    double segment_distance_nautical_miles,
+    Coordinate destination,
+    double arrival_radius_nautical_miles) noexcept;
 
 }  // namespace sailroute::detail

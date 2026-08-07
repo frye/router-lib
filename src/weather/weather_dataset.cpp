@@ -284,12 +284,16 @@ using HandlePtr = std::unique_ptr<codes_handle, HandleDeleter>;
     return true;
 }
 
-[[nodiscard]] Result<TimePoint> valid_time(codes_handle* handle) {
-    auto date_result = required_long(handle, "validityDate");
+[[nodiscard]] Result<TimePoint> encoded_time(
+    codes_handle* handle,
+    const char* date_key,
+    const char* time_key,
+    std::string_view description) {
+    auto date_result = required_long(handle, date_key);
     if (!date_result) {
         return date_result.error();
     }
-    auto time_result = required_long(handle, "validityTime");
+    auto time_result = required_long(handle, time_key);
     if (!time_result) {
         return time_result.error();
     }
@@ -307,11 +311,23 @@ using HandlePtr = std::unique_ptr<codes_handle, HandleDeleter>;
         std::chrono::month{month},
         std::chrono::day{day}};
     if (!date.ok() || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
-        return Error{ErrorCode::grib_decode, "GRIB message has an invalid validity time"};
+        return Error{
+            ErrorCode::grib_decode,
+            "GRIB message has an invalid " + std::string{description}};
     }
 
     return TimePoint{std::chrono::sys_days{date}.time_since_epoch()} +
            std::chrono::hours{hour} + std::chrono::minutes{minute};
+}
+
+[[nodiscard]] Result<TimePoint> valid_time(codes_handle* handle) {
+    return encoded_time(
+        handle, "validityDate", "validityTime", "validity time");
+}
+
+[[nodiscard]] Result<TimePoint> initialization_time(codes_handle* handle) {
+    return encoded_time(
+        handle, "dataDate", "dataTime", "initialization time");
 }
 
 [[nodiscard]] Result<Grid> read_grid(codes_handle* handle) {
@@ -1218,6 +1234,7 @@ struct SpatialBracket {
 
 struct WeatherDataset::Impl {
     ForecastMetadata metadata;
+    ForecastGridIdentity grid_identity;
     Grid grid;
     std::vector<TimePoint> times;
     std::vector<double> east_values;
@@ -1283,6 +1300,7 @@ Result<WeatherDataset> WeatherDataset::load_impl(
     }
 
     std::map<TimePoint, PendingTimeSlice> pending;
+    std::optional<TimePoint> common_initialization_time;
     std::size_t grib_message_count = 0;
     std::size_t wind_message_count = 0;
     int decode_status = CODES_SUCCESS;
@@ -1323,6 +1341,18 @@ Result<WeatherDataset> WeatherDataset::load_impl(
         auto time_result = valid_time(handle.get());
         if (!time_result) {
             return time_result.error();
+        }
+        auto initialization_result = initialization_time(handle.get());
+        if (!initialization_result) {
+            return initialization_result.error();
+        }
+        if (!common_initialization_time) {
+            common_initialization_time = initialization_result.value();
+        } else if (*common_initialization_time !=
+                   initialization_result.value()) {
+            return Error{
+                ErrorCode::incomplete_forecast,
+                "10 m wind messages use different initialization times"};
         }
         auto field_result = decode_field(handle.get());
         if (!field_result) {
@@ -1448,7 +1478,18 @@ Result<WeatherDataset> WeatherDataset::load_impl(
         grid.latitude_count,
         grid.longitude_count,
         grid.global_longitude_coverage,
-        display_path};
+        display_path,
+        *common_initialization_time};
+    impl->grid_identity = ForecastGridIdentity{
+        grid.latitude_count,
+        grid.longitude_count,
+        grid.south_latitude_degrees,
+        grid.west_longitude_degrees,
+        grid.latitude_step_degrees,
+        grid.longitude_step_degrees,
+        grid.global_longitude_coverage,
+        grid.duplicate_longitude_endpoint,
+        bounds};
     return WeatherDataset{std::move(impl)};
 }
 
@@ -1458,6 +1499,22 @@ const ForecastMetadata& WeatherDataset::metadata() const {
     }
     static const ForecastMetadata empty_metadata{};
     return empty_metadata;
+}
+
+const std::vector<TimePoint>& WeatherDataset::valid_times() const noexcept {
+    if (impl_) {
+        return impl_->times;
+    }
+    static const std::vector<TimePoint> empty_times;
+    return empty_times;
+}
+
+const ForecastGridIdentity& WeatherDataset::grid_identity() const noexcept {
+    if (impl_) {
+        return impl_->grid_identity;
+    }
+    static const ForecastGridIdentity empty_identity;
+    return empty_identity;
 }
 
 namespace {

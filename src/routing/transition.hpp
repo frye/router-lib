@@ -18,6 +18,13 @@ struct VariableTransition {
     OperationalConfiguration configuration;
 };
 
+enum class VariableTransitionRejection {
+    infeasible,
+    forecast_exhausted,
+    duration_exhausted,
+    missing_data,
+};
+
 struct EvaluatedWind {
     double speed_knots{};
     double direction_from_degrees{};
@@ -70,7 +77,8 @@ evaluate_variable_transition(
     const RoutePoint& parent,
     OperationalConfiguration parent_configuration,
     Coordinate destination,
-    TimePoint route_end);
+    TimePoint route_end,
+    VariableTransitionRejection* rejection = nullptr);
 
 /// Evaluates one fixed-duration water heading. The transition sails until
 /// `arrival`, after deducting any maneuver delay, and lets current determine the
@@ -86,6 +94,9 @@ evaluate_heading_transition(
     const RoutePoint& parent,
     OperationalConfiguration parent_configuration,
     double water_heading_degrees,
-    TimePoint arrival);
+    TimePoint arrival,
+    std::optional<Coordinate> arrival_destination = std::nullopt,
+    double arrival_radius_nautical_miles = 0.0,
+    VariableTransitionRejection* rejection = nullptr);
 
 }  // namespace sailroute::detail

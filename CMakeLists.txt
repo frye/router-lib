@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(sailroute VERSION 0.4.3 LANGUAGES CXX)
+project(sailroute VERSION 0.5.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -26,6 +26,14 @@ add_library(sailroute STATIC
     src/error.cpp
     src/time.cpp
     src/weather/weather_dataset.cpp
+    src/ensemble/beam_solver.cpp
+    src/ensemble/dataset.cpp
+    src/ensemble/lattice_solver.cpp
+    src/ensemble/objective.cpp
+    src/ensemble/policy.cpp
+    src/ensemble/sampling.cpp
+    src/ensemble/search_state.cpp
+    src/ensemble/transition.cpp
     src/polar/vessel_polar.cpp
     src/environment/environment.cpp
     src/environment/exclusions.cpp
@@ -44,6 +52,7 @@ add_library(sailroute STATIC
     src/routing/router.cpp
     src/routing/transition.cpp
     src/serialization/json.cpp
+    src/serialization/ensemble_json.cpp
     src/serialization/gpx.cpp
     src/serialization/isochrones.cpp
 )
@@ -83,6 +92,12 @@ if(SAILROUTE_BUILD_TESTS)
         tests/test_main.cpp
         tests/test_contours.cpp
         tests/test_environment.cpp
+        tests/test_ensemble_beam.cpp
+        tests/test_ensemble_dataset.cpp
+        tests/test_ensemble_lattice.cpp
+        tests/test_ensemble_objective.cpp
+        tests/test_ensemble_policy.cpp
+        tests/test_ensemble_search_state.cpp
         tests/test_exclusions.cpp
         tests/test_front.cpp
         tests/test_landmask.cpp
@@ -91,6 +106,8 @@ if(SAILROUTE_BUILD_TESTS)
         tests/test_polar.cpp
         tests/test_routing.cpp
         tests/test_serialization.cpp
+        tests/test_ensemble_serialization.cpp
+        tests/test_ensemble_progress.cpp
         tests/test_time.cpp
         tests/test_transition.cpp
         tests/test_weather.cpp
@@ -107,6 +124,19 @@ if(SAILROUTE_BUILD_TESTS)
     target_link_libraries(
         sailroute_compatibility_corpus
         PRIVATE sailroute::sailroute ECCODES::eccodes)
+
+    add_executable(
+        sailroute_ensemble_cli_positive
+        tests/test_ensemble_cli_positive.cpp)
+    target_link_libraries(
+        sailroute_ensemble_cli_positive
+        PRIVATE sailroute::sailroute ECCODES::eccodes)
+    target_compile_definitions(
+        sailroute_ensemble_cli_positive
+        PRIVATE
+            "SAILROUTE_CLI_PATH=\"$<TARGET_FILE:sailroute_cli>\""
+            "SAILROUTE_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
+    add_dependencies(sailroute_ensemble_cli_positive sailroute_cli)
 
     function(add_cli_failure_test test_name expected_output)
         add_test(
@@ -129,6 +159,9 @@ if(SAILROUTE_BUILD_TESTS)
             "-DEXPECTED_FILE=${CMAKE_CURRENT_SOURCE_DIR}/tests/compatibility/v0.3.2.txt"
             -P
             "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompareCommandOutput.cmake")
+    add_test(
+        NAME sailroute_ensemble_cli_positive
+        COMMAND sailroute_ensemble_cli_positive)
     add_test(NAME sailroute_cli_help COMMAND sailroute_cli --help)
     add_cli_failure_test(
         sailroute_cli_custom_intervals
@@ -222,6 +255,118 @@ if(SAILROUTE_BUILD_TESTS)
         sailroute_cli_removed_upwind_twa
         "unknown option: --upwind-twa-degrees"
         --upwind-twa-degrees 90)
+    # Ensemble mode rejection tests.
+    add_cli_failure_test(
+        sailroute_cli_ensemble_rejects_grib
+        "not supported in ensemble mode"
+        --ensemble-member gfs:1.0:gfs.grib
+        --ensemble-member ecmwf:1.0:ecmwf.grib
+        --start 0,0
+        --destination 0,1
+        --grib deterministic.grib)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_rejects_gpx
+        "not supported in ensemble mode"
+        --ensemble-member gfs:1.0:gfs.grib
+        --ensemble-member ecmwf:1.0:ecmwf.grib
+        --start 0,0
+        --destination 0,1
+        --gpx out.gpx)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_rejects_isochrones_json
+        "not supported in ensemble mode"
+        --ensemble-member gfs:1.0:gfs.grib
+        --ensemble-member ecmwf:1.0:ecmwf.grib
+        --start 0,0
+        --destination 0,1
+        --isochrones-json out.json)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_rejects_isochrones_gpx
+        "not supported in ensemble mode"
+        --ensemble-member gfs:1.0:gfs.grib
+        --ensemble-member ecmwf:1.0:ecmwf.grib
+        --start 0,0
+        --destination 0,1
+        --isochrones-gpx out.gpx)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_invalid_member_format
+        "requires ID:WEIGHT:PATH format"
+        --ensemble-member invalid_no_colons
+        --start 0,0
+        --destination 0,1)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_invalid_member_weight
+        "non-negative finite number"
+        --ensemble-member gfs:zero:gfs.grib
+        --start 0,0
+        --destination 0,1)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_zero_total_weight
+        "total weight must be positive"
+        --ensemble-member gfs:0.0:gfs.grib
+        --start 0,0
+        --destination 0,1)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_lattice_rejects_beam_controls
+        "require --experimental-ensemble-beam"
+        --ensemble-member gfs:1.0:gfs.grib
+        --start 0,0
+        --destination 0,1
+        --time-step-minutes 15)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_beam_rejects_lattice_controls
+        "lattice controls are not used"
+        --ensemble-member gfs:1.0:gfs.grib
+        --start 0,0
+        --destination 0,1
+        --experimental-ensemble-beam
+        --lattice-time-bucket-minutes 15)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_missing_members
+        "at least one --ensemble-member"
+        --ensemble-objective weighted_mean_elapsed_arrival
+        --start 0,0
+        --destination 0,1)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_invalid_objective
+        "--ensemble-objective must be one of"
+        --ensemble-member gfs:1.0:gfs.grib
+        --ensemble-member ecmwf:1.0:ecmwf.grib
+        --start 0,0
+        --destination 0,1
+        --ensemble-objective not_a_real_objective)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_target_without_objective
+        "only used with probability_before_target"
+        --ensemble-member gfs:1.0:gfs.grib
+        --ensemble-member ecmwf:1.0:ecmwf.grib
+        --start 0,0
+        --destination 0,1
+        --ensemble-target-seconds 7200)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_rival_without_objective
+        "only used with probability_beating_rival"
+        --ensemble-member gfs:1.0:gfs.grib
+        --ensemble-member ecmwf:1.0:ecmwf.grib
+        --start 0,0
+        --destination 0,1
+        --ensemble-rival rival.json)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_missing_target
+        "requires --ensemble-target-seconds"
+        --ensemble-member gfs:1.0:gfs.grib
+        --ensemble-member ecmwf:1.0:ecmwf.grib
+        --start 0,0
+        --destination 0,1
+        --ensemble-objective probability_before_target)
+    add_cli_failure_test(
+        sailroute_cli_ensemble_missing_rival
+        "requires --ensemble-rival"
+        --ensemble-member gfs:1.0:gfs.grib
+        --ensemble-member ecmwf:1.0:ecmwf.grib
+        --start 0,0
+        --destination 0,1
+        --ensemble-objective probability_beating_rival)
     set_tests_properties(
         sailroute_cli_help
         PROPERTIES PASS_REGULAR_EXPRESSION "--routing-intervals SPEC")
@@ -241,6 +386,7 @@ if(SAILROUTE_BUILD_BENCHMARKS)
 
     add_executable(sailroute_benchmarks
         benchmarks/benchmark_main.cpp
+        benchmarks/ensemble_benchmark.cpp
         benchmarks/lattice_comparison.cpp
     )
     target_link_libraries(sailroute_benchmarks PRIVATE sailroute::sailroute)

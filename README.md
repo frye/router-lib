@@ -4,7 +4,8 @@
 using downloaded GRIB weather forecasts and vessel polars. It includes the
 `sailroute` command-line tool, uses ECMWF ecCodes for GRIB1/GRIB2 decoding, and
 provides deterministic isochrone-beam and time-dependent geodesic-lattice
-routing.
+routing plus explicit ensemble, risk-objective, and forecast re-evaluation
+workflows.
 
 > [!WARNING]
 > Currents, sea state, land avoidance, and exclusion zones are opt-in and must
@@ -66,7 +67,7 @@ cmake --install build --prefix "$PWD/install"
 Point a consuming project at that prefix, then link the exported target:
 
 ```cmake
-find_package(sailroute 0.4 CONFIG REQUIRED)
+find_package(sailroute 0.5 CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE sailroute::sailroute)
 ```
 
@@ -177,6 +178,60 @@ partial route),
 `2` for command-line usage errors, `3` for weather or polar input errors, `4`
 for routing errors, and `5` for serialization or file-output errors.
 
+### Ensemble CLI
+
+Ensemble mode is explicit and mutually exclusive with deterministic `--grib`.
+Add one or more named, non-negative weighted members with
+`--ensemble-member ID:WEIGHT:PATH`; identifiers must be unique and at least one
+weight must be positive. Inputs are sorted by identifier and weights are
+normalized once, so member argument order does not affect the result.
+
+```sh
+./build/sailroute \
+  --ensemble-member control:0.5:control.grib2 \
+  --ensemble-member perturbation-01:0.3:p01.grib2 \
+  --ensemble-member perturbation-02:0.2:p02.grib2 \
+  --start 37.7749,-122.4194 \
+  --destination 21.3069,-157.8583 \
+  --ensemble-objective weighted_p90_elapsed_arrival \
+  --lattice-level 4 \
+  --lattice-time-bucket-minutes 30 \
+  --json ensemble-route.json
+```
+
+The default ensemble solver is the shared-action time-dependent lattice.
+Available objectives are `weighted_mean_elapsed_arrival`,
+`weighted_p75_elapsed_arrival`, `weighted_p90_elapsed_arrival`,
+`probability_before_target`, and `probability_beating_rival`. Target
+probability additionally requires `--ensemble-target-seconds`; rival
+probability requires an `ensemble_rival_outcomes_v1` file through
+`--ensemble-rival`.
+
+A positive-weight member that does not reach the destination makes the weighted
+mean infinite, sorts at positive infinity for P75/P90, and misses a target.
+Target arrival is strictly before the threshold. A rival tie scores one half;
+a reached candidate beats an incomplete rival, while two incomplete outcomes
+use the stable documented outcome-class order. Zero-weight members remain in
+the audit but do not change the objective. Member-local weather, provider,
+legality, and coverage failures are retained rather than hidden by aggregation.
+
+The alternative beam is deliberately experimental and requires
+`--experimental-ensemble-beam`. Its `--time-step-minutes`,
+`--heading-step-degrees`, `--spatial-bucket-nm`, and
+`--max-nodes-per-bucket` controls are rejected for lattice runs. Conversely,
+lattice controls are rejected for beam runs. Ensemble mode also rejects
+deterministic GPX and isochrone output instead of silently discarding those
+requests.
+
+Ensemble JSON uses schema `ensemble_route_result_v1`. It contains canonical
+member weights and forecast/environment attribution, all member-local routes
+and failures, the aggregate objective audit, solver work, the policy DAG,
+decision points, and the cross-cycle re-evaluation state. Positive infinity is
+encoded as a tagged objective value, never as a non-standard JSON number. The
+strict parser rejects unknown or duplicate fields, invalid integer lexemes,
+inconsistent member identities or weights, and unreachable or cyclic policy
+topology. Ensemble JSON input is capped at 64 MiB and 128 nested containers.
+
 Routing intervals are measured from departure. By default, the router creates
 points every 30 minutes for the first 4 hours, every hour through the first 24
 hours, and every 3 hours thereafter. Override the schedule with
@@ -250,6 +305,67 @@ partial result, `points` owns the best route through the final supported
 frontier, `arrival_time` is the final point's time, and diagnostics and
 requested isochrones cover all completed routing steps.
 
+### Ensemble C++ API
+
+Ensemble routing is additive and does not reinterpret `Router::optimize`.
+`EnsembleDataset` owns immutable member weather and environments in canonical
+identifier order. `EnsembleRouter` applies each current action to every active
+member without observing a hidden "true member."
+
+```cpp
+auto initialized = sailroute::parse_utc_time("2026-07-14T12:00:00Z");
+auto dataset = sailroute::EnsembleDataset::load(
+    sailroute::EnsembleRunMetadata{
+        "cycle-20260714T12Z",
+        "example-model",
+        initialized.value(),
+        "forecast provider attribution",
+        1U},
+    {
+        {.identifier = "control", .weight = 0.6, .grib_path = "control.grib2"},
+        {.identifier = "p01", .weight = 0.4, .grib_path = "p01.grib2"},
+    });
+if (!dataset) {
+    std::cerr << dataset.error().message << '\n';
+    return 1;
+}
+
+sailroute::EnsembleRouter router{std::move(dataset.value())};
+sailroute::EnsembleRouteRequest request{
+    .start = {37.7749, -122.4194},
+    .destination = {21.3069, -157.8583},
+    .departure_time = initialized.value(),
+    .objective = {
+        .kind = sailroute::EnsembleObjectiveKind::
+            weighted_p90_elapsed_arrival},
+};
+auto result = router.optimize(request);
+if (!result) {
+    std::cerr << result.error().message << '\n';
+    return 1;
+}
+
+auto json = sailroute::ensemble_route_to_json({
+    router.dataset().metadata(),
+    router.dataset().members(),
+    result.value()});
+```
+
+Lattice label limits and beam node limits are hard resource boundaries. A limit,
+cancellation, provider failure, or invalid objective returns an explicit error;
+there is no success-shaped fallback to another solver. Owning and view progress
+callbacks report initialization, search, and finalization phases, active and
+cumulative work, the current objective bound, and retained policy alternatives.
+Control callbacks may cancel synchronously; callback exceptions propagate.
+
+The selected route is a common non-clairvoyant action sequence. Bounded
+nondominated alternatives form a canonical policy DAG with content-derived
+node/branch identities, member support, objective and wrong-choice costs, and
+operational decision points. Alternatives always require a later forecast-cycle
+re-evaluation. The serialized `EnsembleReevaluationState` carries only the prior
+run, stable branch identities, objective, and explicit spatial/time tolerances;
+it never claims to reveal which forecast member is real.
+
 ### Error handling
 
 All fallible library operations return `Result<T>`. Test it with `operator bool`
@@ -271,7 +387,8 @@ memory, `load(path, GeographicBounds{south, west, north, east})` retains only
 the interpolation subgrid needed for the requested canonical bounds. Bounds
 may cross the antimeridian by setting west greater than east, but must remain
 inside the source grid. `metadata()` reports the valid-time range, retained
-grid dimensions, global-longitude coverage, and source path.
+grid dimensions, global-longitude coverage, GRIB initialization/reference time,
+and source path.
 
 `WeatherDataset::interpolate(coordinate, time)` performs spatial and temporal
 interpolation and returns eastward and northward wind components in metres per
@@ -422,6 +539,14 @@ cmake --build build-bench --parallel
 
 For external peak-memory measurements, run the same command under
 `/usr/bin/time -l` on macOS or `/usr/bin/time -v` on Linux.
+
+With a GRIB path, the same executable also runs the Stage 4 scaling matrix for
+1, 2, 5, 10, 20, and 50 repeated named members. It reports load time, batched
+and independent sampling throughput, every objective on the lattice, the
+experimental beam through 10 members, per-member completion, generated/settled/
+retained work, policy size, runtime, process peak RSS, serialized size, and
+progress callback volume. Repeating one forecast isolates member-count overhead;
+use distinct member paths for forecast-spread quality studies.
 
 ### v0.3.2 compatibility corpus
 
@@ -1016,26 +1141,17 @@ be in `[0, 180]`; TWS and boat speeds are in knots.
 
 ## Roadmap
 
-The options above are what can be improved inside a forward isochrone beam. The
-stages below are not implemented; they are recorded so the design direction is
-explicit.
+Stages 2 through 4 are implemented as additive surfaces while the original
+deterministic beam remains the compatibility default. The remaining direction
+is continuous-control polishing and the format/acquisition adapters listed
+under [Deferred work](#deferred-work).
 
 ### Time-dependent shortest-path solver
 
-Replace the beam with a label-correcting time-dependent A\*/Dijkstra search over
-a space-time lattice. Minimum-time navigation through a flow field is Zermelo's
-problem; travel times are non-negative and the wind evolves forward, so
-label-setting is valid and optimal on the lattice, and earlier legs are
-re-relaxed automatically. This is the only stage that genuinely delivers
-rerouting, and it removes the limitation described under
-[Known limitations](#known-limitations).
-
-- A geodesic lattice (icosahedral, HEALPix, or Fibonacci) rather than lat/lon,
-  which degenerates at high latitude, exactly where ocean races are decided.
-- Node state carrying position, time, board, and sail and reef configuration.
-- An admissible A\* heuristic: remaining great-circle distance divided by the
-  maximum speed the polar can achieve.
-- Coarse-to-fine refinement around the incumbent corridor.
+Implemented and documented under
+[Time-dependent lattice solver](#time-dependent-lattice-solver): deterministic
+A\*/Dijkstra search on a hierarchical icosahedral lattice, shared Stage 3
+transition physics, admissible speed bounds, and corridor-local refinement.
 
 ### Physics
 
@@ -1047,11 +1163,13 @@ What remains is listed under [Deferred work](#deferred-work).
 
 ### Ensemble and risk-adjusted routing
 
-Route across ensemble members rather than a single deterministic GRIB, and
-optimize the mean, a quantile, or the probability of beating a rival. The true
-optimum is a policy rather than a track, because the route is recomputed every
-forecast cycle. The primary deliverable is decision points: where members
-diverge, when commitment is required, and what being wrong costs.
+Implemented and documented under [Ensemble CLI](#ensemble-cli) and
+[Ensemble C++ API](#ensemble-c-api): canonical named members, five auditable
+risk objectives, default lattice and explicitly gated experimental beam
+solvers, owning/view progress, strict versioned JSON, bounded policy
+alternatives, decision points, and stable forecast-cycle re-evaluation state.
+The current ensemble lattice is fixed-resolution; deterministic lattice
+corridor refinement remains isolated from the shared-action search.
 
 ### Continuous optimal-control polish
 

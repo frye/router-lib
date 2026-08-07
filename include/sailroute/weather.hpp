@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace sailroute {
 
@@ -18,6 +19,8 @@ struct ForecastMetadata {
     std::size_t longitude_count{};
     bool global_longitude_coverage{};
     std::string source;
+    /// GRIB reference/analysis time shared by all retained wind messages.
+    TimePoint initialization_time;
 };
 
 /// Canonical load bounds; west greater than east crosses the antimeridian.
@@ -26,6 +29,27 @@ struct GeographicBounds {
     double west_longitude_degrees{};
     double north_latitude_degrees{};
     double east_longitude_degrees{};
+
+    bool operator==(const GeographicBounds&) const = default;
+};
+
+/// Canonical identity of the retained regular latitude/longitude wind grid.
+///
+/// `west_longitude_degrees` is normalized to [0, 360). `interpolation_bounds`
+/// preserves an optional caller-requested coverage boundary, which can be
+/// narrower than the retained interpolation stencil.
+struct ForecastGridIdentity {
+    std::size_t latitude_count{};
+    std::size_t longitude_count{};
+    double south_latitude_degrees{};
+    double west_longitude_degrees{};
+    double latitude_step_degrees{};
+    double longitude_step_degrees{};
+    bool global_longitude_coverage{};
+    bool duplicate_longitude_endpoint{};
+    std::optional<GeographicBounds> interpolation_bounds;
+
+    bool operator==(const ForecastGridIdentity&) const = default;
 };
 
 class WeatherDataset;
@@ -77,6 +101,10 @@ public:
 
     /// Returns valid times, retained grid dimensions, coverage, and source.
     [[nodiscard]] const ForecastMetadata& metadata() const;
+    /// Returns every decoded wind valid time in strictly increasing order.
+    [[nodiscard]] const std::vector<TimePoint>& valid_times() const noexcept;
+    /// Returns the exact canonical retained grid and requested coverage identity.
+    [[nodiscard]] const ForecastGridIdentity& grid_identity() const noexcept;
     /// Interpolates eastward/northward wind in m/s at a coordinate and UTC time.
     [[nodiscard]] Result<Wind> interpolate(Coordinate coordinate, TimePoint time) const;
     /// Resolves the forecast time bracket once for repeated per-coordinate lookups.

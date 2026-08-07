@@ -31,7 +31,9 @@ public:
         long point_count{3};
         long data_date{20260714};
         long data_time{1200};
+        long initial_forecast_hour{0};
         long final_forecast_hour{24};
+        bool write_final_north{true};
     };
 
     ConstantWindGribFixture() : ConstantWindGribFixture(Options{}) {}
@@ -44,20 +46,30 @@ public:
                std::to_string(
                    std::chrono::steady_clock::now().time_since_epoch().count()) +
                ".grib")) {
-        write("10u", 0, options_.east_metres_per_second, "w");
-        write("10v", 0, options_.north_metres_per_second, "a");
+        write(
+            "10u",
+            options_.initial_forecast_hour,
+            options_.east_metres_per_second,
+            "w");
+        write(
+            "10v",
+            options_.initial_forecast_hour,
+            options_.north_metres_per_second,
+            "a");
         write(
             "10u",
             options_.final_forecast_hour,
             options_.final_east_metres_per_second.value_or(
                 options_.east_metres_per_second),
             "a");
-        write(
-            "10v",
-            options_.final_forecast_hour,
-            options_.final_north_metres_per_second.value_or(
-                options_.north_metres_per_second),
-            "a");
+        if (options_.write_final_north) {
+            write(
+                "10v",
+                options_.final_forecast_hour,
+                options_.final_north_metres_per_second.value_or(
+                    options_.north_metres_per_second),
+                "a");
+        }
     }
 
     ConstantWindGribFixture(const ConstantWindGribFixture&) = delete;

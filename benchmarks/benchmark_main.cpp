@@ -2,6 +2,7 @@
 #include "sailroute/router.hpp"
 #include "sailroute/time.hpp"
 
+#include "ensemble_benchmark.hpp"
 #include "lattice_comparison.hpp"
 
 #include <algorithm>
@@ -815,5 +816,7 @@ int main(int argc, char** argv) {
         peak_watermark);
 
     report_sea_state_matrix(weather.value(), polar, request, baseline_hours);
+    sailroute::benchmarks::report_ensemble_scaling(
+        std::filesystem::path{argv[1]}, polar, request);
     return 0;
 }
