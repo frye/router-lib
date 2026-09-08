@@ -97,7 +97,7 @@ struct BucketSelection {
     const EnsembleBeamRoutingOptions& options,
     const EnsembleBeamDiagnostics& diagnostics) {
     return Error{
-        ErrorCode::no_route,
+        ErrorCode::resource_limit,
         "experimental ensemble beam max_total_nodes hard limit " +
             std::to_string(options.max_total_nodes) + " exceeded after " +
             std::to_string(diagnostics.generated_nodes) +
@@ -258,6 +258,7 @@ struct BucketSelection {
 }
 
 [[nodiscard]] std::vector<EnsembleCommonAction> beam_actions(
+    const EnsembleDataset& dataset,
     const EnsembleSearchLabel& label,
     Coordinate destination,
     const EnsembleBeamRoutingOptions& options,
@@ -274,8 +275,10 @@ struct BucketSelection {
             actions.push_back(action.value());
         }
     }
-    for (const EnsembleMemberSearchState& member : label.members) {
-        if (member.status != EnsembleMemberSearchStatus::active) {
+    for (std::size_t index = 0U; index < label.members.size(); ++index) {
+        const auto& member = label.members[index];
+        if (member.status != EnsembleMemberSearchStatus::active ||
+            dataset.members()[index].original_weight == 0.0) {
             continue;
         }
         auto action = make_common_heading_action(
@@ -288,42 +291,6 @@ struct BucketSelection {
     std::sort(actions.begin(), actions.end());
     actions.erase(std::unique(actions.begin(), actions.end()), actions.end());
     return actions;
-}
-
-[[nodiscard]] bool common_action_accepted(
-    const EnsembleSearchLabel& parent,
-    const EnsembleTransitionDiagnostics& diagnostics) noexcept {
-    if (parent.members.size() != diagnostics.members.size()) {
-        return false;
-    }
-    for (std::size_t index = 0U; index < parent.members.size(); ++index) {
-        if (parent.members[index].status !=
-            EnsembleMemberSearchStatus::active) {
-            continue;
-        }
-        const EnsembleMemberTransitionStatus status =
-            diagnostics.members[index].status;
-        if (status != EnsembleMemberTransitionStatus::legal &&
-            status != EnsembleMemberTransitionStatus::reached) {
-            return false;
-        }
-    }
-    return true;
-}
-
-[[nodiscard]] std::optional<Error> transition_error(
-    const EnsembleSearchLabel& parent,
-    const EnsembleTransitionDiagnostics& diagnostics) {
-    for (std::size_t index = 0U; index < parent.members.size(); ++index) {
-        if (parent.members[index].status ==
-                EnsembleMemberSearchStatus::active &&
-            diagnostics.members[index].status ==
-                EnsembleMemberTransitionStatus::error &&
-            diagnostics.members[index].error) {
-            return diagnostics.members[index].error;
-        }
-    }
-    return std::nullopt;
 }
 
 void finalize_active_members(
@@ -388,6 +355,8 @@ void finalize_active_members(
     result.departure_source = departure_source;
     result.solver = EnsembleSolver::experimental_isochrone_beam;
     result.experimental = true;
+    result.objective_specification =
+        canonical_objective_specification(request.objective);
     result.objective = *selected.aggregate_objective;
     result.canonical_action_sequence_identity =
         selected.canonical_action_sequence_identity;
@@ -406,6 +375,9 @@ void finalize_active_members(
             outcomes.value()[index],
             std::move(route.value()),
             member_environment[index]});
+    }
+    if (request.policy.max_alternatives == 0U) {
+        return result;
     }
     auto policy = build_ensemble_policy(
         dataset,
@@ -499,6 +471,12 @@ Result<EnsembleRouteResult> optimize_ensemble_beam_route(
             ErrorCode::invalid_polar,
             "polar contains no positive boat speed"};
     }
+    if (!std::isfinite(request.options.boat_speed_factor) ||
+        request.options.boat_speed_factor <= 0.0 ||
+        request.options.maximum_integration_step <= std::chrono::minutes::zero()) {
+        return invalid_request(
+            "ensemble performance factor and integration step must be positive");
+    }
 
     std::vector<EnsembleMemberOutcome> validation_outcomes;
     validation_outcomes.reserve(dataset.member_count());
@@ -535,24 +513,30 @@ Result<EnsembleRouteResult> optimize_ensemble_beam_route(
     std::vector<OperationalConfiguration> configurations(
         dataset.member_count());
     std::vector<std::optional<Error>> initial_errors(dataset.member_count());
+    std::vector<EnvironmentDiagnostics> member_environment(
+        dataset.member_count());
     initial_points.reserve(dataset.member_count());
     for (std::size_t index = 0U; index < dataset.member_count(); ++index) {
         const WeatherDataset* weather = dataset.member_weather(index);
-        if (weather == nullptr) {
+        const RoutingEnvironment* environment = dataset.member_environment(index);
+        if (weather == nullptr || environment == nullptr) {
             return invalid_request(
                 "ensemble dataset is missing member weather");
         }
-        const auto wind = weather->interpolate(
+        auto initial_point = evaluate_ensemble_initial_point(
+            *weather, request.options, *environment, member_environment[index],
             request.start, departure_time);
         RoutePoint point;
         point.position = request.start;
         point.time = departure_time;
-        if (wind) {
-            point.true_wind_speed_knots = wind.value().speed_knots();
-            point.true_wind_direction_degrees =
-                wind.value().direction_from_degrees();
+        if (initial_point) {
+            point = std::move(initial_point.value());
         } else {
-            initial_errors[index] = wind.error();
+            if (initial_point.error().code == ErrorCode::no_route &&
+                dataset.members()[index].original_weight > 0.0) {
+                return initial_point.error();
+            }
+            initial_errors[index] = initial_point.error();
         }
         initial_points.push_back(std::move(point));
     }
@@ -577,6 +561,7 @@ Result<EnsembleRouteResult> optimize_ensemble_beam_route(
             member.outcome_class = EnsembleMemberOutcomeClass::reached;
         }
     }
+    finalize_diagnostic_members(dataset, initial.value());
     canonicalize_ensemble_label(initial.value());
 
     EnsembleBeamDiagnostics diagnostics;
@@ -593,8 +578,6 @@ Result<EnsembleRouteResult> optimize_ensemble_beam_route(
     std::vector<LabelIndex> frontier{0U};
     std::optional<LabelIndex> best_terminal;
     std::vector<LabelIndex> terminal_labels;
-    std::vector<EnvironmentDiagnostics> member_environment(
-        dataset.member_count());
 
     const auto consider_terminal = [&](LabelIndex candidate) {
         ++diagnostics.completed_nodes;
@@ -752,7 +735,7 @@ Result<EnsembleRouteResult> optimize_ensemble_beam_route(
         }
         if (depth >= options.max_steps) {
             return Error{
-                ErrorCode::no_route,
+                ErrorCode::resource_limit,
                 "experimental ensemble beam max_steps hard limit " +
                     std::to_string(options.max_steps) + " exceeded"};
         }
@@ -773,6 +756,7 @@ Result<EnsembleRouteResult> optimize_ensemble_beam_route(
                 route_end - active_time(parent));
             const std::vector<EnsembleCommonAction> actions =
                 beam_actions(
+                    dataset,
                     parent,
                     request.destination,
                     options,
@@ -812,12 +796,7 @@ Result<EnsembleRouteResult> optimize_ensemble_beam_route(
                         transition.value().diagnostics.members[index].
                             environment_diagnostics);
                 }
-                if (const auto error = transition_error(
-                        parent, transition.value().diagnostics)) {
-                    return *error;
-                }
-                if (!common_action_accepted(
-                        parent, transition.value().diagnostics)) {
+                if (!transition.value().common_action_legal) {
                     ++diagnostics.rejected_common_actions;
                     continue;
                 }

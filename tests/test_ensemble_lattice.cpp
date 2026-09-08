@@ -1,7 +1,10 @@
 #include "sailroute/ensemble.hpp"
+#include "sailroute/ensemble_serialization.hpp"
 
 #include "ensemble/lattice_solver.hpp"
 #include "grib_fixture.hpp"
+#include "routing/environment_context.hpp"
+#include "routing/geodesy.hpp"
 #include "test_support.hpp"
 
 #include <chrono>
@@ -179,11 +182,12 @@ TEST_CASE("ensemble lattice is the default and identical members stay identical"
     REQUIRE(result.value().lattice_diagnostics.max_labels_per_state == 512U);
     REQUIRE(result.value().lattice_diagnostics.max_total_labels == 5'000U);
     REQUIRE(!result.value().lattice_diagnostics.refinement_performed);
-    REQUIRE(!result.value().policy.root_node_identity.empty());
-    REQUIRE(!result.value().policy.alternatives.empty());
-    REQUIRE(
-        result.value().re_evaluation.prior_run_identifier ==
-        dataset.value().metadata().run_identifier);
+    REQUIRE(route_request.policy.max_alternatives == 0U);
+    REQUIRE(result.value().policy.nodes.empty());
+    REQUIRE(result.value().policy.root_node_identity.empty());
+    REQUIRE(result.value().policy.alternatives.empty());
+    REQUIRE(result.value().decision_points.empty());
+    REQUIRE(result.value().re_evaluation.prior_run_identifier.empty());
 }
 
 TEST_CASE("ensemble lattice retains divergent member arrivals and complete routes") {
@@ -214,6 +218,44 @@ TEST_CASE("ensemble lattice retains divergent member arrivals and complete route
     REQUIRE(slow_result.points.size() >= 2U);
 }
 
+TEST_CASE("ensemble VMG proposals use water-relative wind without changing forecast limits") {
+    const ConstantWindGribFixture fixture(
+        ConstantWindGribFixture::Options{.north_metres_per_second = -10.0});
+    const CurrentVector current{2.0, 0.0};
+    const auto dataset = EnsembleDataset::load(
+        metadata(), {input("member", fixture, 1.0, uniform_current(current))});
+    REQUIRE(dataset.has_value());
+    const auto polar = sailroute::VesselPolar::default_racer_cruiser_45ft();
+    const sailroute::Wind raw_wind{0.0, -10.0};
+    const auto effective = sailroute::detail::water_relative_wind(raw_wind, current);
+    const auto optima = polar.slice_at(effective.speed_knots()).velocity_made_good_angles();
+    REQUIRE(optima.valid);
+    REQUIRE(effective.speed_knots() > raw_wind.speed_knots());
+    const double port = sailroute::detail::normalize_degrees(
+        effective.direction_from_degrees() - optima.upwind_degrees);
+    const double starboard = sailroute::detail::normalize_degrees(
+        effective.direction_from_degrees() + optima.upwind_degrees);
+    bool saw_port = false;
+    bool saw_starboard = false;
+    auto route_request = request(Coordinate{1.0, 0.5}, Coordinate{1.05, 0.5});
+    route_request.options.maximum_true_wind_speed_knots =
+        0.5 * (raw_wind.speed_knots() + effective.speed_knots());
+    route_request.options.segment_eligibility =
+        [&](const sailroute::RouteSegmentView& segment) {
+            saw_port = saw_port ||
+                sailroute::detail::angular_difference_degrees(
+                    segment.candidate.heading_degrees, port) < 1.0e-8;
+            saw_starboard = saw_starboard ||
+                sailroute::detail::angular_difference_degrees(
+                    segment.candidate.heading_degrees, starboard) < 1.0e-8;
+            return false;
+        };
+    const auto result = EnsembleRouter{dataset.value(), polar}.optimize(route_request);
+    if (!result) REQUIRE(result.error().code == ErrorCode::no_route);
+    REQUIRE(saw_port);
+    REQUIRE(saw_starboard);
+}
+
 TEST_CASE("probability and quantile objectives tolerate member local failures") {
     const ConstantWindGribFixture fixture;
     auto dataset = EnsembleDataset::load(
@@ -225,31 +267,43 @@ TEST_CASE("probability and quantile objectives tolerate member local failures") 
     REQUIRE(dataset.has_value());
     EnsembleRouter router{dataset.value()};
 
-    EnsembleRouteRequest probability = request();
-    probability.objective.kind =
-        EnsembleObjectiveKind::probability_before_target;
-    probability.objective.target = sailroute::EnsembleArrivalTarget{7'200.0};
-    auto probability_result = router.optimize(probability);
-    REQUIRE(probability_result.has_value());
-    REQUIRE(member(probability_result.value(), "bad").outcome.outcome_class ==
-            EnsembleMemberOutcomeClass::missing_data);
-    REQUIRE(member(probability_result.value(), "good").outcome.outcome_class ==
-            EnsembleMemberOutcomeClass::reached);
-    REQUIRE_NEAR(
-        probability_result.value().objective.value.finite_value, 0.9, 1.0e-12);
-    REQUIRE(probability_result.value().lattice_diagnostics.zero_heuristic);
+    for (const auto solver : {
+             EnsembleSolver::time_dependent_lattice,
+             EnsembleSolver::experimental_isochrone_beam}) {
+        EnsembleRouteRequest probability = request();
+        probability.solver = solver;
+        probability.enable_experimental_beam =
+            solver == EnsembleSolver::experimental_isochrone_beam;
+        probability.objective.kind =
+            EnsembleObjectiveKind::probability_before_target;
+        probability.objective.target = sailroute::EnsembleArrivalTarget{7'200.0};
+        auto probability_result = router.optimize(probability);
+        REQUIRE(probability_result.has_value());
+        REQUIRE(member(probability_result.value(), "bad").outcome.outcome_class ==
+                EnsembleMemberOutcomeClass::missing_data);
+        REQUIRE(member(probability_result.value(), "good").outcome.outcome_class ==
+                EnsembleMemberOutcomeClass::reached);
+        REQUIRE_NEAR(
+            probability_result.value().objective.value.finite_value, 0.9, 1.0e-12);
+        REQUIRE(probability_result.value().objective_specification.kind ==
+                probability.objective.kind);
+        if (solver == EnsembleSolver::time_dependent_lattice) {
+            REQUIRE(probability_result.value().lattice_diagnostics.zero_heuristic);
+        }
 
-    EnsembleRouteRequest quantile = request();
-    quantile.objective.kind =
-        EnsembleObjectiveKind::weighted_p75_elapsed_arrival;
-    auto quantile_result = router.optimize(quantile);
-    REQUIRE(quantile_result.has_value());
-    REQUIRE(quantile_result.value().objective.value.is_finite());
-    REQUIRE(member(quantile_result.value(), "bad").outcome.outcome_class ==
-            EnsembleMemberOutcomeClass::missing_data);
+        auto quantile = probability;
+        quantile.objective = {};
+        quantile.objective.kind =
+            EnsembleObjectiveKind::weighted_p75_elapsed_arrival;
+        auto quantile_result = router.optimize(quantile);
+        REQUIRE(quantile_result.has_value());
+        REQUIRE(quantile_result.value().objective.value.is_finite());
+        REQUIRE(member(quantile_result.value(), "bad").outcome.outcome_class ==
+                EnsembleMemberOutcomeClass::missing_data);
+    }
 }
 
-TEST_CASE("Stage 3 eligibility failures remain member local in lattice search") {
+TEST_CASE("ensemble solvers reject positive-weight hard-illegal common actions") {
     const ConstantWindGribFixture high(
         ConstantWindGribFixture::Options{
             .east_metres_per_second = 0.0,
@@ -271,13 +325,132 @@ TEST_CASE("Stage 3 eligibility failures remain member local in lattice search") 
             return segment.candidate.true_wind_speed_knots < 15.0;
         };
 
-    const auto result =
-        EnsembleRouter{dataset.value()}.optimize(route_request);
+    for (const auto solver : {
+             EnsembleSolver::time_dependent_lattice,
+             EnsembleSolver::experimental_isochrone_beam}) {
+        route_request.solver = solver;
+        route_request.enable_experimental_beam =
+            solver == EnsembleSolver::experimental_isochrone_beam;
+        const auto result =
+            EnsembleRouter{dataset.value()}.optimize(route_request);
+        if (!result) {
+            REQUIRE(result.error().code == ErrorCode::no_route);
+        } else {
+            REQUIRE(member(result.value(), "high").outcome.outcome_class !=
+                    EnsembleMemberOutcomeClass::infeasible_no_route);
+            REQUIRE(member(result.value(), "low").outcome.outcome_class !=
+                    EnsembleMemberOutcomeClass::reached);
+            REQUIRE(result.value().objective.value.finite_value == 0.0);
+        }
+    }
+}
+
+TEST_CASE("ensemble zero-weight diagnostic violations cannot veto either solver") {
+    const ConstantWindGribFixture high(
+        ConstantWindGribFixture::Options{
+            .north_metres_per_second = -10.0});
+    const ConstantWindGribFixture low(
+        ConstantWindGribFixture::Options{
+            .north_metres_per_second = -5.0});
+    auto dataset = EnsembleDataset::load(
+        metadata(), {input("high", high, 0.0), input("low", low)});
+    REQUIRE(dataset.has_value());
+    for (const auto solver : {
+             EnsembleSolver::time_dependent_lattice,
+             EnsembleSolver::experimental_isochrone_beam}) {
+        auto route_request = request();
+        route_request.solver = solver;
+        route_request.enable_experimental_beam =
+            solver == EnsembleSolver::experimental_isochrone_beam;
+        route_request.options.segment_eligibility =
+            [](const sailroute::RouteSegmentView& segment) {
+                return segment.candidate.true_wind_speed_knots < 15.0;
+            };
+        const auto result =
+            EnsembleRouter{dataset.value()}.optimize(route_request);
+        REQUIRE(result.has_value());
+        REQUIRE(result.value().objective.value.is_finite());
+        REQUIRE(member(result.value(), "high").outcome.outcome_class ==
+                EnsembleMemberOutcomeClass::infeasible_no_route);
+        REQUIRE(member(result.value(), "low").outcome.outcome_class ==
+                EnsembleMemberOutcomeClass::reached);
+        REQUIRE(result.value().objective.diagnostics.incomplete_member_weight == 0.0);
+    }
+}
+
+TEST_CASE("ensemble alternatives require explicit opt in") {
+    const ConstantWindGribFixture fixture;
+    auto dataset = EnsembleDataset::load(
+        metadata(), {input("member", fixture)});
+    REQUIRE(dataset.has_value());
+    auto route_request = request();
+    route_request.policy.max_alternatives = 1U;
+    const auto result = EnsembleRouter{dataset.value()}.optimize(route_request);
     REQUIRE(result.has_value());
-    REQUIRE(member(result.value(), "high").outcome.outcome_class ==
-            EnsembleMemberOutcomeClass::infeasible_no_route);
-    REQUIRE(member(result.value(), "low").outcome.outcome_class ==
-            EnsembleMemberOutcomeClass::reached);
+    REQUIRE(!result.value().policy.nodes.empty());
+    REQUIRE(!result.value().policy.alternatives.empty());
+    REQUIRE(result.value().re_evaluation.prior_run_identifier ==
+            dataset.value().metadata().run_identifier);
+}
+
+TEST_CASE("ensemble rival specifications serialize canonically with or without alternatives") {
+    const ConstantWindGribFixture fixture;
+    const auto dataset = EnsembleDataset::load(
+        metadata(), {input("zulu", fixture), input("alpha", fixture)});
+    REQUIRE(dataset.has_value());
+    for (const std::size_t alternatives : {0U, 1U}) {
+        auto route_request = request();
+        route_request.policy.max_alternatives = alternatives;
+        route_request.objective.kind = EnsembleObjectiveKind::probability_beating_rival;
+        route_request.objective.rival_outcomes = {
+            {"zulu", EnsembleMemberOutcomeClass::reached, 7200.0, {}},
+            {"alpha", EnsembleMemberOutcomeClass::reached, 7200.0, {}}};
+        const auto result = EnsembleRouter{dataset.value()}.optimize(route_request);
+        REQUIRE(result.has_value());
+        REQUIRE(result.value().objective_specification.rival_outcomes.front().
+                member_identifier == "alpha");
+        const sailroute::EnsembleRouteDocument doc{
+            dataset.value().metadata(), dataset.value().members(), result.value()};
+        const auto encoded = sailroute::ensemble_route_to_json(doc);
+        REQUIRE(encoded.has_value());
+        const auto parsed = sailroute::ensemble_route_from_json(encoded.value());
+        REQUIRE(parsed.has_value());
+        REQUIRE(parsed.value().result.objective_specification.kind ==
+                EnsembleObjectiveKind::probability_beating_rival);
+        REQUIRE(parsed.value().result.objective_specification.rival_outcomes.front().
+                member_identifier == "alpha");
+    }
+}
+
+TEST_CASE("ensemble immediate arrival cannot bypass positive-weight hard limits") {
+    const ConstantWindGribFixture high(
+        ConstantWindGribFixture::Options{.north_metres_per_second = -15.0});
+    const ConstantWindGribFixture low(
+        ConstantWindGribFixture::Options{.north_metres_per_second = -5.0});
+    for (const double weight : {0.0, 0.1}) {
+        const auto dataset = EnsembleDataset::load(
+            metadata(), {input("high", high, weight), input("low", low)});
+        REQUIRE(dataset.has_value());
+        for (const auto solver : {
+                 EnsembleSolver::time_dependent_lattice,
+                 EnsembleSolver::experimental_isochrone_beam}) {
+            auto route_request = request(Coordinate{1.0, 0.5}, Coordinate{1.0, 0.5});
+            route_request.options.maximum_true_wind_speed_knots = 20.0;
+            route_request.solver = solver;
+            route_request.enable_experimental_beam =
+                solver == EnsembleSolver::experimental_isochrone_beam;
+            const auto result = EnsembleRouter{dataset.value()}.optimize(route_request);
+            if (weight > 0.0) {
+                REQUIRE(!result.has_value());
+                REQUIRE(result.error().code == ErrorCode::no_route);
+            } else {
+                REQUIRE(result.has_value());
+                REQUIRE(member(result.value(), "high").outcome.outcome_class ==
+                        EnsembleMemberOutcomeClass::infeasible_no_route);
+                REQUIRE(member(result.value(), "low").outcome.elapsed_arrival_seconds == 0.0);
+            }
+        }
+    }
 }
 
 TEST_CASE("ensemble lattice handles high latitude seam routes canonically") {
@@ -323,7 +496,7 @@ TEST_CASE("ensemble lattice label limits are explicit hard errors") {
     bounded.lattice.max_total_labels = 1U;
     auto bounded_result = router.optimize(bounded);
     REQUIRE(!bounded_result.has_value());
-    REQUIRE(bounded_result.error().code == ErrorCode::no_route);
+    REQUIRE(bounded_result.error().code == ErrorCode::resource_limit);
     REQUIRE(bounded_result.error().message.find("max_total_labels") !=
             std::string::npos);
     REQUIRE(bounded_result.error().message.find("hard limit") !=

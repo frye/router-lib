@@ -3,6 +3,7 @@
 #include "sailroute/error.hpp"
 #include "sailroute/types.hpp"
 
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -10,6 +11,16 @@
 #include <vector>
 
 namespace sailroute {
+
+/// Canonical load bounds; west greater than east crosses the antimeridian.
+struct GeographicBounds {
+    double south_latitude_degrees{};
+    double west_longitude_degrees{};
+    double north_latitude_degrees{};
+    double east_longitude_degrees{};
+
+    bool operator==(const GeographicBounds&) const = default;
+};
 
 /// Time range, retained grid shape, coverage, and source of loaded weather.
 struct ForecastMetadata {
@@ -21,16 +32,20 @@ struct ForecastMetadata {
     std::string source;
     /// GRIB reference/analysis time shared by all retained wind messages.
     TimePoint initialization_time;
+    /// Effective interpolation extent, not the possibly wider retained stencil.
+    /// Longitudes are in [-180, 180]; global coverage uses west=-180, east=180.
+    GeographicBounds geographic_coverage{};
+    /// Smallest/largest adjacent valid-time interval; absent for a single time.
+    std::optional<std::chrono::seconds> minimum_time_spacing;
+    std::optional<std::chrono::seconds> maximum_time_spacing;
 };
 
-/// Canonical load bounds; west greater than east crosses the antimeridian.
-struct GeographicBounds {
-    double south_latitude_degrees{};
-    double west_longitude_degrees{};
-    double north_latitude_degrees{};
-    double east_longitude_degrees{};
-
-    bool operator==(const GeographicBounds&) const = default;
+struct WeatherLoadOptions {
+    std::optional<GeographicBounds> bounds;
+    /// Positive upper limit on adjacent valid-time intervals, inclusive.
+    /// An excessive gap fails loading with incomplete_forecast. Unset permits
+    /// any interval, including legitimate forecast products with changing cadence.
+    std::optional<std::chrono::seconds> maximum_interpolation_gap;
 };
 
 /// Canonical identity of the retained regular latitude/longitude wind grid.
@@ -98,6 +113,10 @@ public:
     static Result<WeatherDataset> load(
         const std::filesystem::path& path,
         GeographicBounds bounds);
+    /// Loads wind fields with optional cropping and a forecast-gap policy.
+    static Result<WeatherDataset> load(
+        const std::filesystem::path& path,
+        WeatherLoadOptions options);
 
     /// Returns valid times, retained grid dimensions, coverage, and source.
     [[nodiscard]] const ForecastMetadata& metadata() const;
@@ -119,9 +138,6 @@ private:
 
     struct Impl;
     explicit WeatherDataset(std::shared_ptr<const Impl> impl);
-    static Result<WeatherDataset> load_impl(
-        const std::filesystem::path& path,
-        std::optional<GeographicBounds> bounds);
     std::shared_ptr<const Impl> impl_;
 };
 

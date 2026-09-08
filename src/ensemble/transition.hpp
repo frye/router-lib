@@ -48,14 +48,25 @@ struct EnsembleTransitionParameters {
 struct EnsembleTransitionEvaluation {
     EnsembleSearchLabel label;
     EnsembleTransitionDiagnostics diagnostics;
+    /// False if a positive-weight scenario violates hard action feasibility.
+    /// The diagnostic label must not be enqueued or returned as a route.
+    bool common_action_legal{true};
 };
 
 [[nodiscard]] EnsembleMemberOutcomeClass classify_member_transition_error(
     const Error& error) noexcept;
 
+/// Performs initial geometry/environment/wind checks before an arrival shortcut
+/// or a member-local data failure can bypass known hard constraints.
+[[nodiscard]] Result<RoutePoint> evaluate_ensemble_initial_point(
+    const WeatherDataset& weather, const RoutingOptions& options,
+    const RoutingEnvironment& environment, EnvironmentDiagnostics& diagnostics,
+    Coordinate position, TimePoint time);
+
 /// Evaluates one target action for every active member in dataset canonical
 /// order. Member-local failures are retained and never abort evaluation of later
-/// members; only malformed shared state returns a top-level error.
+/// members; only malformed shared state returns a top-level error. Callers must
+/// check common_action_legal before accepting the returned diagnostic label.
 [[nodiscard]] Result<EnsembleTransitionEvaluation>
 evaluate_common_transition(
     const EnsembleDataset& dataset,

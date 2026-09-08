@@ -1,3 +1,4 @@
+#include "sailroute/ensemble_serialization.hpp"
 #include "sailroute/serialization.hpp"
 
 #include "test_support.hpp"
@@ -251,6 +252,140 @@ TEST_CASE("ensemble round-trip serializes and restores schema version") {
     REQUIRE(json.value().find("\"ensemble_route_result_v1\"") != std::string::npos);
 }
 
+TEST_CASE("ensemble compact v2 round-trip requires no policy graph") {
+    auto doc = minimal_doc();
+    doc.result.policy = {};
+    doc.result.decision_points.clear();
+    doc.result.re_evaluation = {};
+    const auto encoded = sailroute::ensemble_route_to_json(doc);
+    REQUIRE(encoded.has_value());
+    REQUIRE(encoded.value().find("ensemble_route_result_v2") != std::string::npos);
+    REQUIRE(encoded.value().find("\"policy\"") == std::string::npos);
+    REQUIRE(encoded.value().find("\"decision_points\"") == std::string::npos);
+    REQUIRE(encoded.value().find("\"re_evaluation\"") == std::string::npos);
+    const auto parsed = sailroute::ensemble_route_from_json(encoded.value());
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed.value().result.policy.nodes.empty());
+    REQUIRE(parsed.value().result.members.size() == 2U);
+    REQUIRE(parsed.value().result.objective.value.finite_value == 7600.0);
+    const auto reencoded = sailroute::ensemble_route_to_json(parsed.value());
+    REQUIRE(reencoded.has_value());
+    REQUIRE(reencoded.value() == encoded.value());
+
+    auto invalid_v1 = encoded.value();
+    replace_once(invalid_v1, "ensemble_route_result_v2", "ensemble_route_result_v1");
+    REQUIRE(!sailroute::ensemble_route_from_json(invalid_v1).has_value());
+
+    auto graph_doc = sailroute::ensemble_route_to_json(minimal_doc());
+    REQUIRE(graph_doc.has_value());
+    replace_once(graph_doc.value(), "ensemble_route_result_v1", "ensemble_route_result_v2");
+    REQUIRE(!sailroute::ensemble_route_from_json(graph_doc.value()).has_value());
+}
+
+TEST_CASE("ensemble compact serializer rejects incomplete policy metadata") {
+    auto doc = minimal_doc();
+    doc.result.policy = {};
+    REQUIRE(!sailroute::ensemble_route_to_json(doc).has_value());
+    doc.result.decision_points.clear();
+    doc.result.re_evaluation = {};
+    doc.result.policy.root_node_identity = "dangling";
+    REQUIRE(!sailroute::ensemble_route_to_json(doc).has_value());
+}
+
+TEST_CASE("ensemble compact results retain every risk objective specification") {
+    using Kind = sailroute::EnsembleObjectiveKind;
+    for (const auto kind : {
+             Kind::weighted_mean_elapsed_arrival,
+             Kind::weighted_p75_elapsed_arrival,
+             Kind::weighted_p90_elapsed_arrival,
+             Kind::probability_before_target,
+             Kind::probability_beating_rival}) {
+        auto doc = minimal_doc();
+        doc.result.policy = {};
+        doc.result.decision_points.clear();
+        doc.result.re_evaluation = {};
+        auto& specification = doc.result.objective_specification;
+        specification.kind = kind;
+        if (kind == Kind::probability_before_target) {
+            specification.target = sailroute::EnsembleArrivalTarget{7600.0};
+            doc.result.objective.value.finite_value = 0.5;
+            auto& members = doc.result.objective.diagnostics.members;
+            members[0].probability_score = 1.0;
+            members[0].weighted_contribution = 0.5;
+            members[1].weighted_contribution = 0.0;
+        } else if (kind == Kind::probability_beating_rival) {
+            for (const auto& member : doc.result.members) {
+                specification.rival_outcomes.push_back(member.outcome);
+            }
+            doc.result.objective.value.finite_value = 0.5;
+            for (auto& member : doc.result.objective.diagnostics.members) {
+                member.rival = member.candidate;
+                member.probability_score = 0.5;
+                member.weighted_contribution = 0.25;
+            }
+        } else if (kind != Kind::weighted_mean_elapsed_arrival) {
+            doc.result.objective.value.finite_value = 8000.0;
+            for (auto& member : doc.result.objective.diagnostics.members) {
+                member.weighted_contribution = 0.0;
+            }
+            doc.result.objective.diagnostics.members[1].selected_quantile_member = true;
+        }
+        const auto encoded = sailroute::ensemble_route_to_json(doc);
+        REQUIRE(encoded.has_value());
+        const auto parsed = sailroute::ensemble_route_from_json(encoded.value());
+        REQUIRE(parsed.has_value());
+        const auto& restored = parsed.value().result.objective_specification;
+        REQUIRE(restored.kind == kind);
+        REQUIRE(restored.target.has_value() == specification.target.has_value());
+        if (restored.target) REQUIRE(restored.target->elapsed_seconds == 7600.0);
+        REQUIRE(restored.rival_outcomes.size() == specification.rival_outcomes.size());
+    }
+}
+
+TEST_CASE("ensemble isolated schemas preserve sampled and polar wind audit") {
+    for (const bool compact : {false, true}) {
+        for (const bool has_polar_audit : {false, true}) {
+            auto doc = minimal_doc();
+            if (compact) {
+                doc.result.policy = {};
+                doc.result.decision_points.clear();
+                doc.result.re_evaluation = {};
+            }
+            auto& point = doc.result.members[0].points[0];
+            point.environment = sailroute::RoutePointEnvironment{};
+            point.environment->speed_over_ground_knots = 7.0;
+            if (has_polar_audit) {
+                point.environment->polar_wind_speed_knots = 11.5;
+                point.environment->polar_wind_direction_degrees = 83.0;
+            }
+            const auto encoded = sailroute::ensemble_route_to_json(doc);
+            REQUIRE(encoded.has_value());
+            const bool version_two = compact || has_polar_audit;
+            REQUIRE(encoded.value().find(version_two
+                        ? "ensemble_route_result_v2"
+                        : "ensemble_route_result_v1") != std::string::npos);
+            REQUIRE((encoded.value().find("\"polar_wind_speed_knots\"") !=
+                     std::string::npos) == version_two);
+            const auto parsed = sailroute::ensemble_route_from_json(encoded.value());
+            REQUIRE(parsed.has_value());
+            const auto& restored = parsed.value().result.members[0].points[0];
+            REQUIRE(restored.true_wind_speed_knots == point.true_wind_speed_knots);
+            REQUIRE(restored.true_wind_direction_degrees ==
+                    point.true_wind_direction_degrees);
+            REQUIRE(restored.environment.has_value());
+            REQUIRE(restored.environment->polar_wind_speed_knots ==
+                    point.environment->polar_wind_speed_knots);
+            REQUIRE(restored.environment->polar_wind_direction_degrees ==
+                    point.environment->polar_wind_direction_degrees);
+            REQUIRE(parsed.value().result.policy.nodes.size() ==
+                    doc.result.policy.nodes.size());
+            const auto reencoded = sailroute::ensemble_route_to_json(parsed.value());
+            REQUIRE(reencoded.has_value());
+            REQUIRE(reencoded.value() == encoded.value());
+        }
+    }
+}
+
 TEST_CASE("ensemble round-trip preserves run identifier") {
     const auto doc = minimal_doc();
     const auto json = sailroute::ensemble_route_to_json(doc);
@@ -342,6 +477,23 @@ TEST_CASE("rival outcomes round-trip preserves schema version") {
     const auto json = sailroute::ensemble_rival_outcomes_to_json(doc);
     REQUIRE(json.has_value());
     REQUIRE(json.value().find("\"ensemble_rival_outcomes_v1\"") != std::string::npos);
+}
+
+TEST_CASE("ensemble resource-limit diagnostics round-trip") {
+    auto doc = minimal_rival_doc();
+    auto& outcome = doc.member_outcomes[1];
+    outcome.outcome_class = sailroute::EnsembleMemberOutcomeClass::other_error;
+    outcome.elapsed_arrival_seconds.reset();
+    outcome.error = sailroute::Error{
+        sailroute::ErrorCode::resource_limit, "fixture search budget exhausted"};
+    const auto encoded = sailroute::ensemble_rival_outcomes_to_json(doc);
+    REQUIRE(encoded.has_value());
+    REQUIRE(encoded.value().find("\"resource_limit\"") != std::string::npos);
+    const auto parsed = sailroute::ensemble_rival_outcomes_from_json(encoded.value());
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed.value().member_outcomes[1].error.has_value());
+    REQUIRE(parsed.value().member_outcomes[1].error->code ==
+            sailroute::ErrorCode::resource_limit);
 }
 
 TEST_CASE("rival outcomes round-trip preserves member outcomes") {

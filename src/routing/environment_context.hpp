@@ -38,6 +38,8 @@ struct GroundVelocity {
     double speed_knots{};
 };
 
+[[nodiscard]] Wind water_relative_wind(Wind ground_wind, CurrentVector current) noexcept;
+
 /// Samples currents and waves, honouring each provider's missing-data policy.
 ///
 /// Counters are accumulated into `diagnostics`, which the caller owns; the

@@ -169,6 +169,7 @@ enum class LatticeSearchAlgorithm {
 /// Resolution, temporal state, refinement, and progress controls for Stage 2.
 struct LatticeRoutingOptions {
     std::size_t subdivision_level{4U};
+    /// VMG/holding action cadence; arrival labels retain whole-second time.
     std::chrono::minutes time_bucket{30};
     std::size_t refinement_levels{1U};
     double corridor_width_nautical_miles{450.0};
@@ -247,13 +248,17 @@ struct RoutePointEnvironment {
     /// Identify which optional components supplied the values above.
     bool current_applied{};
     bool wave_applied{};
+    /// Wind relative to water, used by the polar when current is configured.
+    double polar_wind_speed_knots{};
+    double polar_wind_direction_degrees{};
 };
 
 /// One timestamped point in a selected or provisional route.
 ///
 /// `heading_degrees` and `boat_speed_knots` are water-relative even when a
 /// current provider is configured; `environment` carries the corresponding
-/// ground motion.
+/// ground motion. Wind fields identify the applied sailing sample (which can
+/// be at the midpoint), not a fresh observation at the arrival coordinate.
 struct RoutePoint {
     Coordinate position;
     TimePoint time;
@@ -355,8 +360,8 @@ enum class PruningStrategy {
 struct RoutingOptions {
     std::chrono::minutes time_step{30};
     double heading_step_degrees{10.0};
-    double arrival_radius_nautical_miles{2.0};
-    double spatial_bucket_nautical_miles{10.0};
+    double arrival_radius_nautical_miles{0.1};
+    double spatial_bucket_nautical_miles{2.0};
     std::size_t max_nodes_per_bucket{10};
     std::size_t worker_count{0};
     std::chrono::hours maximum_route_duration{240};
@@ -370,11 +375,11 @@ struct RoutingOptions {
     };
     RoutingProgressOptions progress;
 
-    // Accuracy controls. Every default below reproduces the search exactly as it
-    // behaved before these options existed.
+    // Cruising accuracy defaults; see the 0.6 migration notes for changes.
     ManeuverPenalties maneuver;
-    HeadingAugmentation heading_augmentation{HeadingAugmentation::none};
-    WindSampling wind_sampling{WindSampling::segment_start};
+    HeadingAugmentation heading_augmentation{
+        HeadingAugmentation::destination_bearing_and_velocity_made_good};
+    WindSampling wind_sampling{WindSampling::midpoint};
     /// Skips midpoint sampling for steps shorter than this, where the extra
     /// interpolation buys little. Zero applies it to every step.
     std::chrono::minutes midpoint_wind_sampling_threshold{0};
@@ -383,7 +388,7 @@ struct RoutingOptions {
     /// Wind speed above which the vessel is treated as unable to sail, modelling
     /// a storm limit the polar itself does not express. Unset imposes no limit.
     std::optional<double> maximum_true_wind_speed_knots;
-    AbovePolarRangePolicy above_polar_range{AbovePolarRangePolicy::clamp};
+    AbovePolarRangePolicy above_polar_range{AbovePolarRangePolicy::no_speed};
     PruningStrategy pruning_strategy{PruningStrategy::destination_distance_grid};
     /// Angular width of a bearing sector, used only by `bearing_sectors`.
     double pruning_sector_degrees{2.0};
@@ -397,7 +402,23 @@ struct RoutingOptions {
     // the pre-Stage-2 aggregate keep their original field mapping.
     RoutingSolver solver{RoutingSolver::isochrone_beam};
     LatticeRoutingOptions lattice;
+
+    /// Maximum physical integration interval, independent of lattice edge size.
+    std::chrono::minutes maximum_integration_step{15};
+    double boat_speed_factor{1.0};
+    /// Explicitly authorizes stationary holding; absent means no wait actions.
+    RouteSegmentEligibilityCallback holding_eligibility;
+    /// Hard search limits; exhaustion is reported as an error, never an optimum.
+    std::size_t maximum_generated_candidates{5'000'000U};
+    std::size_t maximum_retained_nodes{500'000U};
+    /// Preserve separated positions as well as headings within a beam bucket.
+    bool strategic_retention{true};
 };
+
+enum class RoutingQuality { fast, balanced, high };
+
+/// Presets change search breadth, not the physical or safety contracts.
+[[nodiscard]] RoutingOptions routing_options_for_quality(RoutingQuality quality);
 
 /// Start, destination, optional departure, and routing configuration.
 struct RouteRequest {
@@ -407,12 +428,22 @@ struct RouteRequest {
     RoutingOptions options;
 };
 
+/// Hold a water-relative heading for a bounded duration; maneuver time is
+/// included in that duration. Arrival may terminate the action early.
+struct SailingAction {
+    double heading_degrees{};
+    std::chrono::seconds duration{};
+};
+
 /// Cumulative search-work counters.
 struct RouteDiagnostics {
     std::size_t expanded_nodes{};
     std::size_t generated_candidates{};
     std::size_t retained_candidates{};
     std::size_t time_steps{};
+    std::size_t eligibility_evaluations{};
+    std::size_t pruned_candidates{};
+    std::size_t future_probe_misses{};
 };
 
 /// Cumulative environmental sampling, evaluation, and rejection counters.
@@ -526,6 +557,27 @@ struct RoutingProgressView {
     LatticeSearchProgress search;
 };
 
+struct RouteRunMetadata {
+    Coordinate requested_destination;
+    double arrival_radius_nautical_miles{};
+    double remaining_distance_nautical_miles{};
+    double boat_speed_factor{1.0};
+    double heading_step_degrees{};
+    double spatial_bucket_nautical_miles{};
+    std::chrono::minutes maximum_integration_step{};
+    TimePoint forecast_initialization;
+    TimePoint forecast_first_valid;
+    TimePoint forecast_last_valid;
+    RoutingSolver solver{RoutingSolver::isochrone_beam};
+    bool strategic_retention{};
+    bool land_avoidance{};
+    std::vector<std::string> warnings;
+    WindSampling wind_sampling{WindSampling::segment_start};
+    std::optional<double> maximum_forecast_wind_speed_knots{};
+    AbovePolarRangePolicy above_polar_range{AbovePolarRangePolicy::no_speed};
+    ManeuverPenalties maneuver{};
+};
+
 /// Successful complete or partial routing output.
 struct RouteResult {
     TimePoint departure_time;
@@ -542,6 +594,7 @@ struct RouteResult {
     /// Present only when a Stage 3 environment was configured.
     std::optional<EnvironmentDiagnostics> environment_diagnostics;
     std::optional<RouteEnvironmentMetadata> environment;
+    std::optional<RouteRunMetadata> run;
 };
 
 /// Checks coordinate finiteness and canonical latitude/longitude bounds.

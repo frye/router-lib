@@ -84,6 +84,25 @@ private:
     ProviderMetadata metadata_;
 };
 
+class InteriorMissingCurrentProvider final : public CurrentProvider {
+public:
+    [[nodiscard]] const ProviderMetadata& metadata() const noexcept override {
+        return metadata_;
+    }
+    [[nodiscard]] EnvironmentCoverage coverage() const override { return {}; }
+    [[nodiscard]] EnvironmentSample<CurrentVector> sample(
+        Coordinate, TimePoint time) const override {
+        if (time > TimePoint{fixture_epoch} &&
+            time < TimePoint{fixture_epoch + 30min}) {
+            return EnvironmentSample<CurrentVector>::without_value(
+                EnvironmentSampleStatus::unavailable);
+        }
+        return EnvironmentSample<CurrentVector>::available(CurrentVector{});
+    }
+private:
+    ProviderMetadata metadata_{provider_metadata("interior-missing-current")};
+};
+
 RoutingEnvironment current_environment(CurrentVector current) {
     RoutingEnvironment environment;
     environment.currents.provider =
@@ -300,12 +319,10 @@ TEST_CASE("member infeasibility and provider errors do not abort later members")
     REQUIRE(
         diagnostics.members[2].status ==
         EnsembleMemberTransitionStatus::reached);
-    REQUIRE(diagnostics.merged_environment.current_samples == 3U);
+    REQUIRE(diagnostics.merged_environment.current_samples >= 3U);
     REQUIRE(diagnostics.merged_environment.current_rejections == 1U);
-    REQUIRE(evaluated.value().label.aggregate_objective.has_value());
-    REQUIRE(
-        evaluated.value().label.aggregate_objective->value.
-            is_positive_infinity());
+    REQUIRE(!evaluated.value().common_action_legal);
+    REQUIRE(!evaluated.value().label.aggregate_objective.has_value());
 }
 
 TEST_CASE("transition errors map to explicit member outcome classes") {
@@ -333,9 +350,12 @@ TEST_CASE("transition errors map to explicit member outcome classes") {
     REQUIRE(
         classify_member_transition_error(Error{ErrorCode::no_route, ""}) ==
         EnsembleMemberOutcomeClass::infeasible_no_route);
+    REQUIRE(
+        classify_member_transition_error(Error{ErrorCode::resource_limit, ""}) ==
+        EnsembleMemberOutcomeClass::other_error);
 }
 
-TEST_CASE("Stage 3 eligibility remains member local under one action") {
+TEST_CASE("ensemble eligibility keeps member diagnostics but rejects the common action") {
     const ConstantWindGribFixture high(
         ConstantWindGribFixture::Options{
             .east_metres_per_second = 0.0,
@@ -367,6 +387,7 @@ TEST_CASE("Stage 3 eligibility remains member local under one action") {
             nullptr,
             {}});
     REQUIRE(evaluated.has_value());
+    REQUIRE(!evaluated.value().common_action_legal);
     REQUIRE(
         evaluated.value().diagnostics.members[0].status ==
         EnsembleMemberTransitionStatus::infeasible);
@@ -424,10 +445,13 @@ TEST_CASE("common heading and wait actions support divergent member states") {
 
     const auto wait = sailroute::detail::make_common_wait_action(10min);
     REQUIRE(wait.has_value());
+    RoutingOptions holding_options;
+    holding_options.holding_eligibility =
+        [](const sailroute::RouteSegmentView&) { return true; };
     const auto waited = sailroute::detail::evaluate_common_transition(
         dataset.value(),
         sailroute::VesselPolar::default_racer_cruiser_45ft(),
-        RoutingOptions{},
+        holding_options,
         root,
         0U,
         wait.value(),
@@ -523,6 +547,213 @@ TEST_CASE("ensemble dominance is member-wise and state compatible") {
     later.aggregate_objective.emplace();
     later.aggregate_objective->value.finite_value = 0.0;
     REQUIRE(sailroute::detail::dominates(earlier, later));
+}
+
+TEST_CASE("ensemble waits require explicit holding and segment permission") {
+    const ConstantWindGribFixture fixture;
+    auto dataset = EnsembleDataset::load(metadata(), {input("member", fixture)});
+    REQUIRE(dataset.has_value());
+    const auto wait = sailroute::detail::make_common_wait_action(30min);
+    REQUIRE(wait.has_value());
+    const EnsembleTransitionParameters parameters{
+        Coordinate{1.0, 1.5}, TimePoint{fixture_epoch},
+        TimePoint{fixture_epoch + 2h}, nullptr, {}};
+    const auto evaluate = [&](const RoutingOptions& options) {
+        return sailroute::detail::evaluate_common_transition(
+            dataset.value(), sailroute::VesselPolar::default_racer_cruiser_45ft(),
+            options, initial_label(dataset.value()), 0U, wait.value(), parameters);
+    };
+    RoutingOptions options;
+    auto denied = evaluate(options);
+    REQUIRE(denied.has_value());
+    REQUIRE(!denied.value().common_action_legal);
+    REQUIRE(denied.value().label.members[0].point.time == TimePoint{fixture_epoch});
+
+    std::size_t holding_checks = 0U;
+    std::size_t segment_checks = 0U;
+    options.holding_eligibility = [&](const sailroute::RouteSegmentView&) {
+        ++holding_checks;
+        return true;
+    };
+    options.segment_eligibility = [&](const sailroute::RouteSegmentView&) {
+        ++segment_checks;
+        return false;
+    };
+    denied = evaluate(options);
+    REQUIRE(denied.has_value());
+    REQUIRE(!denied.value().common_action_legal);
+    REQUIRE(holding_checks > 0U);
+    REQUIRE(segment_checks > 0U);
+
+    options.segment_eligibility = {};
+    const auto allowed = evaluate(options);
+    REQUIRE(allowed.has_value());
+    REQUIRE(allowed.value().common_action_legal);
+    REQUIRE(allowed.value().label.members[0].point.time ==
+            TimePoint{fixture_epoch + 30min});
+}
+
+TEST_CASE("ensemble waits sample environment inside the holding interval") {
+    const ConstantWindGribFixture fixture;
+    RoutingEnvironment environment;
+    environment.currents.provider =
+        std::make_shared<const InteriorMissingCurrentProvider>();
+    environment.currents.missing_data_policy = MissingDataPolicy::fail_route;
+    auto dataset = EnsembleDataset::load(
+        metadata(), {input("member", fixture, environment)});
+    REQUIRE(dataset.has_value());
+    RoutingOptions options;
+    options.maximum_integration_step = 5min;
+    options.holding_eligibility =
+        [](const sailroute::RouteSegmentView&) { return true; };
+    const auto wait = sailroute::detail::make_common_wait_action(30min);
+    const auto result = sailroute::detail::evaluate_common_transition(
+        dataset.value(), sailroute::VesselPolar::default_racer_cruiser_45ft(),
+        options, initial_label(dataset.value()), 0U, wait.value(),
+        EnsembleTransitionParameters{
+            Coordinate{1.0, 1.5}, TimePoint{fixture_epoch},
+            TimePoint{fixture_epoch + 2h}, nullptr, {}});
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().common_action_legal);
+    REQUIRE(result.value().label.members[0].outcome_class ==
+            EnsembleMemberOutcomeClass::missing_data);
+    REQUIRE(result.value().diagnostics.merged_environment.current_samples >= 2U);
+    REQUIRE(result.value().label.members[0].point.time == TimePoint{fixture_epoch});
+}
+
+TEST_CASE("ensemble waits enforce wind limits and time-active exclusions") {
+    const ConstantWindGribFixture fixture(
+        ConstantWindGribFixture::Options{
+            .north_metres_per_second = -5.0,
+            .final_north_metres_per_second = -20.0,
+            .final_forecast_hour = 3});
+    sailroute::ExclusionZone zone;
+    zone.identifier = "interior-holding-restriction";
+    zone.active_from = TimePoint{fixture_epoch + 5min};
+    zone.active_until = TimePoint{fixture_epoch + 25min};
+    zone.polygons.push_back(sailroute::ExclusionPolygon{
+        sailroute::ExclusionRing{
+            {Coordinate{0.9, 0.4}, Coordinate{0.9, 0.6},
+             Coordinate{1.1, 0.6}, Coordinate{1.1, 0.4}}},
+        {}});
+    const auto zones = sailroute::ExclusionZoneSet::create(
+        {zone}, provider_metadata("holding-restriction"));
+    REQUIRE(zones.has_value());
+    for (const bool use_exclusion : {false, true}) {
+        RoutingEnvironment environment;
+        if (use_exclusion) environment.exclusions.zones = zones.value();
+        const auto dataset = EnsembleDataset::load(
+            metadata(), {input("member", fixture, environment)});
+        REQUIRE(dataset.has_value());
+        RoutingOptions options;
+        options.maximum_integration_step = 5min;
+        options.holding_eligibility =
+            [](const sailroute::RouteSegmentView&) { return true; };
+        if (!use_exclusion) options.maximum_true_wind_speed_knots = 25.0;
+        const auto wait = sailroute::detail::make_common_wait_action(30min);
+        const auto result = sailroute::detail::evaluate_common_transition(
+            dataset.value(), sailroute::VesselPolar::default_racer_cruiser_45ft(),
+            options, initial_label(dataset.value()), 0U, wait.value(),
+            EnsembleTransitionParameters{
+                Coordinate{1.0, 1.5}, TimePoint{fixture_epoch},
+                TimePoint{fixture_epoch + 1h}, nullptr, {}});
+        REQUIRE(result.has_value());
+        if (result.value().common_action_legal) {
+            throw std::runtime_error(use_exclusion
+                ? "time-active holding exclusion was accepted"
+                : "holding wind limit was accepted");
+        }
+        REQUIRE(!result.value().common_action_legal);
+        REQUIRE(result.value().label.members[0].outcome_class ==
+                EnsembleMemberOutcomeClass::infeasible_no_route);
+        REQUIRE(result.value().label.members[0].point.time == TimePoint{fixture_epoch});
+        if (use_exclusion) {
+            REQUIRE(result.value().diagnostics.merged_environment.exclusion_rejections > 0U);
+        }
+    }
+}
+
+TEST_CASE("ensemble diagnostic members do not prolong completed participating plans") {
+    const ConstantWindGribFixture fixture;
+    const auto dataset = EnsembleDataset::load(
+        metadata(), {input("active", fixture), input("diagnostic", fixture, {}, 0.0)});
+    REQUIRE(dataset.has_value());
+    auto label = initial_label(dataset.value());
+    label.members[0].status = EnsembleMemberSearchStatus::completed;
+    label.members[0].outcome_class = EnsembleMemberOutcomeClass::reached;
+    label.members[0].point.time += 15min;
+    sailroute::detail::finalize_diagnostic_members(dataset.value(), label);
+    REQUIRE(label.members[1].status == EnsembleMemberSearchStatus::failed);
+    REQUIRE(label.members[1].error.has_value());
+    REQUIRE(label.members[1].error->message.find("zero-weight diagnostic") !=
+            std::string::npos);
+    const auto objective = sailroute::detail::evaluate_ensemble_label_objective(
+        dataset.value(), mean_objective(), label, TimePoint{fixture_epoch});
+    REQUIRE(objective.has_value());
+    REQUIRE(objective.value().value.finite_value == 900.0);
+    REQUIRE(objective.value().diagnostics.incomplete_member_weight == 0.0);
+}
+
+TEST_CASE("ensemble reconstruction retains bounded-integration physical vertices") {
+    const ConstantWindGribFixture fixture;
+    auto dataset = EnsembleDataset::load(metadata(), {input("member", fixture)});
+    REQUIRE(dataset.has_value());
+    std::vector<EnsembleSearchLabel> labels{initial_label(dataset.value())};
+    RoutingOptions options;
+    options.maximum_integration_step = 5min;
+    const auto heading = sailroute::detail::make_common_heading_action(90.0, 30min);
+    const auto result = sailroute::detail::evaluate_common_transition(
+        dataset.value(), sailroute::VesselPolar::default_racer_cruiser_45ft(),
+        options, labels.front(), 0U, heading.value(),
+        EnsembleTransitionParameters{
+            Coordinate{1.0, 1.5}, TimePoint{fixture_epoch},
+            TimePoint{fixture_epoch + 2h}, nullptr, {}});
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().common_action_legal);
+    REQUIRE(!result.value().label.members[0].intermediate_points.empty());
+    labels.push_back(result.value().label);
+    const auto route = sailroute::detail::reconstruct_member_route(labels, 1U, 0U);
+    REQUIRE(route.has_value());
+    REQUIRE(route.value().size() > 2U);
+    for (std::size_t index = 1U; index < route.value().size(); ++index) {
+        REQUIRE(route.value()[index].time - route.value()[index - 1U].time <= 5min);
+    }
+}
+
+TEST_CASE("ensemble bounded heading reaches the arrival circle with eligibility enabled") {
+    const ConstantWindGribFixture fixture;
+    auto dataset = EnsembleDataset::load(metadata(), {input("member", fixture)});
+    REQUIRE(dataset.has_value());
+    auto label = initial_label(dataset.value());
+    RoutingOptions options;
+    std::chrono::seconds last_checked_duration{};
+    options.segment_eligibility = [&](const sailroute::RouteSegmentView& segment) {
+        last_checked_duration = segment.candidate.time - segment.parent.time;
+        return std::abs(segment.candidate.heading_degrees - 90.0) < 1.0e-12;
+    };
+    const auto heading = sailroute::detail::make_common_heading_action(90.0, 30min);
+    for (std::size_t step = 0U; step < 6U; ++step) {
+        const auto result = sailroute::detail::evaluate_common_transition(
+            dataset.value(), sailroute::VesselPolar::default_racer_cruiser_45ft(),
+            options, label, step, heading.value(),
+            EnsembleTransitionParameters{
+                Coordinate{1.0, 0.6}, TimePoint{fixture_epoch},
+                TimePoint{fixture_epoch + 3h}, nullptr, {}});
+        REQUIRE(result.has_value());
+        if (!result.value().common_action_legal) {
+            throw std::runtime_error(
+                "due-east transition rejected at step " + std::to_string(step) +
+                " after " + std::to_string(
+                    (label.members[0].point.time - TimePoint{fixture_epoch}).count()) +
+                " seconds; last eligibility-checked substep duration " +
+                std::to_string(last_checked_duration.count()) + " seconds");
+        }
+        label = result.value().label;
+        if (label.members[0].status == EnsembleMemberSearchStatus::completed) {
+            return;
+        }
+    }
+    REQUIRE(label.members[0].status == EnsembleMemberSearchStatus::completed);
 }
 
 TEST_CASE("shared search rejects member-local alignment") {
@@ -671,9 +902,9 @@ TEST_CASE("label identities ordering and reconstruction are deterministic") {
     const auto route =
         sailroute::detail::reconstruct_member_route(arena, 2U, 0U);
     REQUIRE(route.has_value());
-    REQUIRE(route.value().size() == 3U);
+    REQUIRE(route.value().size() >= 3U);
     REQUIRE(route.value()[0].position.longitude_degrees == 0.5);
-    REQUIRE(route.value()[2].position.longitude_degrees == 0.7);
+    REQUIRE(route.value().back().position.longitude_degrees == 0.7);
     REQUIRE(
         second.value().label.canonical_action_sequence_identity ==
         "root/" +

@@ -2,14 +2,14 @@
 ///
 /// Writes two constant-wind GRIB fixtures, invokes the sailroute CLI binary
 /// with --ensemble-member for both, and asserts exit code 0 and JSON output
-/// containing the ensemble_route_result_v1 schema version.
+/// containing the compact ensemble_route_result_v2 schema version.
 ///
 /// The CLI binary path is injected at compile time via SAILROUTE_CLI_PATH.
 /// The test requires ECCODES environment (ECCODES_SAMPLES_PATH) to be
 /// available, matching the same requirement as the compatibility corpus.
 
 #include "grib_fixture.hpp"
-#include "sailroute/serialization.hpp"
+#include "sailroute/ensemble_serialization.hpp"
 #include "sailroute/time.hpp"
 
 #include <array>
@@ -27,7 +27,7 @@
 
 namespace {
 
-/// Run a shell command, capture combined stdout+stderr, return exit code.
+/// Capture machine-readable stdout; human-readable warnings stay on stderr.
 int run_command(const std::string& cmd, std::string& output) {
     output.clear();
 #ifdef _WIN32
@@ -96,12 +96,13 @@ int main() {
         shell_quote(cli_path) +
         " --ensemble-member gfs:1.0:" + shell_quote(member_a.path()) +
         " --ensemble-member ecmwf:1.0:" + shell_quote(member_b.path()) +
+        " --demo-polar"
+        " --departure 2026-07-14T18:00:00Z"
         " --start 2.0,1.0"
         " --destination 0.0,1.0"
         " --lattice-level 0"
         " --lattice-time-bucket-minutes 30"
-        " --lattice-search a-star"
-        " 2>&1";
+        " --lattice-search a-star";
 
     std::string output;
     const int exit_code = run_command(cmd, output);
@@ -115,11 +116,11 @@ int main() {
     }
 
     const bool has_schema =
-        output.find("ensemble_route_result_v1") != std::string::npos;
+        output.find("ensemble_route_result_v2") != std::string::npos;
     if (!has_schema) {
         std::cerr
             << "sailroute ensemble CLI output missing schema_version "
-               "\"ensemble_route_result_v1\"\nOutput:\n"
+               "\"ensemble_route_result_v2\"\nOutput:\n"
             << output << '\n';
         return 1;
     }
@@ -154,15 +155,16 @@ int main() {
     const std::string single_member_cmd =
         shell_quote(cli_path) +
         " --ensemble-member gfs:1.0:" + shell_quote(member_a.path()) +
+        " --demo-polar"
+        " --departure 2026-07-14T18:00:00Z"
         " --start 2.0,1.0"
         " --destination 0.0,1.0"
-        " --lattice-level 0"
-        " 2>&1";
+        " --lattice-level 0";
     output.clear();
     const int single_member_exit =
         run_command(single_member_cmd, output);
     if (single_member_exit != 0 ||
-        output.find("ensemble_route_result_v1") == std::string::npos) {
+        output.find("ensemble_route_result_v2") == std::string::npos) {
         std::cerr
             << "sailroute single-member ensemble CLI failed with exit code "
             << single_member_exit << "\nOutput:\n"

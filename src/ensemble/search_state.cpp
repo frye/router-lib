@@ -277,7 +277,8 @@ Result<EnsembleSearchLabel> make_initial_ensemble_label(
             member_configurations[index],
             EnsembleMemberSearchStatus::active,
             std::nullopt,
-            std::nullopt});
+            std::nullopt,
+            {}});
     }
     canonicalize_ensemble_label(label);
     return label;
@@ -312,6 +313,27 @@ void canonicalize_ensemble_label(EnsembleSearchLabel& label) {
             "/" + common_action_identity(action);
     }
     label.canonical_label_identity = make_label_identity(label);
+}
+
+void finalize_diagnostic_members(
+    const EnsembleDataset& dataset, EnsembleSearchLabel& label) {
+    for (std::size_t index = 0U; index < label.members.size(); ++index) {
+        if (dataset.members()[index].original_weight > 0.0 &&
+            label.members[index].status == EnsembleMemberSearchStatus::active) {
+            return;
+        }
+    }
+    for (std::size_t index = 0U; index < label.members.size(); ++index) {
+        auto& member = label.members[index];
+        if (dataset.members()[index].original_weight == 0.0 &&
+            member.status == EnsembleMemberSearchStatus::active) {
+            member.status = EnsembleMemberSearchStatus::failed;
+            member.outcome_class = EnsembleMemberOutcomeClass::infeasible_no_route;
+            member.error = Error{
+                ErrorCode::no_route,
+                "zero-weight diagnostic member did not arrive before common-plan termination"};
+        }
+    }
 }
 
 Result<std::vector<EnsembleMemberOutcome>> ensemble_label_outcomes(
@@ -467,7 +489,13 @@ Result<std::vector<RoutePoint>> reconstruct_member_route(
             return invalid_state(
                 "ensemble member index is outside a label's canonical members");
         }
-        const RoutePoint& point = label.members[member_index].point;
+        const auto& member = label.members[member_index];
+        for (const RoutePoint& intermediate : member.intermediate_points) {
+            if (route.empty() || !same_point(route.back(), intermediate)) {
+                route.push_back(intermediate);
+            }
+        }
+        const RoutePoint& point = member.point;
         if (route.empty() || !same_point(route.back(), point)) {
             route.push_back(point);
         }

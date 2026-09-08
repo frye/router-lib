@@ -16,6 +16,8 @@ namespace sailroute::detail {
 struct VariableTransition {
     RoutePoint point;
     OperationalConfiguration configuration;
+    /// Integrated vertices between the parent and the final point.
+    std::vector<RoutePoint> intermediate_points;
 };
 
 enum class VariableTransitionRejection {
@@ -98,5 +100,32 @@ evaluate_heading_transition(
     std::optional<Coordinate> arrival_destination = std::nullopt,
     double arrival_radius_nautical_miles = 0.0,
     VariableTransitionRejection* rejection = nullptr);
+
+[[nodiscard]] Result<std::optional<VariableTransition>>
+evaluate_wait_transition(
+    const WeatherDataset& weather, const VesselPolar& polar,
+    const RoutingOptions& options, const RoutingEnvironment& environment,
+    EnvironmentDiagnostics& diagnostics, const RoutePoint& parent,
+    OperationalConfiguration configuration, TimePoint arrival);
+
+// Single integration kernels; callers use the bounded wrappers above.
+[[nodiscard]] Result<std::optional<VariableTransition>>
+evaluate_variable_transition_step(
+    const WeatherDataset& weather, const VesselPolar& polar,
+    const RoutingOptions& options, const RoutingEnvironment& environment,
+    EnvironmentDiagnostics& diagnostics, const RoutePoint& parent,
+    OperationalConfiguration configuration, Coordinate destination,
+    TimePoint route_end, VariableTransitionRejection* rejection = nullptr);
+
+[[nodiscard]] Result<std::optional<VariableTransition>>
+evaluate_heading_transition_step(
+    const WeatherDataset& weather, const VesselPolar& polar,
+    const RoutingOptions& options, const RoutingEnvironment& environment,
+    EnvironmentDiagnostics& diagnostics, const RoutePoint& parent,
+    OperationalConfiguration configuration, double heading, TimePoint arrival,
+    std::optional<Coordinate> destination = std::nullopt,
+    double arrival_radius = 0.0,
+    VariableTransitionRejection* rejection = nullptr,
+    unsigned arrival_refinements = 0U);
 
 }  // namespace sailroute::detail

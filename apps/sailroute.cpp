@@ -1,5 +1,12 @@
 #include "sailroute/sailroute.hpp"
 #include "sailroute/serialization.hpp"
+#ifdef SAILROUTE_ENABLE_ENSEMBLE
+#include "sailroute/ensemble.hpp"
+#include "sailroute/ensemble_serialization.hpp"
+#endif
+#ifdef SAILROUTE_ENABLE_LAND_DATA
+#include "sailroute/land_data.hpp"
+#endif
 
 #include <array>
 #include <charconv>
@@ -11,6 +18,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -23,7 +31,19 @@ constexpr int exit_input = 3;
 constexpr int exit_routing = 4;
 constexpr int exit_output = 5;
 
+struct CruisingInputs {
+    bool demo_polar{};
+    std::optional<std::filesystem::path> land_path;
+    double land_resolution_nautical_miles{1.0};
+    double land_clearance_nautical_miles{};
+    std::optional<std::chrono::seconds> maximum_forecast_gap;
+    std::optional<sailroute::GeographicBounds> bounds;
+    sailroute::PolarLoadOptions polar;
+    std::set<std::string> seen;
+};
+
 struct CliOptions {
+    CruisingInputs cruising;
     std::filesystem::path grib_path;
     std::optional<std::filesystem::path> polar_path;
     std::string json_path{"-"};
@@ -38,6 +58,7 @@ struct CliOptions {
 };
 
 /// One named, weighted GRIB member specified by --ensemble-member ID:WEIGHT:PATH.
+#ifdef SAILROUTE_ENABLE_ENSEMBLE
 struct EnsembleMemberSpec {
     std::string identifier;
     double weight{1.0};
@@ -45,6 +66,7 @@ struct EnsembleMemberSpec {
 };
 
 struct EnsembleCliOptions {
+    CruisingInputs cruising;
     std::vector<EnsembleMemberSpec> members;
     std::string run_id;
     sailroute::EnsembleObjectiveKind objective{
@@ -62,6 +84,7 @@ struct EnsembleCliOptions {
     sailroute::EnsembleBeamRoutingOptions beam;
     bool help{};
 };
+#endif
 
 void print_help(std::ostream& output) {
     output <<
@@ -74,7 +97,20 @@ void print_help(std::ostream& output) {
         "\n"
         "Input and output:\n"
         "  --departure YYYY-MM-DDTHH:MM:SSZ    UTC departure time\n"
-        "  --polar PATH                        Vessel polar file (default: built-in)\n"
+        "  --polar PATH                        Required vessel polar (unless --demo-polar)\n"
+        "  --demo-polar                        Explicitly use the demonstration polar\n"
+        "  --quality MODE                      fast|balanced|high (default: balanced)\n"
+        "  --boat-speed-factor N               Positive polar performance multiplier\n"
+        "  --integration-minutes N             Maximum physical integration interval\n"
+        "  --maximum-forecast-gap-minutes N     Reject wider interpolation gaps\n"
+        "  --bounds S,W,N,E                    Crop the forecast and local land region\n"
+        "  --polar-format MODE                 automatic|matrix|expedition\n"
+        "  --minimum-sailing-angle N            Additional polar TWA lower bound\n"
+        "  --land PATH                         Local native GSHHG shoreline data\n"
+        "  --land-resolution-nm N              Regional mask grid spacing (default 1)\n"
+        "  --land-clearance-nm N               Required coastal clearance (default 0)\n"
+        "  --maximum-candidates N              Hard generated search-work limit\n"
+        "  --maximum-nodes N                   Hard retained search-node limit\n"
         "  --json PATH|-                       JSON output (default: stdout)\n"
         "  --gpx PATH                          Also write a GPX 1.1 track\n"
         "  --isochrones-json PATH              Write retained frontiers as GeoJSON\n"
@@ -83,7 +119,7 @@ void print_help(std::ostream& output) {
         "Routing controls:\n"
         "  --solver MODE                       isochrone|lattice (default: isochrone)\n"
         "  --lattice-level N                  Icosphere subdivision level (0-8)\n"
-        "  --lattice-time-bucket-minutes N    Time-state bucket width (> 0)\n"
+        "  --lattice-time-bucket-minutes N    VMG/holding action cadence (> 0)\n"
         "  --lattice-refinement-levels N      Coarse-to-fine levels (default: 1)\n"
         "  --lattice-corridor-nm N            Refinement corridor width (> 0)\n"
         "  --lattice-corridor-retries N       Bounded widening retries (default: 2)\n"
@@ -293,8 +329,109 @@ bool is_option(std::string_view argument, std::string_view canonical, std::strin
     return argument == canonical || (!alias.empty() && argument == alias);
 }
 
+sailroute::Result<sailroute::RoutingOptions> quality_options(int argc, char* argv[]) {
+    sailroute::RoutingOptions result;
+    for (int index = 1; index < argc; ++index) {
+        if (std::string_view{argv[index]} != "--quality") continue;
+        if (++index == argc) return usage_error("--quality requires a value");
+        const std::string_view value{argv[index]};
+        if (value == "fast") result = sailroute::routing_options_for_quality(sailroute::RoutingQuality::fast);
+        else if (value == "balanced") result = sailroute::routing_options_for_quality(sailroute::RoutingQuality::balanced);
+        else if (value == "high") result = sailroute::routing_options_for_quality(sailroute::RoutingQuality::high);
+        else return usage_error("--quality must be fast, balanced or high");
+    }
+    return result;
+}
+
+sailroute::Result<bool> parse_cruising_option(
+    int& index, int argc, char* argv[], CruisingInputs& inputs,
+    sailroute::RoutingOptions& routing) {
+    const std::string_view argument{argv[index]};
+    const bool recognized = argument == "--demo-polar" || argument == "--quality" ||
+        argument == "--boat-speed-factor" || argument == "--integration-minutes" ||
+        argument == "--maximum-forecast-gap-minutes" || argument == "--land" ||
+        argument == "--land-resolution-nm" || argument == "--land-clearance-nm" ||
+        argument == "--maximum-candidates" || argument == "--maximum-nodes" ||
+        argument == "--bounds" || argument == "--polar-format" ||
+        argument == "--minimum-sailing-angle";
+    if (!recognized) return false;
+    if (!inputs.seen.insert(std::string{argument}).second) {
+        return usage_error(std::string{argument} + " may only be specified once");
+    }
+    if (argument == "--demo-polar") {
+        inputs.demo_polar = true;
+        return true;
+    }
+    if (++index == argc) return usage_error(std::string{argument} + " requires a value");
+    const std::string_view value{argv[index]};
+    if (argument == "--quality") return true;  // Applied before explicit overrides.
+    if (argument == "--bounds") {
+        const auto first = value.find(',');
+        const auto second = first == std::string_view::npos ? first : value.find(',', first + 1U);
+        if (second == std::string_view::npos) return usage_error("--bounds requires S,W,N,E");
+        auto south_west = parse_coordinate(value.substr(0, second), "--bounds");
+        auto north_east = parse_coordinate(value.substr(second + 1U), "--bounds");
+        if (!south_west) return south_west.error();
+        if (!north_east) return north_east.error();
+        inputs.bounds = sailroute::GeographicBounds{
+            south_west.value().latitude_degrees, south_west.value().longitude_degrees,
+            north_east.value().latitude_degrees, north_east.value().longitude_degrees};
+        return true;
+    }
+    if (argument == "--polar-format") {
+        if (value == "automatic") inputs.polar.format = sailroute::PolarFormat::automatic;
+        else if (value == "matrix") inputs.polar.format = sailroute::PolarFormat::matrix;
+        else if (value == "expedition") inputs.polar.format = sailroute::PolarFormat::expedition;
+        else return usage_error("--polar-format must be automatic, matrix or expedition");
+        return true;
+    }
+    if (argument == "--minimum-sailing-angle") {
+        double number = 0.0;
+        if (!parse_double(value, number) || number <= 0.0 || number > 180.0) {
+            return usage_error("--minimum-sailing-angle must be in (0,180]");
+        }
+        inputs.polar.minimum_sailing_angle_degrees = number;
+        return true;
+    }
+    if (argument == "--land") {
+        if (value.empty()) return usage_error("--land requires a non-empty path");
+        inputs.land_path = std::filesystem::path{value};
+        return true;
+    }
+    if (argument == "--boat-speed-factor" || argument == "--land-resolution-nm" ||
+        argument == "--land-clearance-nm") {
+        double number = 0.0;
+        if (!parse_double(value, number) || number < 0.0 ||
+            (number == 0.0 && argument != "--land-clearance-nm")) {
+            return usage_error(std::string{argument} + " has an invalid numeric value");
+        }
+        if (argument == "--boat-speed-factor") routing.boat_speed_factor = number;
+        else if (argument == "--land-resolution-nm") inputs.land_resolution_nautical_miles = number;
+        else inputs.land_clearance_nautical_miles = number;
+        return true;
+    }
+    unsigned long long number = 0;
+    if (!parse_unsigned(value, number) || number == 0 ||
+        number > static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
+        return usage_error(std::string{argument} + " requires a positive bounded integer");
+    }
+    if (argument == "--integration-minutes") {
+        routing.maximum_integration_step = std::chrono::minutes{number};
+    } else if (argument == "--maximum-forecast-gap-minutes") {
+        inputs.maximum_forecast_gap = std::chrono::minutes{number};
+    } else if (argument == "--maximum-candidates") {
+        routing.maximum_generated_candidates = static_cast<std::size_t>(number);
+    } else {
+        routing.maximum_retained_nodes = static_cast<std::size_t>(number);
+    }
+    return true;
+}
+
 sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
     CliOptions options;
+    auto quality = quality_options(argc, argv);
+    if (!quality) return quality.error();
+    options.routing = std::move(quality.value());
     bool grib_seen = false;
     bool start_seen = false;
     bool destination_seen = false;
@@ -339,6 +476,9 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
             options.help = true;
             continue;
         }
+        auto common = parse_cruising_option(index, argc, argv, options.cruising, options.routing);
+        if (!common) return common.error();
+        if (common.value()) continue;
 
         const auto value_after = [&](std::string_view name)
             -> sailroute::Result<std::string_view> {
@@ -959,6 +1099,16 @@ sailroute::Result<CliOptions> parse_arguments(int argc, char* argv[]) {
         }
         return usage_error("missing required option(s):" + missing);
     }
+    if (options.routing.solver == sailroute::RoutingSolver::time_dependent_lattice &&
+        (routing_intervals_seen || time_step_seen || heading_step_seen || spatial_bucket_seen ||
+         max_nodes_seen || pruning_strategy_seen || pruning_sector_seen || heading_augmentation_seen)) {
+        return usage_error("beam heading, interval and pruning controls are not used by --solver lattice");
+    }
+    if (!options.cruising.land_path &&
+        (options.cruising.seen.contains("--land-clearance-nm") ||
+         options.cruising.seen.contains("--land-resolution-nm"))) {
+        return usage_error("land clearance/resolution options require --land");
+    }
     std::vector<std::pair<std::string_view, std::filesystem::path>> outputs;
     if (options.json_path != "-") {
         outputs.emplace_back("--json", options.json_path);
@@ -1031,15 +1181,42 @@ sailroute::Result<std::string> write_file(
     return std::string{};
 }
 
+sailroute::Result<sailroute::RoutingEnvironment> load_environment(
+    const CruisingInputs& inputs, const sailroute::ForecastMetadata& forecast) {
+    sailroute::RoutingEnvironment environment;
+    if (!inputs.land_path) return environment;
+#ifdef SAILROUTE_ENABLE_LAND_DATA
+    sailroute::LandDataOptions data;
+    data.bounds = forecast.geographic_coverage;
+    data.resolution_nautical_miles = inputs.land_resolution_nautical_miles;
+    auto mask = sailroute::load_gshhg_landmask(*inputs.land_path, data);
+    if (!mask) return mask.error();
+    environment.land.landmask = std::move(mask.value());
+    environment.land.clearance_nautical_miles = inputs.land_clearance_nautical_miles;
+    environment.land.missing_data_policy = sailroute::MissingDataPolicy::reject_transition;
+    return environment;
+#else
+    static_cast<void>(forecast);
+    return usage_error("local land-data support is disabled in this build");
+#endif
+}
+
 int run(const CliOptions& options) {
-    auto weather = sailroute::WeatherDataset::load(options.grib_path);
+    auto weather = sailroute::WeatherDataset::load(options.grib_path,
+        sailroute::WeatherLoadOptions{options.cruising.bounds, options.cruising.maximum_forecast_gap});
     if (!weather) {
         return report_error("input", weather.error(), exit_input);
+    }
+    if (!options.polar_path && !options.cruising.demo_polar) {
+        return report_error("usage", usage_error("provide --polar or explicitly select --demo-polar"), exit_usage);
+    }
+    if (options.polar_path && options.cruising.demo_polar) {
+        return report_error("usage", usage_error("--polar and --demo-polar are mutually exclusive"), exit_usage);
     }
 
     sailroute::VesselPolar polar = sailroute::VesselPolar::default_racer_cruiser_45ft();
     if (options.polar_path) {
-        auto loaded_polar = sailroute::VesselPolar::load(*options.polar_path);
+        auto loaded_polar = sailroute::VesselPolar::load(*options.polar_path, options.cruising.polar);
         if (!loaded_polar) {
             return report_error("input", loaded_polar.error(), exit_input);
         }
@@ -1055,10 +1232,18 @@ int run(const CliOptions& options) {
         options.destination,
         options.departure,
         routing};
-    sailroute::Router router{std::move(weather.value()), std::move(polar)};
+    auto environment = load_environment(options.cruising, weather.value().metadata());
+    if (!environment) return report_error("input", environment.error(), exit_input);
+    sailroute::Router router{
+        std::move(weather.value()), std::move(polar), std::move(environment.value())};
     auto route = router.optimize(request);
     if (!route) {
         return report_error("routing", route.error(), exit_routing);
+    }
+    if (route.value().run) {
+        for (const auto& warning : route.value().run->warnings) {
+            std::cerr << "sailroute: warning: " << warning << '\n';
+        }
     }
     if (route.value().completion ==
         sailroute::RouteCompletion::forecast_exhausted) {
@@ -1133,6 +1318,7 @@ int run(const CliOptions& options) {
 
 /// Parses --ensemble-member ID:WEIGHT:PATH.
 /// Splits on the first two ':' characters only; PATH may itself contain ':'.
+#ifdef SAILROUTE_ENABLE_ENSEMBLE
 sailroute::Result<EnsembleMemberSpec> parse_ensemble_member(
     std::string_view text) {
     const std::size_t first_colon = text.find(':');
@@ -1166,6 +1352,9 @@ sailroute::Result<EnsembleMemberSpec> parse_ensemble_member(
 sailroute::Result<EnsembleCliOptions> parse_ensemble_arguments(
     int argc, char* argv[]) {
     EnsembleCliOptions opts;
+    auto quality = quality_options(argc, argv);
+    if (!quality) return quality.error();
+    opts.routing = std::move(quality.value());
     bool start_seen = false;
     bool destination_seen = false;
     bool departure_seen = false;
@@ -1210,6 +1399,9 @@ sailroute::Result<EnsembleCliOptions> parse_ensemble_arguments(
             opts.help = true;
             continue;
         }
+        auto common = parse_cruising_option(index, argc, argv, opts.cruising, opts.routing);
+        if (!common) return common.error();
+        if (common.value()) continue;
 
         const auto value_after = [&](std::string_view name)
             -> sailroute::Result<std::string_view> {
@@ -1704,20 +1896,42 @@ sailroute::Result<EnsembleCliOptions> parse_ensemble_arguments(
             "--spatial-bucket-nm, and --max-nodes-per-bucket require "
             "--experimental-ensemble-beam in ensemble mode");
     }
+    if (!opts.cruising.land_path &&
+        (opts.cruising.seen.contains("--land-clearance-nm") ||
+         opts.cruising.seen.contains("--land-resolution-nm"))) {
+        return usage_error("land clearance/resolution options require --land");
+    }
     return opts;
 }
 
 int run_ensemble(const EnsembleCliOptions& opts) {
+    if (!opts.polar_path && !opts.cruising.demo_polar) {
+        return report_error("usage", usage_error("provide --polar or explicitly select --demo-polar"), exit_usage);
+    }
+    if (opts.polar_path && opts.cruising.demo_polar) {
+        return report_error("usage", usage_error("--polar and --demo-polar are mutually exclusive"), exit_usage);
+    }
     sailroute::VesselPolar polar =
         sailroute::VesselPolar::default_racer_cruiser_45ft();
     if (opts.polar_path) {
-        auto loaded = sailroute::VesselPolar::load(*opts.polar_path);
+        auto loaded = sailroute::VesselPolar::load(*opts.polar_path, opts.cruising.polar);
         if (!loaded)
             return report_error("input", loaded.error(), exit_input);
         polar = std::move(loaded.value());
     }
 
     // Build member input list.
+    sailroute::RoutingEnvironment shared_environment;
+    if (opts.cruising.land_path) {
+        auto first = sailroute::WeatherDataset::load(opts.members.front().grib_path,
+            sailroute::WeatherLoadOptions{opts.cruising.bounds, opts.cruising.maximum_forecast_gap});
+        if (!first) return report_error("input", first.error(), exit_input);
+        auto loaded = load_environment(opts.cruising, first.value().metadata());
+        if (!loaded) return report_error("input", loaded.error(), exit_input);
+        shared_environment = std::move(loaded.value());
+    } else {
+        std::cerr << "sailroute: warning: land avoidance disabled\n";
+    }
     std::vector<sailroute::EnsembleMemberInput> members;
     members.reserve(opts.members.size());
     for (const auto& spec : opts.members) {
@@ -1725,6 +1939,8 @@ int run_ensemble(const EnsembleCliOptions& opts) {
         m.identifier = spec.identifier;
         m.weight = spec.weight;
         m.grib_path = spec.grib_path;
+        m.bounds = opts.cruising.bounds;
+        m.environment = shared_environment;
         members.push_back(std::move(m));
     }
 
@@ -1743,6 +1959,20 @@ int run_ensemble(const EnsembleCliOptions& opts) {
         std::move(meta), std::move(members));
     if (!dataset)
         return report_error("input", dataset.error(), exit_input);
+    if (opts.cruising.maximum_forecast_gap) {
+        for (const auto& member : dataset.value().members()) {
+            if (member.weather.maximum_time_spacing &&
+                *member.weather.maximum_time_spacing > *opts.cruising.maximum_forecast_gap) {
+                return report_error("input",
+                    {sailroute::ErrorCode::incomplete_forecast,
+                     "ensemble member " + member.identifier + " exceeds the configured forecast gap"},
+                    exit_input);
+            }
+        }
+    }
+    if (opts.cruising.demo_polar) {
+        std::cerr << "sailroute: warning: using an approximate demonstration polar\n";
+    }
 
     // Build objective.
     sailroute::EnsembleObjective objective;
@@ -1857,6 +2087,7 @@ int run_ensemble(const EnsembleCliOptions& opts) {
     return 0;
 }
 
+#endif
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -1874,6 +2105,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (ensemble_mode) {
+#ifdef SAILROUTE_ENABLE_ENSEMBLE
         auto options = parse_ensemble_arguments(argc, argv);
         if (!options) {
             std::cerr << "sailroute: " << options.error().message << "\n"
@@ -1885,6 +2117,10 @@ int main(int argc, char* argv[]) {
             return 0;
         }
         return run_ensemble(options.value());
+#else
+        std::cerr << "sailroute: ensemble support is disabled in this build\n";
+        return exit_usage;
+#endif
     }
 
     auto options = parse_arguments(argc, argv);

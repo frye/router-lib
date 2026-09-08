@@ -156,9 +156,9 @@ TEST_CASE("experimental beam keeps canonical identical member states") {
     }
     REQUIRE(result.value().beam_diagnostics.beam_width == 64U);
     REQUIRE(result.value().beam_diagnostics.max_total_nodes == 10'000U);
-    REQUIRE(!result.value().policy.root_node_identity.empty());
-    REQUIRE(!result.value().policy.alternatives.empty());
-    REQUIRE(!result.value().re_evaluation.selected_branch_identity.empty());
+    REQUIRE(result.value().policy.root_node_identity.empty());
+    REQUIRE(result.value().policy.alternatives.empty());
+    REQUIRE(result.value().re_evaluation.selected_branch_identity.empty());
 }
 
 TEST_CASE("experimental beam retains divergent member positions") {
@@ -203,6 +203,9 @@ TEST_CASE("experimental beam accepts only common Stage 3 legal headings") {
         };
 
     const auto result = EnsembleRouter{dataset.value()}.optimize(request);
+    if (!result) {
+        throw std::runtime_error(result.error().message);
+    }
     REQUIRE(result.has_value());
     REQUIRE(result.value().members[0].outcome.outcome_class ==
             EnsembleMemberOutcomeClass::reached);
@@ -232,6 +235,9 @@ TEST_CASE("experimental beam clips the first arrival-radius crossing") {
         };
 
     const auto result = EnsembleRouter{dataset.value()}.optimize(request);
+    if (!result) {
+        throw std::runtime_error(result.error().message);
+    }
     REQUIRE(result.has_value());
     const auto& route = member(result.value(), "member");
     REQUIRE(route.outcome.outcome_class == EnsembleMemberOutcomeClass::reached);
@@ -297,7 +303,7 @@ TEST_CASE("experimental beam hard limits and cancellation are explicit") {
     auto bounded_result =
         EnsembleRouter{dataset.value()}.optimize(bounded);
     REQUIRE(!bounded_result.has_value());
-    REQUIRE(bounded_result.error().code == ErrorCode::no_route);
+    REQUIRE(bounded_result.error().code == ErrorCode::resource_limit);
     REQUIRE(bounded_result.error().message.find("hard limit") !=
             std::string::npos);
 
@@ -308,9 +314,18 @@ TEST_CASE("experimental beam hard limits and cancellation are explicit") {
     auto rejected_result =
         EnsembleRouter{dataset.value()}.optimize(rejected);
     REQUIRE(!rejected_result.has_value());
-    REQUIRE(rejected_result.error().code == ErrorCode::no_route);
+    REQUIRE(rejected_result.error().code == ErrorCode::resource_limit);
     REQUIRE(rejected_result.error().message.find(
                 "3 generated and 0 accepted") != std::string::npos);
+
+    EnsembleRouteRequest step_bounded = beam_request();
+    step_bounded.destination = Coordinate{1.0, 1.5};
+    step_bounded.beam.max_steps = 1U;
+    const auto step_result =
+        EnsembleRouter{dataset.value()}.optimize(step_bounded);
+    REQUIRE(!step_result.has_value());
+    REQUIRE(step_result.error().code == ErrorCode::resource_limit);
+    REQUIRE(step_result.error().message.find("max_steps") != std::string::npos);
 
     const auto cancelled =
         sailroute::detail::optimize_ensemble_beam_route(

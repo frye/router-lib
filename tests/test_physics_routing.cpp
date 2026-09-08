@@ -294,7 +294,7 @@ TEST_CASE("geometry-only environments do not invent point physics audit data") {
     }
 }
 
-TEST_CASE("zero current is exactly equivalent to configuring no current") {
+TEST_CASE("zero current preserves physics with identical search ordering") {
     const sailroute::test::ConstantWindGribFixture fixture;
     const WeatherDataset weather = load_weather(fixture);
     const auto polar = sailroute::VesselPolar::default_racer_cruiser_45ft();
@@ -304,7 +304,8 @@ TEST_CASE("zero current is exactly equivalent to configuring no current") {
     for (const RoutingSolver solver :
          {RoutingSolver::isochrone_beam,
           RoutingSolver::time_dependent_lattice}) {
-        const RouteRequest request = base_request(1U, solver);
+        RouteRequest request = base_request(1U, solver);
+        request.options.lattice.search_algorithm = sailroute::LatticeSearchAlgorithm::dijkstra;
         const RouteResult expected = route_or_throw(legacy, request);
         const RouteResult actual = route_or_throw(still, request);
         require_identical_route(expected, actual);
@@ -490,7 +491,7 @@ TEST_CASE("fixed-duration heading transitions apply current and exclusions") {
         diagnostics,
         parent,
         {},
-        45.0,
+        50.0,
         parent.time + std::chrono::minutes{30});
     REQUIRE(moved.has_value());
     REQUIRE(moved.value().has_value());

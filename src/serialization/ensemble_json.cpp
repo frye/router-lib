@@ -4,7 +4,7 @@
 // shared helper headers (text_encoding, numeric_encoding) but introduces
 // no new library dependencies. Existing deterministic bytes are unaffected.
 
-#include "sailroute/serialization.hpp"
+#include "sailroute/ensemble_serialization.hpp"
 
 #include "sailroute/time.hpp"
 #include "serialization/numeric_encoding.hpp"
@@ -207,7 +207,8 @@ static Err append_route_action_array(std::string& out,
     return kOk;
 }
 
-static Err append_route_point(std::string& out, const RoutePoint& p) {
+static Err append_route_point(
+    std::string& out, const RoutePoint& p, bool version_two) {
     out.push_back('{');
     akey(out, "position");
     if (auto e = append_coordinate(out, p.position)) return e;
@@ -259,6 +260,14 @@ static Err append_route_point(std::string& out, const RoutePoint& p) {
         afield_bool(out, "current_applied", env.current_applied);
         out.push_back(',');
         afield_bool(out, "wave_applied", env.wave_applied);
+        if (version_two) {
+            out.push_back(',');
+            akey(out, "polar_wind_speed_knots");
+            if (auto e = anum(out, env.polar_wind_speed_knots)) return e;
+            out.push_back(',');
+            akey(out, "polar_wind_direction_degrees");
+            if (auto e = anum(out, env.polar_wind_direction_degrees)) return e;
+        }
         out.push_back('}');
     }
     out.push_back('}');
@@ -426,8 +435,8 @@ static Err append_beam_diagnostics(std::string& out,
     return kOk;
 }
 
-static Err append_member_route_result(std::string& out,
-                                       const EnsembleMemberRouteResult& m) {
+static Err append_member_route_result(
+    std::string& out, const EnsembleMemberRouteResult& m, bool version_two) {
     out.push_back('{');
     akey(out, "outcome");
     if (auto e = append_member_outcome(out, m.outcome)) return e;
@@ -435,7 +444,7 @@ static Err append_member_route_result(std::string& out,
     out.append("\"points\":[");
     for (std::size_t i = 0; i < m.points.size(); ++i) {
         if (i > 0) out.push_back(',');
-        if (auto e = append_route_point(out, m.points[i])) return e;
+        if (auto e = append_route_point(out, m.points[i], version_two)) return e;
     }
     out.push_back(']');
     out.push_back(',');
@@ -961,7 +970,22 @@ static Err append_departure_source(std::string& out, DepartureSource ds) {
     return kOk;
 }
 
+static bool requires_version_two(const EnsembleRouteResult& result) {
+    if (result.policy.nodes.empty()) return true;
+    for (const auto& member : result.members) {
+        for (const auto& point : member.points) {
+            if (point.environment &&
+                (point.environment->polar_wind_speed_knots != 0.0 ||
+                 point.environment->polar_wind_direction_degrees != 0.0)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static Err append_result(std::string& out, const EnsembleRouteResult& r) {
+    const bool version_two = requires_version_two(r);
     out.push_back('{');
     afield(out, "departure_time", format_utc_time(r.departure_time));
     out.push_back(',');
@@ -980,12 +1004,19 @@ static Err append_result(std::string& out, const EnsembleRouteResult& r) {
     out.append("\"members\":[");
     for (std::size_t i = 0; i < r.members.size(); ++i) {
         if (i > 0) out.push_back(',');
-        if (auto e = append_member_route_result(out, r.members[i])) return e;
+        if (auto e = append_member_route_result(
+                out, r.members[i], version_two)) return e;
     }
     out.push_back(']');
     out.push_back(',');
     akey(out, "objective");
     if (auto e = append_objective_evaluation(out, r.objective)) return e;
+    if (version_two) {
+        out.push_back(',');
+        akey(out, "objective_specification");
+        if (auto e = append_re_evaluation_objective(
+                out, r.objective_specification)) return e;
+    }
     out.push_back(',');
     akey(out, "lattice_diagnostics");
     if (auto e = append_lattice_diagnostics(out, r.lattice_diagnostics))
@@ -993,19 +1024,21 @@ static Err append_result(std::string& out, const EnsembleRouteResult& r) {
     out.push_back(',');
     akey(out, "beam_diagnostics");
     if (auto e = append_beam_diagnostics(out, r.beam_diagnostics)) return e;
-    out.push_back(',');
-    akey(out, "policy");
-    if (auto e = append_policy_graph(out, r.policy)) return e;
-    out.push_back(',');
-    out.append("\"decision_points\":[");
-    for (std::size_t i = 0; i < r.decision_points.size(); ++i) {
-        if (i > 0) out.push_back(',');
-        if (auto e = append_decision_point(out, r.decision_points[i])) return e;
+    if (!r.policy.nodes.empty()) {
+        out.push_back(',');
+        akey(out, "policy");
+        if (auto e = append_policy_graph(out, r.policy)) return e;
+        out.push_back(',');
+        out.append("\"decision_points\":[");
+        for (std::size_t i = 0; i < r.decision_points.size(); ++i) {
+            if (i > 0) out.push_back(',');
+            if (auto e = append_decision_point(out, r.decision_points[i])) return e;
+        }
+        out.push_back(']');
+        out.push_back(',');
+        akey(out, "re_evaluation");
+        if (auto e = append_re_evaluation_state(out, r.re_evaluation)) return e;
     }
-    out.push_back(']');
-    out.push_back(',');
-    akey(out, "re_evaluation");
-    if (auto e = append_re_evaluation_state(out, r.re_evaluation)) return e;
     out.push_back(',');
     afield_bool(out, "experimental", r.experimental);
     out.push_back('}');
@@ -1026,7 +1059,8 @@ Result<std::string> ensemble_route_to_json(const EnsembleRouteDocument& doc) {
     std::string out;
     out.reserve(65536);
     out.push_back('{');
-    afield(out, "schema_version", "ensemble_route_result_v1");
+    afield(out, "schema_version", requires_version_two(doc.result)
+        ? "ensemble_route_result_v2" : "ensemble_route_result_v1");
     out.push_back(',');
     akey(out, "run_metadata");
     if (auto e = append_run_metadata(out, doc.metadata)) return *e;
@@ -1589,6 +1623,7 @@ static Result<EnsembleMemberOutcome> parse_member_outcome(
             else if (code_str == "cancelled")        ec = ErrorCode::cancelled;
             else if (code_str == "invalid_environment") ec = ErrorCode::invalid_environment;
             else if (code_str == "environment_data_unavailable") ec = ErrorCode::environment_data_unavailable;
+            else if (code_str == "resource_limit") ec = ErrorCode::resource_limit;
             else return parse_error("unknown error code: " + std::string(code_str));
             out.error = Error{ec, std::string{msg.value()}};
             break;
@@ -1633,7 +1668,8 @@ static Result<EnsembleRouteAction> parse_route_action(const JsonObject& obj) {
     return a;
 }
 
-static Result<RoutePoint> parse_route_point(const JsonObject& obj) {
+static Result<RoutePoint> parse_route_point(
+    const JsonObject& obj, bool version_two) {
     if (auto e = check_no_unknown_fields(
             obj, {"position", "time", "heading_degrees", "boat_speed_knots",
                   "true_wind_speed_knots", "true_wind_direction_degrees",
@@ -1683,8 +1719,15 @@ static Result<RoutePoint> parse_route_point(const JsonObject& obj) {
                              "significant_wave_height_metres",
                              "wave_period_seconds",
                              "relative_wave_angle_degrees",
-                             "current_applied", "wave_applied"})) {
+                             "current_applied", "wave_applied",
+                             "polar_wind_speed_knots",
+                             "polar_wind_direction_degrees"})) {
                 return *e;
+            }
+            if (!version_two &&
+                (field_present(v.obj, "polar_wind_speed_knots") ||
+                 field_present(v.obj, "polar_wind_direction_degrees"))) {
+                return parse_error("polar-wind audit fields require ensemble v2");
             }
             RoutePointEnvironment env;
             auto sog = req_finite_double(v.obj, "speed_over_ground_knots");
@@ -1717,6 +1760,15 @@ static Result<RoutePoint> parse_route_point(const JsonObject& obj) {
             auto wa = req_bool(v.obj, "wave_applied");
             if (!wa) return wa.error();
             env.wave_applied = wa.value();
+            if (version_two) {
+                auto speed = req_finite_double(v.obj, "polar_wind_speed_knots");
+                if (!speed) return speed.error();
+                auto direction = req_finite_double(
+                    v.obj, "polar_wind_direction_degrees");
+                if (!direction) return direction.error();
+                env.polar_wind_speed_knots = speed.value();
+                env.polar_wind_direction_degrees = direction.value();
+            }
             rp.environment = env;
             break;
         }
@@ -1926,7 +1978,7 @@ static Result<EnsembleBeamDiagnostics> parse_beam_diagnostics(
 }
 
 static Result<EnsembleMemberRouteResult> parse_member_route_result(
-    const JsonObject& obj) {
+    const JsonObject& obj, bool version_two) {
     if (auto e = check_no_unknown_fields(
             obj, {"outcome", "points", "environment_diagnostics"})) {
         return *e;
@@ -1948,7 +2000,7 @@ static Result<EnsembleMemberRouteResult> parse_member_route_result(
     for (const auto& elem : *pts_arr.value()) {
         if (!elem.is_object())
             return parse_error("points array element must be an object");
-        auto pt = parse_route_point(elem.obj);
+        auto pt = parse_route_point(elem.obj, version_two);
         if (!pt) return pt.error();
         r.points.push_back(std::move(pt.value()));
     }
@@ -2434,14 +2486,15 @@ static Result<ForecastMetadata> parse_forecast_metadata(
         first_time.value() > last_time.value()) {
         return parse_error("invalid forecast metadata range or grid size");
     }
-    return ForecastMetadata{
-        first_time.value(),
-        last_time.value(),
-        latitude_count.value(),
-        longitude_count.value(),
-        global.value(),
-        std::string{source.value()},
-        initialization_time.value()};
+    ForecastMetadata metadata;
+    metadata.first_valid_time = first_time.value();
+    metadata.last_valid_time = last_time.value();
+    metadata.latitude_count = latitude_count.value();
+    metadata.longitude_count = longitude_count.value();
+    metadata.global_longitude_coverage = global.value();
+    metadata.source = source.value();
+    metadata.initialization_time = initialization_time.value();
+    return metadata;
 }
 
 static Result<ForecastGridIdentity> parse_forecast_grid_identity(
@@ -2868,14 +2921,23 @@ static Result<EnsembleSolver> parse_solver(std::string_view sv) {
     return parse_error("unknown solver: " + std::string(sv));
 }
 
-static Result<EnsembleRouteResult> parse_result(const JsonObject& obj) {
-    if (auto e = check_no_unknown_fields(
+static Result<EnsembleRouteResult> parse_result(
+    const JsonObject& obj, bool version_two) {
+    const auto unknown_fields = version_two
+        ? check_no_unknown_fields(
+            obj, {"departure_time", "departure_source", "solver",
+                  "common_actions", "canonical_action_sequence_identity",
+                  "members", "objective", "objective_specification", "lattice_diagnostics",
+                  "beam_diagnostics", "experimental", "policy",
+                  "decision_points", "re_evaluation"})
+        : check_no_unknown_fields(
             obj, {"departure_time", "departure_source", "solver",
                   "common_actions", "canonical_action_sequence_identity",
                   "members", "objective", "lattice_diagnostics",
                   "beam_diagnostics", "policy", "decision_points",
-                  "re_evaluation", "experimental"})) {
-        return *e;
+                  "re_evaluation", "experimental"});
+    if (unknown_fields) {
+        return *unknown_fields;
     }
     auto dt_str = req_string(obj, "departure_time");
     if (!dt_str) return dt_str.error();
@@ -2907,16 +2969,6 @@ static Result<EnsembleRouteResult> parse_result(const JsonObject& obj) {
     if (!bd_obj) return bd_obj.error();
     auto bd = parse_beam_diagnostics(*bd_obj.value());
     if (!bd) return bd.error();
-    auto pg_obj = req_object(obj, "policy");
-    if (!pg_obj) return pg_obj.error();
-    auto pg = parse_policy_graph(*pg_obj.value());
-    if (!pg) return pg.error();
-    auto dp_arr = req_array(obj, "decision_points");
-    if (!dp_arr) return dp_arr.error();
-    auto re_obj = req_object(obj, "re_evaluation");
-    if (!re_obj) return re_obj.error();
-    auto re = parse_re_evaluation_state(*re_obj.value());
-    if (!re) return re.error();
     auto exp = req_bool(obj, "experimental");
     if (!exp) return exp.error();
 
@@ -2928,9 +2980,43 @@ static Result<EnsembleRouteResult> parse_result(const JsonObject& obj) {
     r.objective = std::move(objv.value());
     r.lattice_diagnostics = ld.value();
     r.beam_diagnostics = bd.value();
-    r.policy = std::move(pg.value());
-    r.re_evaluation = std::move(re.value());
     r.experimental = exp.value();
+    if (version_two) {
+        auto specification_obj = req_object(obj, "objective_specification");
+        if (!specification_obj) return specification_obj.error();
+        auto specification = parse_objective_spec(*specification_obj.value());
+        if (!specification) return specification.error();
+        r.objective_specification = std::move(specification.value());
+    }
+    if (!version_two || field_present(obj, "policy") ||
+        field_present(obj, "decision_points") ||
+        field_present(obj, "re_evaluation")) {
+        auto pg_obj = req_object(obj, "policy");
+        if (!pg_obj) return pg_obj.error();
+        auto pg = parse_policy_graph(*pg_obj.value());
+        if (!pg) return pg.error();
+        auto re_obj = req_object(obj, "re_evaluation");
+        if (!re_obj) return re_obj.error();
+        auto re = parse_re_evaluation_state(*re_obj.value());
+        if (!re) return re.error();
+        r.policy = std::move(pg.value());
+        r.re_evaluation = std::move(re.value());
+        if (!version_two) {
+            r.objective_specification = r.re_evaluation.objective;
+        }
+        if (r.policy.nodes.empty()) {
+            return parse_error("present policy diagnostics require a nonempty graph");
+        }
+        auto dp_arr = req_array(obj, "decision_points");
+        if (!dp_arr) return dp_arr.error();
+        for (const auto& elem : *dp_arr.value()) {
+            if (!elem.is_object())
+                return parse_error("decision_points element must be an object");
+            auto dp = parse_decision_point(elem.obj);
+            if (!dp) return dp.error();
+            r.decision_points.push_back(std::move(dp.value()));
+        }
+    }
 
     for (const auto& elem : *ca_arr.value()) {
         if (!elem.is_object())
@@ -2942,18 +3028,10 @@ static Result<EnsembleRouteResult> parse_result(const JsonObject& obj) {
     for (const auto& elem : *mem_arr.value()) {
         if (!elem.is_object())
             return parse_error("members element must be an object");
-        auto m = parse_member_route_result(elem.obj);
+        auto m = parse_member_route_result(elem.obj, version_two);
         if (!m) return m.error();
         r.members.push_back(std::move(m.value()));
     }
-    for (const auto& elem : *dp_arr.value()) {
-        if (!elem.is_object())
-            return parse_error("decision_points element must be an object");
-        auto dp = parse_decision_point(elem.obj);
-        if (!dp) return dp.error();
-        r.decision_points.push_back(std::move(dp.value()));
-    }
-
     // Member identity consistency: no duplicate member_identifiers in members.
     std::unordered_set<std::string> seen;
     for (const auto& m : r.members) {
@@ -3007,6 +3085,7 @@ static std::optional<Error> validate_member_outcome(
             case ErrorCode::cancelled:
             case ErrorCode::invalid_environment:
             case ErrorCode::environment_data_unavailable:
+            case ErrorCode::resource_limit:
                 break;
             default:
                 return parse_error(
@@ -3245,6 +3324,31 @@ static std::optional<Error> validate_document(
     }
 
     const EnsemblePolicyGraph& policy = result.policy;
+    if (requires_version_two(result)) {
+        if (const auto error = validate_objective_spec(
+                result.objective_specification, member_ids, "v2 result")) {
+            return error;
+        }
+    }
+    if (policy.nodes.empty()) {
+        const auto& reevaluation = result.re_evaluation;
+        if (!policy.root_node_identity.empty() ||
+            !policy.branches.empty() || !policy.alternatives.empty() ||
+            !result.decision_points.empty() ||
+            !reevaluation.prior_run_identifier.empty() ||
+            !reevaluation.selected_branch_identity.empty() ||
+            !reevaluation.canonical_branch_identities.empty() ||
+            reevaluation.spatial_tolerance_nautical_miles != 0.0 ||
+            reevaluation.time_tolerance != std::chrono::seconds::zero() ||
+            reevaluation.objective.kind !=
+                EnsembleObjectiveKind::weighted_mean_elapsed_arrival ||
+            reevaluation.objective.target ||
+            !reevaluation.objective.rival_outcomes.empty()) {
+            return parse_error(
+                "compact results cannot contain partial policy diagnostics");
+        }
+        return std::nullopt;
+    }
     if (policy.schema_revision == 0U || policy.nodes.empty() ||
         policy.root_node_identity.empty()) {
         return parse_error("policy graph has no valid root");
@@ -3485,6 +3589,22 @@ static std::optional<Error> validate_document(
             reevaluation.objective, member_ids, "re_evaluation")) {
         return error;
     }
+    if (requires_version_two(result)) {
+        std::string selected_specification;
+        std::string diagnostic_specification;
+        if (const auto error = append_re_evaluation_objective(
+                selected_specification, result.objective_specification)) {
+            return error;
+        }
+        if (const auto error = append_re_evaluation_objective(
+                diagnostic_specification, reevaluation.objective)) {
+            return error;
+        }
+        if (selected_specification != diagnostic_specification) {
+            return parse_error(
+                "v2 objective specification contradicts retained diagnostics");
+        }
+    }
     for (const EnsembleDecisionPoint& decision : result.decision_points) {
         const EnsemblePolicyNode& node =
             policy.nodes[node_index.at(decision.policy_node_identity)];
@@ -3550,7 +3670,8 @@ Result<EnsembleRouteDocument> ensemble_route_from_json(std::string_view json) {
     }
     auto sv = req_string(root, "schema_version");
     if (!sv) return sv.error();
-    if (sv.value() != "ensemble_route_result_v1")
+    if (sv.value() != "ensemble_route_result_v1" &&
+        sv.value() != "ensemble_route_result_v2")
         return parse_error("unsupported schema_version: " + std::string(sv.value()));
 
     auto meta_obj = req_object(root, "run_metadata");
@@ -3574,7 +3695,8 @@ Result<EnsembleRouteDocument> ensemble_route_from_json(std::string_view json) {
 
     auto res_obj = req_object(root, "result");
     if (!res_obj) return res_obj.error();
-    auto res = parse_result(*res_obj.value());
+    auto res = parse_result(
+        *res_obj.value(), sv.value() == "ensemble_route_result_v2");
     if (!res) return res.error();
 
     EnsembleRouteDocument document{

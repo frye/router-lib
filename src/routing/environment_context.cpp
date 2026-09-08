@@ -42,6 +42,13 @@ EnvironmentSampleResult policy_result(
 
 }  // namespace
 
+Wind water_relative_wind(Wind ground_wind, CurrentVector current) noexcept {
+    constexpr double knots_to_mps = 1852.0 / 3600.0;
+    return Wind{
+        ground_wind.east_mps - current.east_knots * knots_to_mps,
+        ground_wind.north_mps - current.north_knots * knots_to_mps};
+}
+
 EnvironmentSampleResult sample_environment(
     const RoutingEnvironment& environment,
     Coordinate coordinate,
@@ -134,6 +141,9 @@ GroundVelocity ground_velocity(
     double water_heading_degrees,
     double water_speed_knots,
     CurrentVector current) noexcept {
+    if (current.east_knots == 0.0 && current.north_knots == 0.0) {
+        return GroundVelocity{normalize_degrees(water_heading_degrees), water_speed_knots};
+    }
     const double heading = water_heading_degrees * degrees_to_radians;
     const double east =
         water_speed_knots * std::sin(heading) + current.east_knots;

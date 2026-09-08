@@ -735,7 +735,7 @@ Result<EnsemblePolicyBuildResult> build_ensemble_policy(
     result.re_evaluation.schema_revision = 1U;
     result.re_evaluation.prior_run_identifier =
         dataset.metadata().run_identifier;
-    result.re_evaluation.objective = objective;
+    result.re_evaluation.objective = canonical_objective_specification(objective);
     result.re_evaluation.spatial_tolerance_nautical_miles =
         options.commitment_spatial_tolerance_nautical_miles;
     result.re_evaluation.time_tolerance =

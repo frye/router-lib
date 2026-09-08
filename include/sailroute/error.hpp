@@ -23,6 +23,7 @@ enum class ErrorCode {
     cancelled,
     invalid_environment,
     environment_data_unavailable,
+    resource_limit,
 };
 
 /// A machine-readable error category and human-readable diagnostic.

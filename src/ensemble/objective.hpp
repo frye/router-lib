@@ -15,6 +15,10 @@ struct EnsembleObjectiveTieBreakInputs {
     std::string canonical_action_sequence_identity;
 };
 
+/// Canonical copy for result/diagnostic persistence after request validation.
+[[nodiscard]] EnsembleObjective canonical_objective_specification(
+    EnsembleObjective objective);
+
 /// Validates and evaluates one candidate in dataset canonical member order.
 Result<EnsembleObjectiveEvaluation> evaluate_ensemble_objective(
     const EnsembleDataset& dataset,

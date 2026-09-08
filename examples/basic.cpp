@@ -9,10 +9,15 @@ int main() {
         std::cerr << weather.error().message << '\n';
         return 1;
     }
+    auto polar = sailroute::VesselPolar::load("boat.pol");
+    if (!polar) {
+        std::cerr << polar.error().message << '\n';
+        return 1;
+    }
 
     sailroute::Router router{
         std::move(weather.value()),
-        sailroute::VesselPolar::default_racer_cruiser_45ft()};
+        std::move(polar.value())};
     sailroute::RouteRequest request{
         .start = {37.7749, -122.4194},
         .destination = {21.3069, -157.8583},
