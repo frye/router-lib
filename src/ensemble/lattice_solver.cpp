@@ -241,7 +241,7 @@ struct LaterQueueEntry {
     std::size_t configured,
     const EnsembleLatticeDiagnostics& diagnostics) {
     return Error{
-        ErrorCode::no_route,
+        ErrorCode::resource_limit,
         "ensemble lattice " + std::string{limit} + " hard limit " +
             std::to_string(configured) + " exceeded after " +
             std::to_string(diagnostics.generated_labels) +
@@ -394,7 +394,8 @@ struct LaterQueueEntry {
     const EnsembleRouteRequest& request,
     const GeodesicLattice& lattice,
     const EnsembleSearchLabel& label,
-    std::chrono::seconds bucket_width) {
+    std::chrono::seconds bucket_width,
+    std::span<EnvironmentDiagnostics> member_environment) {
     std::vector<EnsembleCommonAction> actions;
     if (auto destination = make_common_target_action(request.destination)) {
         actions.push_back(destination.value());
@@ -403,7 +404,8 @@ struct LaterQueueEntry {
     std::vector<CellIndex> target_cells;
     for (std::size_t index = 0U; index < label.members.size(); ++index) {
         const EnsembleMemberSearchState& member = label.members[index];
-        if (member.status != EnsembleMemberSearchStatus::active) {
+        if (member.status != EnsembleMemberSearchStatus::active ||
+            dataset.members()[index].original_weight == 0.0) {
             continue;
         }
         const auto cell = lattice.nearest_cell(member.point.position);
@@ -428,15 +430,31 @@ struct LaterQueueEntry {
         if (!evaluated || !evaluated.value()) {
             continue;
         }
+        Wind proposal_wind = wind.value();
+        const RoutingEnvironment* environment = dataset.member_environment(index);
+        if (environment != nullptr && environment->currents.configured()) {
+            const auto fields = sample_environment(
+                *environment, member.point.position, member.point.time,
+                member_environment[index]);
+            if (fields.outcome != EnvironmentOutcome::accepted) {
+                continue;
+            }
+            proposal_wind = water_relative_wind(
+                proposal_wind, fields.samples.current);
+        }
         const PolarSlice slice = polar.slice_at(
-            evaluated.value()->speed_knots,
+            proposal_wind.speed_knots(),
             request.options.polar_angle_interpolation);
+        if (request.options.above_polar_range == AbovePolarRangePolicy::no_speed &&
+            slice.above_tabulated_wind_speed()) {
+            continue;
+        }
         const VelocityMadeGoodAngles optima =
             slice.velocity_made_good_angles();
         if (!optima.valid || !(optima.upwind_degrees > 0.0)) {
             continue;
         }
-        const double wind_from = evaluated.value()->direction_from_degrees;
+        const double wind_from = proposal_wind.direction_from_degrees();
         for (const double heading : {
                  normalize_degrees(wind_from - optima.upwind_degrees),
                  normalize_degrees(wind_from + optima.upwind_degrees)}) {
@@ -454,8 +472,10 @@ struct LaterQueueEntry {
             actions.push_back(target.value());
         }
     }
-    if (auto wait = make_common_wait_action(bucket_width)) {
-        actions.push_back(wait.value());
+    if (request.options.holding_eligibility) {
+        if (auto wait = make_common_wait_action(bucket_width)) {
+            actions.push_back(wait.value());
+        }
     }
     std::sort(actions.begin(), actions.end());
     actions.erase(std::unique(actions.begin(), actions.end()), actions.end());
@@ -508,6 +528,8 @@ struct LaterQueueEntry {
     EnsembleRouteResult result;
     result.departure_time = departure;
     result.departure_source = departure_source;
+    result.objective_specification =
+        canonical_objective_specification(request.objective);
     result.objective = *selected.aggregate_objective;
     result.canonical_action_sequence_identity =
         selected.canonical_action_sequence_identity;
@@ -526,6 +548,9 @@ struct LaterQueueEntry {
             outcomes.value()[index],
             std::move(route.value()),
             member_environment[index]});
+    }
+    if (request.policy.max_alternatives == 0U) {
+        return result;
     }
     auto policy = build_ensemble_policy(
         dataset,
@@ -572,6 +597,12 @@ Result<EnsembleRouteResult> optimize_ensemble_lattice_route(
         return invalid_request(
             "ensemble arrival radius and maximum route duration must be positive");
     }
+    if (!std::isfinite(request.options.boat_speed_factor) ||
+        request.options.boat_speed_factor <= 0.0 ||
+        request.options.maximum_integration_step <= std::chrono::minutes::zero()) {
+        return invalid_request(
+            "ensemble performance factor and integration step must be positive");
+    }
     if (request.lattice.time_bucket <= std::chrono::minutes::zero() ||
         request.lattice.max_labels_per_state == 0U ||
         request.lattice.max_total_labels == 0U) {
@@ -591,7 +622,8 @@ Result<EnsembleRouteResult> optimize_ensemble_lattice_route(
         return invalid_request(
             "ensemble lattice subdivision level exceeds the supported maximum");
     }
-    const double maximum_speed = polar.maximum_boat_speed_knots();
+    const double maximum_speed =
+        polar.maximum_boat_speed_knots() * request.options.boat_speed_factor;
     if (!(maximum_speed > 0.0)) {
         return Error{
             ErrorCode::invalid_polar,
@@ -649,21 +681,28 @@ Result<EnsembleRouteResult> optimize_ensemble_lattice_route(
     std::vector<OperationalConfiguration> configurations(dataset.member_count());
     initial_points.reserve(dataset.member_count());
     std::vector<std::optional<Error>> initial_errors(dataset.member_count());
+    std::vector<EnvironmentDiagnostics> member_environment(
+        dataset.member_count());
     for (std::size_t index = 0U; index < dataset.member_count(); ++index) {
         const WeatherDataset* weather = dataset.member_weather(index);
-        if (weather == nullptr) {
+        const RoutingEnvironment* environment = dataset.member_environment(index);
+        if (weather == nullptr || environment == nullptr) {
             return invalid_request("ensemble dataset is missing member weather");
         }
-        const auto wind = weather->interpolate(request.start, departure);
+        auto initial_point = evaluate_ensemble_initial_point(
+            *weather, request.options, *environment, member_environment[index],
+            request.start, departure);
         RoutePoint point;
         point.position = request.start;
         point.time = departure;
-        if (wind) {
-            point.true_wind_speed_knots = wind.value().speed_knots();
-            point.true_wind_direction_degrees =
-                wind.value().direction_from_degrees();
+        if (initial_point) {
+            point = std::move(initial_point.value());
         } else {
-            initial_errors[index] = wind.error();
+            if (initial_point.error().code == ErrorCode::no_route &&
+                dataset.members()[index].original_weight > 0.0) {
+                return initial_point.error();
+            }
+            initial_errors[index] = initial_point.error();
         }
         initial_points.push_back(std::move(point));
     }
@@ -688,6 +727,7 @@ Result<EnsembleRouteResult> optimize_ensemble_lattice_route(
             member.outcome_class = EnsembleMemberOutcomeClass::reached;
         }
     }
+    finalize_diagnostic_members(dataset, initial.value());
     canonicalize_ensemble_label(initial.value());
 
     EnsembleLatticeDiagnostics diagnostics;
@@ -758,8 +798,6 @@ Result<EnsembleRouteResult> optimize_ensemble_lattice_route(
     };
     std::optional<LabelIndex> best_terminal;
     std::vector<LabelIndex> terminal_labels;
-    std::vector<EnvironmentDiagnostics> member_environment(
-        dataset.member_count());
 
     const auto consider_terminal = [&](LabelIndex candidate) {
         if (std::any_of(
@@ -929,7 +967,8 @@ Result<EnsembleRouteResult> optimize_ensemble_lattice_route(
             request,
             lattice.value(),
             current,
-            bucket_width);
+            bucket_width,
+            member_environment);
         for (const EnsembleCommonAction& action : actions) {
             ++diagnostics.generated_labels;
             auto transition = evaluate_common_transition(
@@ -961,6 +1000,9 @@ Result<EnsembleRouteResult> optimize_ensemble_lattice_route(
                         environment_diagnostics);
             }
 
+            if (!transition.value().common_action_legal) {
+                continue;
+            }
             auto key = state_key(
                 transition.value().label,
                 lattice.value(),

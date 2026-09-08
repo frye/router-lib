@@ -53,6 +53,14 @@ public:
 
     /// Optimizes a route without intermediate progress delivery.
     [[nodiscard]] Result<RouteResult> optimize(const RouteRequest& request) const;
+    /// Replays a fixed waypoint path with the same physics, without searching
+    /// for alternative courses. Waypoints exclude the departure position.
+    [[nodiscard]] Result<RouteResult> evaluate_route(
+        const RouteRequest& request, std::span<const Coordinate> waypoints) const;
+    /// Replays a timed heading policy without replacing it by fixed-waypoint
+    /// steering or independently optimizing any action.
+    [[nodiscard]] Result<RouteResult> evaluate_actions(
+        const RouteRequest& request, std::span<const SailingAction> actions) const;
     /// Optimizes a route with owning, notification-only progress snapshots.
     [[nodiscard]] Result<RouteResult> optimize(
         const RouteRequest& request,

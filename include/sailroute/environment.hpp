@@ -284,9 +284,8 @@ struct LandmaskMetadata {
     double resolution_nautical_miles{};
     /// Upper bound on the error of an interpolated distance, nautical miles.
     ///
-    /// Segment certification adds this to the configured clearance, so a mask
-    /// that under-reports its own error can never round a decision toward
-    /// accepting land.
+    /// Segment certification adds this to the configured clearance. This must
+    /// be a genuine upper bound: under-reporting error invalidates the proof.
     double interpolation_error_nautical_miles{};
 };
 

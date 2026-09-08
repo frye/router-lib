@@ -62,6 +62,10 @@ Result<std::string> validate_environment_numbers(const RoutePoint& point) {
         return invalid_numeric_value("course_over_ground_degrees");
     }
     if (environment.current_applied) {
+        if (!std::isfinite(environment.polar_wind_speed_knots) ||
+            !std::isfinite(environment.polar_wind_direction_degrees)) {
+            return invalid_numeric_value("polar_wind");
+        }
         if (!std::isfinite(environment.current_east_knots)) {
             return invalid_numeric_value("current_east_knots");
         }
@@ -165,6 +169,19 @@ Result<std::string> validate_route_numbers(const RouteResult& route) {
             return invalid_numeric_value("land_clearance_nautical_miles");
         }
     }
+    if (route.run) {
+        const auto& run = *route.run;
+        if (!is_valid(run.requested_destination) ||
+            !std::isfinite(run.arrival_radius_nautical_miles) ||
+            !std::isfinite(run.remaining_distance_nautical_miles) ||
+            !std::isfinite(run.boat_speed_factor) ||
+            !std::isfinite(run.heading_step_degrees) ||
+            !std::isfinite(run.spatial_bucket_nautical_miles) ||
+            (run.maximum_forecast_wind_speed_knots &&
+             !std::isfinite(*run.maximum_forecast_wind_speed_knots))) {
+            return invalid_numeric_value("routing metadata");
+        }
+    }
     return std::string{};
 }
 
@@ -178,13 +195,11 @@ Result<std::string> route_to_json(const RouteResult& route) {
 
     std::string output;
     output.reserve(512 + route.points.size() * 320);
-    output.append("{\n  \"completion\":");
+    output.append("{\n  \"schema\":\"route_result_v2\",\n  \"completion\":");
     serialization_detail::append_json_string(
         output,
-        to_string(
-            serialization_detail::legacy_serialized_completion(
-                route.completion)));
-    if (serialization_detail::needs_legacy_partial_reason(route.completion)) {
+        to_string(route.completion));
+    if (route.completion != RouteCompletion::destination_reached) {
         output.append(",\n  \"partial_reason\":");
         serialization_detail::append_json_string(
             output, to_string(route.completion));
@@ -221,7 +236,64 @@ Result<std::string> route_to_json(const RouteResult& route) {
     output.append(std::to_string(route.diagnostics.retained_candidates));
     output.append(",\"timeSteps\":");
     output.append(std::to_string(route.diagnostics.time_steps));
+    output.append(",\"eligibilityEvaluations\":");
+    output.append(std::to_string(route.diagnostics.eligibility_evaluations));
+    output.append(",\"prunedCandidates\":");
+    output.append(std::to_string(route.diagnostics.pruned_candidates));
+    output.append(",\"futureProbeMisses\":");
+    output.append(std::to_string(route.diagnostics.future_probe_misses));
     output.push_back('}');
+    if (route.run) {
+        const auto& run = *route.run;
+        output.append(",\n  \"routing\":{\"objective\":\"earliest_arrival\",\"qualityClaim\":\"best_found\",\"solver\":");
+        serialization_detail::append_json_string(output, to_string(run.solver));
+        output.append(",\"requestedDestination\":");
+        append_coordinate(output, run.requested_destination);
+        output.append(",\"arrivalRadiusNm\":");
+        serialization_detail::append_number(output, run.arrival_radius_nautical_miles);
+        output.append(",\"remainingDistanceNm\":");
+        serialization_detail::append_number(output, run.remaining_distance_nautical_miles);
+        output.append(",\"boatSpeedFactor\":");
+        serialization_detail::append_number(output, run.boat_speed_factor);
+        output.append(",\"headingStepDegrees\":");
+        serialization_detail::append_number(output, run.heading_step_degrees);
+        output.append(",\"spatialBucketNm\":");
+        serialization_detail::append_number(output, run.spatial_bucket_nautical_miles);
+        output.append(",\"maximumIntegrationMinutes\":");
+        output.append(std::to_string(run.maximum_integration_step.count()));
+        output.append(",\"strategicRetention\":");
+        output.append(run.strategic_retention ? "true" : "false");
+        output.append(",\"landAvoidance\":");
+        output.append(run.land_avoidance ? "true" : "false");
+        output.append(",\"windSampling\":");
+        serialization_detail::append_json_string(output,
+            run.wind_sampling == WindSampling::midpoint ? "midpoint" : "segment_start");
+        output.append(",\"abovePolarRange\":");
+        serialization_detail::append_json_string(output,
+            run.above_polar_range == AbovePolarRangePolicy::no_speed ? "no_speed" : "clamp");
+        output.append(",\"maximumForecastWindKnots\":");
+        if (run.maximum_forecast_wind_speed_knots) {
+            serialization_detail::append_number(output, *run.maximum_forecast_wind_speed_knots);
+        } else {
+            output.append("null");
+        }
+        output.append(",\"tackPenaltySeconds\":");
+        output.append(std::to_string(run.maneuver.tack_penalty.count()));
+        output.append(",\"gybePenaltySeconds\":");
+        output.append(std::to_string(run.maneuver.gybe_penalty.count()));
+        output.append(",\"forecastInitialization\":");
+        serialization_detail::append_json_string(output, format_utc_time(run.forecast_initialization));
+        output.append(",\"forecastFirstValid\":");
+        serialization_detail::append_json_string(output, format_utc_time(run.forecast_first_valid));
+        output.append(",\"forecastLastValid\":");
+        serialization_detail::append_json_string(output, format_utc_time(run.forecast_last_valid));
+        output.append(",\"warnings\":[");
+        for (std::size_t index = 0; index < run.warnings.size(); ++index) {
+            if (index != 0U) output.push_back(',');
+            serialization_detail::append_json_string(output, run.warnings[index]);
+        }
+        output.append("]}");
+    }
     if (route.lattice_diagnostics.has_value()) {
         const LatticeRouteDiagnostics& lattice = *route.lattice_diagnostics;
         output.append(",\n  \"latticeDiagnostics\":{\"settledLabels\":");
@@ -363,6 +435,10 @@ Result<std::string> route_to_json(const RouteResult& route) {
             serialization_detail::append_number(
                 output, environment.course_over_ground_degrees);
             if (environment.current_applied) {
+                output.append(",\"polarWindSpeedKnots\":");
+                serialization_detail::append_number(output, environment.polar_wind_speed_knots);
+                output.append(",\"polarWindDirectionDegrees\":");
+                serialization_detail::append_number(output, environment.polar_wind_direction_degrees);
                 output.append(",\"currentEastKnots\":");
                 serialization_detail::append_number(
                     output, environment.current_east_knots);

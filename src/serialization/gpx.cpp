@@ -54,6 +54,10 @@ Result<std::string> validate_route_numbers(const RouteResult& route) {
                 return invalid_numeric_value("course_over_ground_degrees");
             }
             if (environment.current_applied) {
+                if (!std::isfinite(environment.polar_wind_speed_knots) ||
+                    !std::isfinite(environment.polar_wind_direction_degrees)) {
+                    return invalid_numeric_value("polar_wind");
+                }
                 if (!std::isfinite(environment.current_east_knots)) {
                     return invalid_numeric_value("current_east_knots");
                 }
@@ -92,6 +96,19 @@ Result<std::string> validate_route_numbers(const RouteResult& route) {
         }
         if (!std::isfinite(environment.land_clearance_nautical_miles)) {
             return invalid_numeric_value("land_clearance_nautical_miles");
+        }
+    }
+    if (route.run) {
+        const auto& run = *route.run;
+        if (!is_valid(run.requested_destination) ||
+            !std::isfinite(run.arrival_radius_nautical_miles) ||
+            !std::isfinite(run.remaining_distance_nautical_miles) ||
+            !std::isfinite(run.boat_speed_factor) ||
+            !std::isfinite(run.heading_step_degrees) ||
+            !std::isfinite(run.spatial_bucket_nautical_miles) ||
+            (run.maximum_forecast_wind_speed_knots &&
+             !std::isfinite(*run.maximum_forecast_wind_speed_knots))) {
+            return invalid_numeric_value("routing metadata");
         }
     }
     return std::string{};
@@ -181,16 +198,30 @@ Result<std::string> route_to_gpx(const RouteResult& route) {
     append_element(
         output,
         "sailroute:completion",
-        to_string(
-            serialization_detail::legacy_serialized_completion(
-                route.completion)),
+        to_string(route.completion),
         "      ");
-    if (serialization_detail::needs_legacy_partial_reason(route.completion)) {
+    if (route.completion != RouteCompletion::destination_reached) {
         append_element(
             output,
             "sailroute:partialReason",
             to_string(route.completion),
             "      ");
+    }
+    append_element(output, "sailroute:schema", "route_result_v2", "      ");
+    if (route.run) {
+        append_element(output, "sailroute:objective", "earliest_arrival", "      ");
+        append_element(output, "sailroute:qualityClaim", "best_found", "      ");
+        append_number_element(output, "sailroute:boatSpeedFactor", route.run->boat_speed_factor, "      ");
+        append_number_element(output, "sailroute:remainingDistanceNm", route.run->remaining_distance_nautical_miles, "      ");
+        append_element(output, "sailroute:windSampling",
+            route.run->wind_sampling == WindSampling::midpoint ? "midpoint" : "segment_start", "      ");
+        if (route.run->maximum_forecast_wind_speed_knots) {
+            append_number_element(output, "sailroute:maximumForecastWindKnots",
+                *route.run->maximum_forecast_wind_speed_knots, "      ");
+        }
+        for (const auto& warning : route.run->warnings) {
+            append_element(output, "sailroute:warning", warning, "      ");
+        }
     }
     if (route.environment.has_value()) {
         const RouteEnvironmentMetadata& environment = *route.environment;
@@ -374,6 +405,12 @@ Result<std::string> route_to_gpx(const RouteResult& route) {
                     "sailroute:currentNorthKnots",
                     environment.current_north_knots,
                     "          ");
+            }
+            if (environment.current_applied) {
+                append_number_element(output, "sailroute:polarWindSpeedKnots",
+                    environment.polar_wind_speed_knots, "          ");
+                append_number_element(output, "sailroute:polarWindDirectionDegrees",
+                    environment.polar_wind_direction_degrees, "          ");
             }
             append_number_element(
                 output,

@@ -58,9 +58,46 @@ EnsembleMemberOutcomeClass classify_member_transition_error(
         case ErrorCode::invalid_argument:
         case ErrorCode::invalid_polar:
         case ErrorCode::output_error:
+        case ErrorCode::resource_limit:
             return EnsembleMemberOutcomeClass::other_error;
     }
     return EnsembleMemberOutcomeClass::other_error;
+}
+
+Result<RoutePoint> evaluate_ensemble_initial_point(
+    const WeatherDataset& weather, const RoutingOptions& options,
+    const RoutingEnvironment& environment, EnvironmentDiagnostics& diagnostics,
+    Coordinate position, TimePoint time) {
+    const auto geometry = check_segment_geometry(
+        environment, position, time, position, time, diagnostics);
+    if (geometry.outcome == EnvironmentOutcome::failed) {
+        return *geometry.error;
+    }
+    if (geometry.outcome == EnvironmentOutcome::rejected) {
+        return Error{ErrorCode::no_route,
+                     "ensemble departure violates a hard geometry constraint"};
+    }
+    auto wind = weather.interpolate(position, time);
+    if (!wind) return wind.error();
+    auto evaluated = evaluate_wind(wind.value(), options);
+    if (!evaluated) return evaluated.error();
+    if (!evaluated.value()) {
+        return Error{ErrorCode::no_route,
+                     "ensemble departure violates the configured wind limit"};
+    }
+    const auto fields = sample_environment(
+        environment, position, time, diagnostics);
+    if (fields.outcome == EnvironmentOutcome::failed) return *fields.error;
+    if (fields.outcome == EnvironmentOutcome::rejected) {
+        return Error{ErrorCode::environment_data_unavailable,
+                     "ensemble departure environment is unavailable"};
+    }
+    RoutePoint point;
+    point.position = position;
+    point.time = time;
+    point.true_wind_speed_knots = evaluated.value()->speed_knots;
+    point.true_wind_direction_degrees = evaluated.value()->direction_from_degrees;
+    return point;
 }
 
 Result<EnsembleTransitionEvaluation> evaluate_common_target_transition(
@@ -124,6 +161,10 @@ Result<EnsembleTransitionEvaluation> evaluate_common_transition(
     }
 
     EnsembleTransitionEvaluation result;
+    result.common_action_legal =
+        canonical_action.value().kind !=
+            EnsembleCommonActionKind::wait_for_duration ||
+        static_cast<bool>(options.holding_eligibility);
     result.label = parent;
     result.label.parent_label = parent_label;
     result.label.incoming_action = canonical_action.value();
@@ -133,6 +174,7 @@ Result<EnsembleTransitionEvaluation> evaluate_common_transition(
 
     for (std::size_t index = 0U; index < dataset.member_count(); ++index) {
         EnsembleMemberSearchState& state = result.label.members[index];
+        state.intermediate_points.clear();
         const std::string& identifier = dataset.members()[index].identifier;
         if (state.member_identifier != identifier) {
             return invalid_transition(
@@ -177,45 +219,6 @@ Result<EnsembleTransitionEvaluation> evaluate_common_transition(
             continue;
         }
 
-        if (canonical_action.value().kind ==
-            EnsembleCommonActionKind::wait_for_duration) {
-            const TimePoint arrival =
-                state.point.time + canonical_action.value().duration;
-            const SegmentCheckResult waiting = check_segment_geometry(
-                *environment,
-                state.point.position,
-                state.point.time,
-                state.point.position,
-                arrival,
-                evaluation.environment_diagnostics);
-            if (waiting.outcome == EnvironmentOutcome::failed) {
-                evaluation.status = EnsembleMemberTransitionStatus::error;
-                fail_member(
-                    state,
-                    evaluation,
-                    classify_member_transition_error(*waiting.error),
-                    waiting.error);
-            } else if (waiting.outcome == EnvironmentOutcome::rejected) {
-                evaluation.status = EnsembleMemberTransitionStatus::infeasible;
-                fail_member(
-                    state,
-                    evaluation,
-                    EnsembleMemberOutcomeClass::infeasible_no_route,
-                    std::nullopt);
-            } else {
-                state.point.time = arrival;
-                state.point.boat_speed_knots = 0.0;
-                state.point.environment.reset();
-                state.error.reset();
-                evaluation.status = EnsembleMemberTransitionStatus::legal;
-            }
-            merge(
-                result.diagnostics.merged_environment,
-                evaluation.environment_diagnostics);
-            result.diagnostics.members.push_back(std::move(evaluation));
-            continue;
-        }
-
         VariableTransitionRejection rejection{
             VariableTransitionRejection::infeasible};
         Result<std::optional<VariableTransition>> transition =
@@ -231,6 +234,17 @@ Result<EnsembleTransitionEvaluation> evaluate_common_transition(
                   canonical_action.value().target,
                   parameters.route_end,
                   &rejection)
+            : canonical_action.value().kind ==
+                    EnsembleCommonActionKind::wait_for_duration
+            ? evaluate_wait_transition(
+                  *weather,
+                  polar,
+                  options,
+                  *environment,
+                  evaluation.environment_diagnostics,
+                  state.point,
+                  state.configuration,
+                  state.point.time + canonical_action.value().duration)
             : evaluate_heading_transition(
                   *weather,
                   polar,
@@ -288,13 +302,15 @@ Result<EnsembleTransitionEvaluation> evaluate_common_transition(
                 outcome_class,
                 std::nullopt);
         } else {
+            state.intermediate_points =
+                std::move(transition.value()->intermediate_points);
             state.point = std::move(transition.value()->point);
             state.configuration = transition.value()->configuration;
             state.error.reset();
             if (great_circle_distance_nautical_miles(
                     state.point.position,
                     parameters.route_destination) <=
-                options.arrival_radius_nautical_miles) {
+                options.arrival_radius_nautical_miles + 1.0e-6) {
                 state.status = EnsembleMemberSearchStatus::completed;
                 state.outcome_class = EnsembleMemberOutcomeClass::reached;
                 evaluation.status = EnsembleMemberTransitionStatus::reached;
@@ -308,6 +324,14 @@ Result<EnsembleTransitionEvaluation> evaluate_common_transition(
         result.diagnostics.members.push_back(std::move(evaluation));
     }
 
+    for (std::size_t index = 0U; index < dataset.member_count(); ++index) {
+        if (dataset.members()[index].original_weight > 0.0 &&
+            result.label.members[index].outcome_class ==
+                EnsembleMemberOutcomeClass::infeasible_no_route) {
+            result.common_action_legal = false;
+        }
+    }
+    finalize_diagnostic_members(dataset, result.label);
     canonicalize_ensemble_label(result.label);
     const bool resolved = std::none_of(
         result.label.members.begin(),
@@ -315,7 +339,8 @@ Result<EnsembleTransitionEvaluation> evaluate_common_transition(
         [](const EnsembleMemberSearchState& member) {
             return member.status == EnsembleMemberSearchStatus::active;
         });
-    if (resolved && parameters.objective != nullptr) {
+    if (resolved && result.common_action_legal &&
+        parameters.objective != nullptr) {
         auto objective = evaluate_ensemble_label_objective(
             dataset,
             *parameters.objective,

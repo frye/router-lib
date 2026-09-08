@@ -1,7 +1,7 @@
 #include "ensemble_benchmark.hpp"
 
 #include "sailroute/ensemble.hpp"
-#include "sailroute/serialization.hpp"
+#include "sailroute/ensemble_serialization.hpp"
 
 #include <algorithm>
 #include <array>

@@ -1,4 +1,5 @@
 #include "sailroute/weather.hpp"
+#include "sailroute/time.hpp"
 
 #include <eccodes.h>
 
@@ -253,10 +254,6 @@ using HandlePtr = std::unique_ptr<codes_handle, HandleDeleter>;
         return WindComponent::north;
     }
 
-    if (!has_short_name || (short_name != "u" && short_name != "v")) {
-        return std::nullopt;
-    }
-
     std::string level_type;
     long level = 0;
     if (!optional_string(handle, "typeOfLevel", level_type) ||
@@ -264,7 +261,22 @@ using HandlePtr = std::unique_ptr<codes_handle, HandleDeleter>;
         level_type != "heightAboveGround" || level != 10) {
         return std::nullopt;
     }
-    return short_name == "u" ? WindComponent::east : WindComponent::north;
+    if (has_short_name && (short_name == "u" || short_name == "v")) {
+        return short_name == "u" ? WindComponent::east : WindComponent::north;
+    }
+
+    // Statistical GRIB2 products can have names such as avg_10u. Recognize
+    // their WMO U/V identity so semantic validation rejects rather than skips them.
+    long discipline = 0;
+    long category = 0;
+    long parameter = 0;
+    if (optional_long(handle, "discipline", discipline) && discipline == 0 &&
+        optional_long(handle, "parameterCategory", category) && category == 2 &&
+        optional_long(handle, "parameterNumber", parameter) &&
+        (parameter == 2 || parameter == 3)) {
+        return parameter == 2 ? WindComponent::east : WindComponent::north;
+    }
+    return std::nullopt;
 }
 
 [[nodiscard]] Result<bool> validate_wind_level(codes_handle* handle) {
@@ -280,6 +292,29 @@ using HandlePtr = std::unique_ptr<codes_handle, HandleDeleter>;
         return Error{
             ErrorCode::unsupported_grib,
             "10 m wind message does not use typeOfLevel=heightAboveGround and level=10"};
+    }
+    return true;
+}
+
+[[nodiscard]] Result<bool> validate_wind_semantics(codes_handle* handle) {
+    auto step_type = required_string(handle, "stepType");
+    if (!step_type) {
+        return step_type.error();
+    }
+    if (step_type.value() != "instant") {
+        return Error{
+            ErrorCode::unsupported_grib,
+            "unsupported 10 m wind stepType '" + step_type.value() +
+                "'; only instantaneous U/V wind is supported"};
+    }
+
+    long grid_relative = 0;
+    if (optional_long(handle, "uvRelativeToGrid", grid_relative) &&
+        grid_relative != 0) {
+        return Error{
+            ErrorCode::unsupported_grib,
+            "unsupported grid-relative 10 m U/V wind; earth-relative components "
+            "(uvRelativeToGrid=0) are required"};
     }
     return true;
 }
@@ -1258,20 +1293,27 @@ WeatherDataset::WeatherDataset(std::shared_ptr<const Impl> impl)
     : impl_(std::move(impl)) {}
 
 Result<WeatherDataset> WeatherDataset::load(const std::filesystem::path& path) {
-    return load_impl(path, std::nullopt);
+    return load(path, WeatherLoadOptions{});
 }
 
 Result<WeatherDataset> WeatherDataset::load(
     const std::filesystem::path& path,
     GeographicBounds bounds) {
-    return load_impl(path, bounds);
+    return load(path, WeatherLoadOptions{bounds, std::nullopt});
 }
 
-Result<WeatherDataset> WeatherDataset::load_impl(
+Result<WeatherDataset> WeatherDataset::load(
     const std::filesystem::path& path,
-    std::optional<GeographicBounds> bounds) {
+    WeatherLoadOptions options) {
+    const auto& bounds = options.bounds;
     if (path.empty()) {
         return Error{ErrorCode::invalid_argument, "GRIB path must not be empty"};
+    }
+    if (options.maximum_interpolation_gap &&
+        *options.maximum_interpolation_gap <= std::chrono::seconds::zero()) {
+        return Error{
+            ErrorCode::invalid_argument,
+            "maximum weather interpolation gap must be positive"};
     }
     if (bounds) {
         if (const auto error = validate_bounds(*bounds)) {
@@ -1338,6 +1380,10 @@ Result<WeatherDataset> WeatherDataset::load_impl(
         if (!level_result) {
             return level_result.error();
         }
+        auto semantics_result = validate_wind_semantics(handle.get());
+        if (!semantics_result) {
+            return semantics_result.error();
+        }
         auto time_result = valid_time(handle.get());
         if (!time_result) {
             return time_result.error();
@@ -1380,6 +1426,28 @@ Result<WeatherDataset> WeatherDataset::load_impl(
         return Error{
             ErrorCode::incomplete_forecast,
             "forecast contains no supported 10 m U/V wind messages"};
+    }
+
+    std::optional<std::chrono::seconds> minimum_spacing;
+    std::optional<std::chrono::seconds> maximum_spacing;
+    for (auto current = std::next(pending.begin()); current != pending.end();
+         ++current) {
+        const auto previous = std::prev(current);
+        const auto spacing = std::chrono::duration_cast<std::chrono::seconds>(
+            current->first - previous->first);
+        minimum_spacing = minimum_spacing ? std::min(*minimum_spacing, spacing) : spacing;
+        maximum_spacing = maximum_spacing ? std::max(*maximum_spacing, spacing) : spacing;
+        if (options.maximum_interpolation_gap &&
+            spacing > *options.maximum_interpolation_gap) {
+            return Error{
+                ErrorCode::incomplete_forecast,
+                "forecast interpolation gap of " + std::to_string(spacing.count()) +
+                    " seconds between " + format_utc_time(previous->first) +
+                    " and " + format_utc_time(current->first) +
+                    " exceeds configured maximum of " +
+                    std::to_string(options.maximum_interpolation_gap->count()) +
+                    " seconds"};
+        }
     }
 
     // Mosaic every valid time's tiles into a single U and V field, then apply
@@ -1472,6 +1540,23 @@ Result<WeatherDataset> WeatherDataset::load_impl(
             std::make_move_iterator(slice.north.values.end()));
     }
 
+    const auto signed_longitude = [](double longitude) {
+        const double normalized = normalize_longitude(longitude);
+        return normalized > 180.0 ? normalized - kLongitudePeriod : normalized;
+    };
+    const GeographicBounds coverage = bounds.value_or(GeographicBounds{
+        grid.south_latitude_degrees,
+        grid.global_longitude_coverage
+            ? -180.0
+            : signed_longitude(grid.west_longitude_degrees),
+        grid.south_latitude_degrees +
+            grid.latitude_step_degrees * static_cast<double>(grid.latitude_count - 1U),
+        grid.global_longitude_coverage
+            ? 180.0
+            : signed_longitude(
+                  grid.west_longitude_degrees +
+                  grid.longitude_step_degrees *
+                      static_cast<double>(grid.longitude_count - 1U))});
     impl->metadata = ForecastMetadata{
         impl->times.front(),
         impl->times.back(),
@@ -1479,7 +1564,10 @@ Result<WeatherDataset> WeatherDataset::load_impl(
         grid.longitude_count,
         grid.global_longitude_coverage,
         display_path,
-        *common_initialization_time};
+        *common_initialization_time,
+        coverage,
+        minimum_spacing,
+        maximum_spacing};
     impl->grid_identity = ForecastGridIdentity{
         grid.latitude_count,
         grid.longitude_count,

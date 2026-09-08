@@ -35,6 +35,7 @@ struct Label {
     LabelIndex parent{no_label};
     std::size_t ordinal{};
     bool goal{};
+    std::vector<RoutePoint> intermediate_points;
 };
 
 SolverLabelIdentity label_identity(const Label& label) noexcept {
@@ -87,6 +88,8 @@ std::vector<RoutePoint> reconstruct(
     std::vector<RoutePoint> route;
     while (end != no_label) {
         route.push_back(labels[end].point);
+        route.insert(route.end(), labels[end].intermediate_points.rbegin(),
+                     labels[end].intermediate_points.rend());
         end = labels[end].parent;
     }
     std::reverse(route.begin(), route.end());
@@ -97,23 +100,23 @@ double heuristic_seconds(
     Coordinate position,
     Coordinate destination,
     double maximum_speed,
-    LatticeSearchAlgorithm algorithm) noexcept {
+    LatticeSearchAlgorithm algorithm,
+    double radius) noexcept {
     if (algorithm == LatticeSearchAlgorithm::dijkstra ||
         !(maximum_speed > 0.0)) {
         return 0.0;
     }
-    return great_circle_distance_nautical_miles(position, destination) /
+    return std::max(0.0, great_circle_distance_nautical_miles(position, destination) - radius) /
         maximum_speed * 3600.0;
 }
 
 std::int64_t bucket_for(
     TimePoint time,
     TimePoint departure,
-    std::chrono::seconds width) noexcept {
+    std::chrono::seconds) noexcept {
     return std::chrono::duration_cast<std::chrono::seconds>(
                time - departure)
-               .count() /
-        width.count();
+               .count();
 }
 
 SphericalPositionKey position_key(
@@ -151,7 +154,10 @@ Result<SearchOutcome> search_lattice(
     const bool forecast_limited = metadata.last_valid_time < horizon_end;
     const auto bucket_width = std::chrono::duration_cast<std::chrono::seconds>(
         request.options.lattice.time_bucket);
-    const double maximum_speed = polar.maximum_boat_speed_knots();
+    const double maximum_speed =
+        polar.maximum_boat_speed_knots() * request.options.boat_speed_factor;
+    const auto search_algorithm = environment.currents.configured()
+        ? LatticeSearchAlgorithm::dijkstra : request.options.lattice.search_algorithm;
     if (!(maximum_speed > 0.0)) {
         return Error{ErrorCode::invalid_polar, "polar contains no positive boat speed"};
     }
@@ -230,7 +236,7 @@ Result<SearchOutcome> search_lattice(
             0.0,
             std::nullopt},
         no_label,
-        0U});
+        0U, false, {}});
     std::map<SolverStateKey, LabelIndex> best{{labels.front().state, 0U}};
     std::map<ContinuationStateKey, TimePoint> earliest_arrival{
         {ContinuationStateKey{
@@ -248,7 +254,7 @@ Result<SearchOutcome> search_lattice(
             request.start,
             request.destination,
             maximum_speed,
-            request.options.lattice.search_algorithm),
+            search_algorithm, request.options.arrival_radius_nautical_miles),
         departure,
         labels.front().state,
         0U,
@@ -297,7 +303,7 @@ Result<SearchOutcome> search_lattice(
                     labels.back().point.position,
                     request.destination,
                     maximum_speed,
-                    request.options.lattice.search_algorithm),
+                    search_algorithm, request.options.arrival_radius_nautical_miles),
             labels.back().point.time,
             labels.back().state,
             labels.back().ordinal,
@@ -309,6 +315,10 @@ Result<SearchOutcome> search_lattice(
     };
 
     while (!queue.empty()) {
+        if (labels.size() >= request.options.maximum_retained_nodes ||
+            route_diagnostics.generated_candidates >= request.options.maximum_generated_candidates) {
+            return Error{ErrorCode::resource_limit, "lattice search work limit reached"};
+        }
         const QueueEntry entry = queue.top();
         queue.pop();
         const auto current_best = best.find(entry.state);
@@ -322,7 +332,9 @@ Result<SearchOutcome> search_lattice(
         ++diagnostics.settled_labels;
         ++route_diagnostics.expanded_nodes;
 
-        if (current.goal) {
+        if (current.goal ||
+            great_circle_distance_nautical_miles(current.point.position, request.destination) <=
+                request.options.arrival_radius_nautical_miles + 1.0e-6) {
             RouteResult result;
             result.departure_time = departure;
             result.arrival_time = current.point.time;
@@ -366,6 +378,12 @@ Result<SearchOutcome> search_lattice(
             entry.label == 0U && direct_anchor_edge;
         if (destination_connector || same_face_anchor_edge) {
             ++route_diagnostics.generated_candidates;
+            const double remaining = great_circle_distance_nautical_miles(
+                current.point.position, request.destination);
+            const Coordinate target = destination_point(
+                current.point.position,
+                initial_bearing_degrees(current.point.position, request.destination),
+                std::max(0.0, remaining - request.options.arrival_radius_nautical_miles));
             auto arrival_result = evaluate_variable_transition(
                 weather,
                 polar,
@@ -374,7 +392,7 @@ Result<SearchOutcome> search_lattice(
                 environment_diagnostics,
                 current.point,
                 current.state.configuration,
-                request.destination,
+                target,
                 route_end);
             if (!arrival_result) {
                 return arrival_result.error();
@@ -394,7 +412,8 @@ Result<SearchOutcome> search_lattice(
                     std::move(arrival.point),
                     entry.label,
                     next_ordinal++,
-                    true});
+                    true,
+                    std::move(arrival.intermediate_points)});
             }
         }
 
@@ -443,11 +462,11 @@ Result<SearchOutcome> search_lattice(
                         transition.point.position, position_bucket_width)},
                 std::move(transition.point),
                 entry.label,
-                next_ordinal++});
+                next_ordinal++, false, std::move(transition.intermediate_points)});
         }
 
         const std::int64_t next_bucket =
-            current.state.time_bucket + 1;
+            (current.point.time - departure) / bucket_width + 1;
         const TimePoint wait_until =
             departure + bucket_width * next_bucket;
         if (wait_until > current.point.time && wait_until <= route_end) {
@@ -469,13 +488,22 @@ Result<SearchOutcome> search_lattice(
                     return evaluated_wind.error();
                 }
                 if (evaluated_wind.value().has_value()) {
-                    const double wind_speed =
-                        evaluated_wind.value()->speed_knots;
-                    const double wind_from =
-                        evaluated_wind.value()->direction_from_degrees;
-                    const PolarSlice slice = polar.slice_at(
-                        wind_speed,
-                        request.options.polar_angle_interpolation);
+                    Wind proposal_wind = wind_result.value();
+                    bool available = true;
+                    if (environment.currents.configured()) {
+                        const auto fields = sample_environment(
+                            environment, current.point.position, current.point.time,
+                            environment_diagnostics);
+                        if (fields.outcome == EnvironmentOutcome::failed) return *fields.error;
+                        available = fields.outcome == EnvironmentOutcome::accepted;
+                        if (available) {
+                            proposal_wind = water_relative_wind(proposal_wind, fields.samples.current);
+                        }
+                    }
+                    const double wind_speed = proposal_wind.speed_knots();
+                    const double wind_from = proposal_wind.direction_from_degrees();
+                    const PolarSlice slice = available ? polar.slice_at(
+                        wind_speed, request.options.polar_angle_interpolation) : PolarSlice{};
                     if (!(request.options.above_polar_range ==
                               AbovePolarRangePolicy::no_speed &&
                           slice.above_tabulated_wind_speed())) {
@@ -517,51 +545,36 @@ Result<SearchOutcome> search_lattice(
                                 push_label(Label{
                                     SolverStateKey{
                                         *target,
-                                        next_bucket,
+                                        bucket_for(transition.point.time, departure, bucket_width),
                                         transition.configuration,
                                         position_key(
                                             transition.point.position,
                                             position_bucket_width)},
                                     std::move(transition.point),
                                     entry.label,
-                                    next_ordinal++});
+                                    next_ordinal++, false, std::move(transition.intermediate_points)});
                             }
                         }
                     }
                 }
             }
 
-            // Waiting still has to be legal: an exclusion zone can open around
-            // a stationary vessel, so the degenerate segment is checked too.
-            bool waiting_allowed = true;
-            if (environment.active()) {
-                const SegmentCheckResult waiting = check_segment_geometry(
-                    environment,
-                    current.point.position,
-                    current.point.time,
-                    current.point.position,
-                    wait_until,
-                    environment_diagnostics);
-                if (waiting.outcome == EnvironmentOutcome::failed) {
-                    return *waiting.error;
-                }
-                waiting_allowed =
-                    waiting.outcome == EnvironmentOutcome::accepted;
+            auto waited = evaluate_wait_transition(
+                weather, polar, request.options, environment, environment_diagnostics,
+                current.point, current.state.configuration, wait_until);
+            if (!waited) {
+                return waited.error();
             }
-            RoutePoint waited = current.point;
-            waited.time = wait_until;
-            waited.boat_speed_knots = 0.0;
-            waited.environment.reset();
-            if (waiting_allowed) {
+            if (waited.value()) {
                 push_label(Label{
                     SolverStateKey{
                         current.state.spatial,
-                        next_bucket,
+                        bucket_for(wait_until, departure, bucket_width),
                         current.state.configuration,
                         current.state.position},
-                    std::move(waited),
+                    std::move(waited.value()->point),
                     entry.label,
-                    next_ordinal++});
+                    next_ordinal++, false, {}});
                 ++diagnostics.wait_transitions;
             }
         }

@@ -677,5 +677,14 @@ int compare_ensemble_objective_evaluations(
         right.diagnostics.canonical_action_sequence_identity);
 }
 
+EnsembleObjective canonical_objective_specification(EnsembleObjective objective) {
+    std::sort(
+        objective.rival_outcomes.begin(), objective.rival_outcomes.end(),
+        [](const auto& left, const auto& right) {
+            return left.member_identifier < right.member_identifier;
+        });
+    return objective;
+}
+
 }  // namespace detail
 }  // namespace sailroute

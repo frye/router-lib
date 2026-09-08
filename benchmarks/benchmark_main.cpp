@@ -2,8 +2,11 @@
 #include "sailroute/router.hpp"
 #include "sailroute/time.hpp"
 
+#ifdef SAILROUTE_ENABLE_ENSEMBLE
 #include "ensemble_benchmark.hpp"
+#endif
 #include "lattice_comparison.hpp"
+#include "strategic_benchmark.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -467,6 +470,10 @@ void report_sea_state_matrix(
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string_view{argv[1]} == "--strategic") {
+        sailroute::benchmarks::report_strategic_benchmark(std::cout);
+        return 0;
+    }
     std::cout << "benchmark metadata\n"
               << "  source revision: " << SAILROUTE_SOURCE_REVISION << '\n'
               << "  compatibility baseline: " << SAILROUTE_BASELINE_REVISION
@@ -493,7 +500,10 @@ int main(int argc, char** argv) {
     std::cout << "polar lookups: " << iterations / seconds << "/s\n";
     std::cout << "checksum: " << checksum << '\n';
 
-    sailroute::benchmarks::report_lattice_comparison();
+    if (argc > 1 && std::string_view{argv[1]} == "--topology") {
+        sailroute::benchmarks::report_lattice_comparison();
+        return 0;
+    }
 
     if (argc < 2) {
         std::cout << "routing benchmarks skipped; pass a GRIB forecast path\n";
@@ -816,7 +826,11 @@ int main(int argc, char** argv) {
         peak_watermark);
 
     report_sea_state_matrix(weather.value(), polar, request, baseline_hours);
-    sailroute::benchmarks::report_ensemble_scaling(
-        std::filesystem::path{argv[1]}, polar, request);
+#ifdef SAILROUTE_ENABLE_ENSEMBLE
+    if (argc > 2 && std::string_view{argv[2]} == "--ensemble") {
+        sailroute::benchmarks::report_ensemble_scaling(
+            std::filesystem::path{argv[1]}, polar, request);
+    }
+#endif
     return 0;
 }

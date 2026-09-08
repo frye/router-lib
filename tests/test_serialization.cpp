@@ -202,7 +202,7 @@ TEST_CASE("route serialization identifies forecast-exhausted partial results") {
         json.value().find("\"completion\":\"forecast_exhausted\"") !=
         std::string::npos);
     REQUIRE(
-        json.value().find("\"partial_reason\"") ==
+        json.value().find("\"partial_reason\":\"forecast_exhausted\"") !=
         std::string::npos);
 
     const auto gpx = sailroute::route_to_gpx(route);
@@ -212,18 +212,18 @@ TEST_CASE("route serialization identifies forecast-exhausted partial results") {
             "<sailroute:completion>forecast_exhausted"
             "</sailroute:completion>") != std::string::npos);
     REQUIRE(
-        gpx.value().find("<sailroute:partialReason>") ==
+        gpx.value().find("<sailroute:partialReason>forecast_exhausted") !=
         std::string::npos);
 }
 
-TEST_CASE("duration exhaustion preserves legacy partial serialization") {
+TEST_CASE("duration exhaustion has a precise versioned completion") {
     auto route = sample_route();
     route.completion = sailroute::RouteCompletion::duration_exhausted;
 
     const auto json = sailroute::route_to_json(route);
     REQUIRE(json.has_value());
     REQUIRE(
-        json.value().find("\"completion\":\"forecast_exhausted\"") !=
+        json.value().find("\"completion\":\"duration_exhausted\"") !=
         std::string::npos);
     REQUIRE(
         json.value().find("\"partial_reason\":\"duration_exhausted\"") !=
@@ -233,8 +233,9 @@ TEST_CASE("duration exhaustion preserves legacy partial serialization") {
     REQUIRE(gpx.has_value());
     REQUIRE(
         gpx.value().find(
-            "<sailroute:completion>forecast_exhausted"
+            "<sailroute:completion>duration_exhausted"
             "</sailroute:completion>") != std::string::npos);
+    REQUIRE(json.value().find("\"schema\":\"route_result_v2\"") != std::string::npos);
     REQUIRE(
         gpx.value().find(
             "<sailroute:partialReason>duration_exhausted"

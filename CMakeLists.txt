@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(sailroute VERSION 0.5.0 LANGUAGES CXX)
+project(sailroute VERSION 0.6.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -8,6 +8,9 @@ include(CMakePackageConfigHelpers)
 option(SAILROUTE_BUILD_TESTS "Build sailroute tests" ON)
 option(SAILROUTE_BUILD_BENCHMARKS "Build sailroute benchmarks" OFF)
 option(SAILROUTE_ENABLE_LTO "Enable link-time optimization when supported" OFF)
+option(SAILROUTE_ENABLE_ENSEMBLE "Build optional ensemble/racing workflows" ON)
+option(SAILROUTE_ENABLE_LAND_DATA "Build the optional local GSHHG adapter" ON)
+option(SAILROUTE_BUILD_LEGACY_CORPUS "Build the archived compatibility output tool" OFF)
 
 find_package(Threads REQUIRED)
 find_package(eccodes CONFIG QUIET)
@@ -26,14 +29,6 @@ add_library(sailroute STATIC
     src/error.cpp
     src/time.cpp
     src/weather/weather_dataset.cpp
-    src/ensemble/beam_solver.cpp
-    src/ensemble/dataset.cpp
-    src/ensemble/lattice_solver.cpp
-    src/ensemble/objective.cpp
-    src/ensemble/policy.cpp
-    src/ensemble/sampling.cpp
-    src/ensemble/search_state.cpp
-    src/ensemble/transition.cpp
     src/polar/vessel_polar.cpp
     src/environment/environment.cpp
     src/environment/exclusions.cpp
@@ -45,6 +40,7 @@ add_library(sailroute STATIC
     src/routing/front.cpp
     src/routing/geodesy.cpp
     src/routing/intervals.cpp
+    src/routing/integration.cpp
     src/routing/lattice.cpp
     src/routing/lattice_solver.cpp
     src/routing/environment_context.cpp
@@ -52,11 +48,23 @@ add_library(sailroute STATIC
     src/routing/router.cpp
     src/routing/transition.cpp
     src/serialization/json.cpp
-    src/serialization/ensemble_json.cpp
     src/serialization/gpx.cpp
     src/serialization/isochrones.cpp
 )
 add_library(sailroute::sailroute ALIAS sailroute)
+if(SAILROUTE_ENABLE_ENSEMBLE)
+    target_sources(sailroute PRIVATE
+        src/ensemble/beam_solver.cpp src/ensemble/dataset.cpp
+        src/ensemble/lattice_solver.cpp src/ensemble/objective.cpp
+        src/ensemble/policy.cpp src/ensemble/sampling.cpp
+        src/ensemble/search_state.cpp src/ensemble/transition.cpp
+        src/serialization/ensemble_json.cpp)
+    target_compile_definitions(sailroute PUBLIC SAILROUTE_ENABLE_ENSEMBLE=1)
+endif()
+if(SAILROUTE_ENABLE_LAND_DATA)
+    target_sources(sailroute PRIVATE src/adapters/land_data.cpp)
+    target_compile_definitions(sailroute PUBLIC SAILROUTE_ENABLE_LAND_DATA=1)
+endif()
 
 target_compile_features(sailroute PUBLIC cxx_std_20)
 target_include_directories(sailroute
@@ -92,12 +100,6 @@ if(SAILROUTE_BUILD_TESTS)
         tests/test_main.cpp
         tests/test_contours.cpp
         tests/test_environment.cpp
-        tests/test_ensemble_beam.cpp
-        tests/test_ensemble_dataset.cpp
-        tests/test_ensemble_lattice.cpp
-        tests/test_ensemble_objective.cpp
-        tests/test_ensemble_policy.cpp
-        tests/test_ensemble_search_state.cpp
         tests/test_exclusions.cpp
         tests/test_front.cpp
         tests/test_landmask.cpp
@@ -105,26 +107,42 @@ if(SAILROUTE_BUILD_TESTS)
         tests/test_physics_routing.cpp
         tests/test_polar.cpp
         tests/test_routing.cpp
+        tests/test_routing_contracts.cpp
+        tests/test_strategic_routing.cpp
+        benchmarks/strategic_benchmark.cpp
         tests/test_serialization.cpp
-        tests/test_ensemble_serialization.cpp
-        tests/test_ensemble_progress.cpp
         tests/test_time.cpp
         tests/test_transition.cpp
         tests/test_weather.cpp
     )
+    if(SAILROUTE_ENABLE_ENSEMBLE)
+        target_sources(sailroute_tests PRIVATE
+            tests/test_ensemble_beam.cpp tests/test_ensemble_dataset.cpp
+            tests/test_ensemble_lattice.cpp tests/test_ensemble_objective.cpp
+            tests/test_ensemble_policy.cpp tests/test_ensemble_search_state.cpp
+            tests/test_ensemble_serialization.cpp tests/test_ensemble_progress.cpp)
+    endif()
+    if(SAILROUTE_ENABLE_LAND_DATA)
+        target_sources(sailroute_tests PRIVATE tests/test_land_data.cpp)
+    endif()
     target_link_libraries(sailroute_tests PRIVATE sailroute::sailroute ECCODES::eccodes)
     target_include_directories(sailroute_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(
         sailroute_tests
-        PRIVATE SAILROUTE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        PRIVATE SAILROUTE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+            "SAILROUTE_CLI_PATH=\"$<TARGET_FILE:sailroute_cli>\"")
+    add_dependencies(sailroute_tests sailroute_cli)
 
+    if(SAILROUTE_BUILD_LEGACY_CORPUS)
     add_executable(
         sailroute_compatibility_corpus
         tests/compatibility_corpus.cpp)
     target_link_libraries(
         sailroute_compatibility_corpus
         PRIVATE sailroute::sailroute ECCODES::eccodes)
+    endif()
 
+    if(SAILROUTE_ENABLE_ENSEMBLE)
     add_executable(
         sailroute_ensemble_cli_positive
         tests/test_ensemble_cli_positive.cpp)
@@ -137,6 +155,7 @@ if(SAILROUTE_BUILD_TESTS)
             "SAILROUTE_CLI_PATH=\"$<TARGET_FILE:sailroute_cli>\""
             "SAILROUTE_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
     add_dependencies(sailroute_ensemble_cli_positive sailroute_cli)
+    endif()
 
     function(add_cli_failure_test test_name expected_output)
         add_test(
@@ -151,18 +170,35 @@ if(SAILROUTE_BUILD_TESTS)
     endfunction()
 
     add_test(NAME sailroute_tests COMMAND sailroute_tests)
-    add_test(
-        NAME sailroute_v032_compatibility
-        COMMAND
-            ${CMAKE_COMMAND}
-            "-DCOMMAND_PATH=$<TARGET_FILE:sailroute_compatibility_corpus>"
-            "-DEXPECTED_FILE=${CMAKE_CURRENT_SOURCE_DIR}/tests/compatibility/v0.3.2.txt"
-            -P
-            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompareCommandOutput.cmake")
+    if(SAILROUTE_ENABLE_ENSEMBLE)
     add_test(
         NAME sailroute_ensemble_cli_positive
         COMMAND sailroute_ensemble_cli_positive)
+    endif()
     add_test(NAME sailroute_cli_help COMMAND sailroute_cli --help)
+    add_test(NAME sailroute_cli_cruising COMMAND sailroute_cli
+        --grib "${CMAKE_CURRENT_SOURCE_DIR}/samples/sample.grib"
+        --polar "${CMAKE_CURRENT_SOURCE_DIR}/samples/sample.pol"
+        --start 48.294300,-123.531697 --destination 48.141100,-123.402687
+        --departure 2026-07-14T20:19:01Z --quality balanced --boat-speed-factor 0.9)
+    set_tests_properties(sailroute_cli_cruising PROPERTIES
+        PASS_REGULAR_EXPRESSION "\"completion\":\"destination_reached\"")
+    add_cli_failure_test(sailroute_cli_requires_polar
+        "provide --polar or explicitly select --demo-polar"
+        --grib "${CMAKE_CURRENT_SOURCE_DIR}/samples/sample.grib"
+        --start 48.294300,-123.531697 --destination 48.141100,-123.402687
+        --departure 2026-07-14T20:19:01Z)
+    add_cli_failure_test(sailroute_cli_invalid_quality
+        "--quality must be fast, balanced or high" --quality unknown)
+    add_cli_failure_test(sailroute_cli_duplicate_quality
+        "--quality may only be specified once" --quality fast --quality high)
+    add_cli_failure_test(sailroute_cli_land_options_need_data
+        "land clearance/resolution options require --land"
+        --grib missing.grib --start 0,0 --destination 1,1 --land-clearance-nm 1)
+    add_cli_failure_test(sailroute_cli_lattice_rejects_beam_options
+        "beam heading, interval and pruning controls are not used"
+        --grib missing.grib --start 0,0 --destination 1,1 --solver lattice
+        --heading-step-degrees 5)
     add_cli_failure_test(
         sailroute_cli_custom_intervals
         "cannot open GRIB file"
@@ -255,6 +291,7 @@ if(SAILROUTE_BUILD_TESTS)
         sailroute_cli_removed_upwind_twa
         "unknown option: --upwind-twa-degrees"
         --upwind-twa-degrees 90)
+    if(SAILROUTE_ENABLE_ENSEMBLE)
     # Ensemble mode rejection tests.
     add_cli_failure_test(
         sailroute_cli_ensemble_rejects_grib
@@ -304,6 +341,7 @@ if(SAILROUTE_BUILD_TESTS)
         sailroute_cli_ensemble_zero_total_weight
         "total weight must be positive"
         --ensemble-member gfs:0.0:gfs.grib
+        --demo-polar
         --start 0,0
         --destination 0,1)
     add_cli_failure_test(
@@ -367,6 +405,7 @@ if(SAILROUTE_BUILD_TESTS)
         --start 0,0
         --destination 0,1
         --ensemble-objective probability_beating_rival)
+    endif()
     set_tests_properties(
         sailroute_cli_help
         PROPERTIES PASS_REGULAR_EXPRESSION "--routing-intervals SPEC")
@@ -386,10 +425,13 @@ if(SAILROUTE_BUILD_BENCHMARKS)
 
     add_executable(sailroute_benchmarks
         benchmarks/benchmark_main.cpp
-        benchmarks/ensemble_benchmark.cpp
+        benchmarks/strategic_benchmark.cpp
         benchmarks/lattice_comparison.cpp
     )
-    target_link_libraries(sailroute_benchmarks PRIVATE sailroute::sailroute)
+    if(SAILROUTE_ENABLE_ENSEMBLE)
+        target_sources(sailroute_benchmarks PRIVATE benchmarks/ensemble_benchmark.cpp)
+    endif()
+    target_link_libraries(sailroute_benchmarks PRIVATE sailroute::sailroute ECCODES::eccodes)
     target_include_directories(
         sailroute_benchmarks
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

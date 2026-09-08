@@ -161,7 +161,7 @@ TEST_CASE("ensemble policy builds stable divergent and reconvergent decisions") 
     auto policy = sailroute::detail::build_ensemble_policy(
         dataset.value(),
         objective,
-        EnsemblePolicyOptions{},
+        EnsemblePolicyOptions{.max_alternatives = 3U},
         labels,
         terminals,
         3U,
@@ -194,7 +194,7 @@ TEST_CASE("ensemble policy builds stable divergent and reconvergent decisions") 
     auto repeated = sailroute::detail::build_ensemble_policy(
         second_dataset.value(),
         objective,
-        EnsemblePolicyOptions{},
+        EnsemblePolicyOptions{.max_alternatives = 3U},
         labels,
         terminals,
         3U,
@@ -358,7 +358,7 @@ TEST_CASE("probability policy support follows member scores") {
     auto policy = sailroute::detail::build_ensemble_policy(
         dataset.value(),
         objective,
-        EnsemblePolicyOptions{},
+        EnsemblePolicyOptions{.max_alternatives = 3U},
         labels,
         terminals,
         1U,

@@ -65,6 +65,8 @@ struct EnsembleMemberSearchState {
     EnsembleMemberSearchStatus status{EnsembleMemberSearchStatus::active};
     std::optional<EnsembleMemberOutcomeClass> outcome_class;
     std::optional<Error> error;
+    /// Physical vertices of the incoming action, excluding parent/final points.
+    std::vector<RoutePoint> intermediate_points;
 };
 
 /// One shared-search label. There is exactly one action history for all members;
@@ -86,6 +88,11 @@ struct EnsembleSearchLabel {
 
 /// Refreshes identities after internal state construction or mutation.
 void canonicalize_ensemble_label(EnsembleSearchLabel& label);
+
+/// Ends remaining diagnostic-only members once all positive-weight members
+/// are resolved; they never prolong the selected common action sequence.
+void finalize_diagnostic_members(
+    const EnsembleDataset& dataset, EnsembleSearchLabel& label);
 
 /// Converts a fully resolved label to canonical public objective outcomes.
 [[nodiscard]] Result<std::vector<EnsembleMemberOutcome>>

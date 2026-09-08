@@ -32,7 +32,14 @@ struct EnsembleRunMetadata {
     std::uint32_t schema_revision{1U};
 };
 
-/// Named weighted input loaded through `WeatherDataset::load`.
+/// Named weighted scenario loaded through `WeatherDataset::load`.
+///
+/// Positive-weight scenarios participate in common-plan hard legality.
+/// Zero-weight scenarios are evaluated for diagnostics, but cannot veto an
+/// action or contribute to risk objectives, and do not prolong a plan after all
+/// positive-weight scenarios resolve. An unreached diagnostic member at that
+/// point has an explicit incomplete outcome. Weights are not calibrated forecast
+/// probabilities unless the application supplies such a calibration.
 struct EnsembleMemberInput {
     std::string identifier;
     double weight{1.0};
@@ -343,20 +350,32 @@ struct EnsembleBeamRoutingOptions {
     std::size_t max_total_nodes{500'000U};
 };
 
-/// Bounds policy alternatives and defines cross-cycle commitment tolerances.
+/// Bounds retained alternatives and their descriptive decision diagnostics.
+///
+/// These diagnostics do not execute an adaptive policy or resume/re-evaluate a
+/// voyage. Applications must start a new optimization from observed conditions.
 struct EnsemblePolicyOptions {
-    /// Additional alternatives retained beside the selected route.
-    std::size_t max_alternatives{3U};
+    /// Additional alternatives retained beside the selected route. Zero skips
+    /// policy graph, decision diagnostics, and cross-cycle metadata construction.
+    std::size_t max_alternatives{0U};
+    /// Legacy names: these are configured grouping/time-offset tolerances, not
+    /// computed last-safe-turn distances or deadlines.
     double commitment_spatial_tolerance_nautical_miles{2.0};
     std::chrono::minutes commitment_time_tolerance{15};
 };
 
 /// Additive request surface for a shared-action ensemble optimization.
 ///
-/// `options` supplies the existing transition physics and Stage 3 eligibility
+/// `options` supplies the shared transition physics and environment/eligibility
 /// controls. Its deterministic `solver` and lattice fields are not consulted.
 /// Beam selection is rejected unless `enable_experimental_beam` is explicitly
 /// true, and that opt-in is itself rejected for every other solver.
+///
+/// A hard-infeasible action in any active positive-weight scenario is rejected
+/// for the whole plan, regardless of objective. Forecast/duration exhaustion
+/// and unavailable observations remain explicit statistical outcomes; they do
+/// not certify the unobserved continuation as legal. Zero-weight diagnostic
+/// members cannot veto actions. Stationary waits require `holding_eligibility`.
 struct EnsembleRouteRequest {
     Coordinate start;
     Coordinate destination;
@@ -426,7 +445,8 @@ struct EnsembleMemberRouteResult {
     EnvironmentDiagnostics environment_diagnostics;
 };
 
-/// One complete common-action alternative retained from the solver.
+/// One resolved common-action alternative retained from the solver.
+/// Its member outcomes may include explicit statistical non-arrival.
 struct EnsemblePolicyAlternative {
     std::string branch_identity;
     bool selected{};
@@ -449,7 +469,7 @@ struct EnsemblePolicyNode {
     std::vector<std::string> outgoing_branch_identities;
 };
 
-/// One canonical action edge in the non-clairvoyant policy DAG.
+/// One canonical action edge in a graph of retained common-plan alternatives.
 struct EnsemblePolicyBranch {
     std::string branch_identity;
     std::string from_node_identity;
@@ -461,6 +481,7 @@ struct EnsemblePolicyBranch {
     EnsembleObjectiveValue wrong_choice_cost;
 };
 
+/// Optional retained-alternative topology; not an executable adaptive policy.
 struct EnsemblePolicyGraph {
     std::uint32_t schema_revision{1U};
     std::string root_node_identity;
@@ -478,17 +499,22 @@ struct EnsembleDecisionBranch {
     EnsembleObjectiveValue wrong_choice_cost;
 };
 
-/// Operational choice extracted from a policy node with multiple legal actions.
+/// Descriptive choice extracted from retained alternatives, not an executable
+/// feedback rule or a guarantee that an alternative remains safe later.
 struct EnsembleDecisionPoint {
     std::string decision_identity;
     std::string policy_node_identity;
     std::vector<Coordinate> canonical_member_positions;
     TimePoint earliest_time{};
+    /// Legacy name: latest member time plus a configured tolerance, not a
+    /// computed operational commitment deadline.
     TimePoint latest_commitment_time{};
     std::vector<EnsembleDecisionBranch> branches;
 };
 
-/// Content needed to compare this policy with a later forecast cycle.
+/// Descriptive identifiers/tolerances for application-side comparisons with a
+/// later forecast cycle. No library resume or automatic re-evaluation operation
+/// consumes this structure.
 struct EnsembleReevaluationState {
     std::uint32_t schema_revision{1U};
     std::string prior_run_identifier;
@@ -507,9 +533,13 @@ struct EnsembleRouteResult {
     std::vector<EnsembleRouteAction> common_actions;
     std::string canonical_action_sequence_identity;
     std::vector<EnsembleMemberRouteResult> members;
+    /// Selected risk objective and its target/rival inputs, independent of
+    /// whether retained-alternative diagnostics were requested.
+    EnsembleObjective objective_specification;
     EnsembleObjectiveEvaluation objective;
     EnsembleLatticeDiagnostics lattice_diagnostics;
     EnsembleBeamDiagnostics beam_diagnostics;
+    /// Empty by default; populated only when alternatives are requested.
     EnsemblePolicyGraph policy;
     std::vector<EnsembleDecisionPoint> decision_points;
     EnsembleReevaluationState re_evaluation;

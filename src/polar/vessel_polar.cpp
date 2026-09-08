@@ -29,6 +29,13 @@ struct VesselPolar::Impl {
     std::vector<double> downwind_vmg_linear;
     std::vector<double> upwind_vmg_cubic;
     std::vector<double> downwind_vmg_cubic;
+    std::vector<std::uint8_t> sailing_points;
+    std::vector<std::uint8_t> sailing_intervals;
+    double minimum_sailing_angle_degrees{0.0};
+    std::vector<double> column_minimum_angles;
+    std::vector<double> column_maximum_angles;
+    std::vector<double> between_minimum_angles;
+    std::vector<double> between_maximum_angles;
 };
 
 namespace {
@@ -44,6 +51,8 @@ struct ParsedPolar {
     std::vector<double> wind_speeds;
     std::vector<double> wind_angles;
     std::vector<double> boat_speeds;
+    std::vector<std::uint8_t> sailing_points;
+    std::vector<std::uint8_t> sailing_intervals;
 };
 
 struct NumericToken {
@@ -131,8 +140,10 @@ std::vector<std::string_view> split_tokens(std::string_view line) {
         delimiter = ';';
     } else if (line.find(',') != std::string_view::npos) {
         delimiter = ',';
-    } else if (line.find('\t') != std::string_view::npos) {
-        delimiter = '\t';
+    } else if (!line.empty() && line.front() == '\t') {
+        // Preserve a blank tab-separated matrix corner; ordinary tabs are
+        // whitespace so native rows can mix tabs and spaces.
+        tokens.push_back({});
     }
 
     if (delimiter != '\0') {
@@ -166,9 +177,6 @@ std::vector<std::string_view> split_tokens(std::string_view line) {
         }
     }
 
-    while (!tokens.empty() && trim(tokens.back()).empty()) {
-        tokens.pop_back();
-    }
     return tokens;
 }
 
@@ -217,7 +225,7 @@ bool strictly_increasing(const std::vector<double>& values) noexcept {
     return true;
 }
 
-Result<ParsedPolar> parse_polar_lines(const std::vector<SourceLine>& lines) {
+Result<ParsedPolar> parse_matrix_lines(const std::vector<SourceLine>& lines) {
     ParsedPolar result;
     std::size_t header_index = lines.size();
 
@@ -251,10 +259,27 @@ Result<ParsedPolar> parse_polar_lines(const std::vector<SourceLine>& lines) {
         const bool blank_corner =
             first_number != tokens.size() && first_number > 0 && trim(tokens[0]).empty();
         if (!numeric_only && !blank_corner && !looks_like_header(tokens)) {
+            const auto numeric_count = std::count_if(
+                tokens.begin(), tokens.end(),
+                [](std::string_view token) { return parse_number(token).valid; });
+            if (numeric_count >= 2) {
+                return invalid_polar(
+                    lines[line_index].number, "invalid matrix header before TWS values");
+            }
             continue;
         }
         if (first_number == tokens.size()) {
-            continue;
+            return invalid_polar(
+                lines[line_index].number, "matrix header has no numeric TWS values");
+        }
+        for (std::size_t i = 0; i < first_number; ++i) {
+            if (i == 0 && blank_corner) {
+                continue;
+            }
+            if (!looks_like_header({tokens[i]}) && tokens[i] != "/" && tokens[i] != "\\") {
+                return invalid_polar(
+                    lines[line_index].number, "invalid or missing TWS header value");
+            }
         }
 
         std::size_t wind_start = first_number;
@@ -304,15 +329,13 @@ Result<ParsedPolar> parse_polar_lines(const std::vector<SourceLine>& lines) {
         }
 
         if (candidate.size() < 2) {
-            continue;
+            return invalid_polar(
+                lines[line_index].number, "matrix requires at least two TWS columns");
         }
         if (!strictly_increasing(candidate) || candidate.front() < 0.0) {
-            if (looks_like_header(tokens) || blank_corner) {
-                return invalid_polar(
-                    lines[line_index].number,
-                    "TWS values must be nonnegative and strictly increasing");
-            }
-            continue;
+            return invalid_polar(
+                lines[line_index].number,
+                "TWS values must be nonnegative and strictly increasing");
         }
 
         result.wind_speeds = std::move(candidate);
@@ -348,8 +371,9 @@ Result<ParsedPolar> parse_polar_lines(const std::vector<SourceLine>& lines) {
                 break;
             }
         }
-        if (first_number == tokens.size()) {
-            continue;
+        if (first_number != 0) {
+            return invalid_polar(
+                lines[line_index].number, "expected a numeric TWA at start of matrix row");
         }
 
         const std::size_t expected_values = result.wind_speeds.size() + 1;
@@ -458,6 +482,165 @@ Interval find_interval(const double* axis, std::size_t count, double value) noex
 
 Interval find_interval(const std::vector<double>& axis, double value) noexcept {
     return find_interval(axis.data(), axis.size(), value);
+}
+
+Result<ParsedPolar> parse_expedition_lines(const std::vector<SourceLine>& lines) {
+    struct Curve {
+        double wind;
+        std::vector<double> angles;
+        std::vector<double> speeds;
+    };
+    std::vector<Curve> curves;
+    std::vector<double> angles;
+    for (const auto& line : lines) {
+        std::string_view text = line.text;
+        if (line.number == 1 && text.starts_with("\xEF\xBB\xBF")) {
+            text.remove_prefix(3);
+        }
+        if (is_full_line_comment(text)) {
+            continue;
+        }
+        text = remove_inline_comment(text);
+        auto tokens = split_tokens(trim(text));
+        if (tokens.empty()) {
+            continue;
+        }
+        if (!parse_number(tokens.front()).valid) {
+            const auto numeric_count = std::count_if(
+                tokens.begin(), tokens.end(),
+                [](std::string_view token) { return parse_number(token).valid; });
+            if (curves.empty() && !tokens.front().empty() &&
+                !looks_like_header(tokens) && numeric_count < 2) {
+                // Expedition exports may include a boat name or version preamble.
+                continue;
+            }
+            return invalid_polar(line.number, "expected TWS at start of Expedition row");
+        }
+        if (tokens.size() < 5U || tokens.size() % 2U != 1U) {
+            return invalid_polar(
+                line.number, "expected TWS followed by at least two complete TWA/BSP pairs");
+        }
+        if ((tokens.size() - 1U) / 2U > max_axis_size) {
+            return invalid_polar(line.number, "too many TWA/BSP pairs (maximum is 512)");
+        }
+        std::vector<double> numbers;
+        for (const auto token : tokens) {
+            const NumericToken number = parse_number(token);
+            if (!number.valid || !number.finite) {
+                return invalid_polar(
+                    line.number, "Expedition TWS, TWA and BSP values must be finite numbers");
+            }
+            numbers.push_back(number.value);
+        }
+        Curve curve{numbers.front(), {}, {}};
+        if (curve.wind < 0.0 ||
+            (!curves.empty() && curve.wind <= curves.back().wind)) {
+            return invalid_polar(
+                line.number, "Expedition TWS rows must be nonnegative and strictly increasing");
+        }
+        for (std::size_t i = 1; i < numbers.size(); i += 2U) {
+            const double angle = numbers[i];
+            if (angle < 0.0 || angle > 180.0 ||
+                (!curve.angles.empty() && angle <= curve.angles.back())) {
+                return invalid_polar(
+                    line.number, "Expedition TWA pairs must be within 0 to 180 degrees "
+                        "and strictly increasing");
+            }
+            if (numbers[i + 1U] < 0.0) {
+                return invalid_polar(line.number, "Expedition BSP values must be nonnegative");
+            }
+            curve.angles.push_back(angle);
+            curve.speeds.push_back(numbers[i + 1U]);
+        }
+        if (curve.angles.back() - curve.angles.front() < 30.0) {
+            return invalid_polar(line.number, "Expedition TWA curve must span at least 30 degrees");
+        }
+        angles.insert(angles.end(), curve.angles.begin(), curve.angles.end());
+        curves.push_back(std::move(curve));
+        if (curves.size() > max_axis_size) {
+            return invalid_polar(line.number, "too many Expedition TWS rows (maximum is 512)");
+        }
+    }
+    if (curves.size() < 2U || curves.back().wind - curves.front().wind < 1.0) {
+        return invalid_polar(
+            lines.front().number, "Expedition polar requires at least two TWS rows spanning 1 knot");
+    }
+    std::sort(angles.begin(), angles.end());
+    angles.erase(std::unique(angles.begin(), angles.end()), angles.end());
+    if (angles.size() > max_axis_size) {
+        return invalid_polar(
+            lines.back().number, "too many distinct Expedition TWAs (maximum is 512)");
+    }
+    if (curves.front().wind > 0.0) {
+        Curve calm{0.0, curves.front().angles,
+            std::vector<double>(curves.front().speeds.size(), 0.0)};
+        curves.insert(curves.begin(), std::move(calm));
+    }
+    ParsedPolar result;
+    result.wind_angles = std::move(angles);
+    for (const auto& curve : curves) {
+        result.wind_speeds.push_back(curve.wind);
+    }
+    for (std::size_t row = 0; row < result.wind_angles.size(); ++row) {
+        const double angle = result.wind_angles[row];
+        for (const auto& curve : curves) {
+            const Interval interval = find_interval(curve.angles, angle);
+            const double low = curve.speeds[interval.lower];
+            const double high = curve.speeds[interval.lower + 1U];
+            result.boat_speeds.push_back(low + interval.fraction * (high - low));
+            const bool in_domain =
+                angle > 0.0 && angle >= curve.angles.front() && angle <= curve.angles.back();
+            const bool positive_interval =
+                curve.angles[interval.lower] > 0.0 && low > 0.0 && high > 0.0;
+            const bool positive_point = interval.fraction == 0.0 ? low > 0.0
+                : interval.fraction == 1.0 ? high > 0.0 : positive_interval;
+            result.sailing_points.push_back(in_domain && positive_point);
+            const bool supports_next = row + 1U < result.wind_angles.size() &&
+                result.wind_angles[row + 1U] <= curve.angles.back();
+            result.sailing_intervals.push_back(
+                in_domain && supports_next && positive_interval &&
+                angle < curve.angles.back());
+        }
+    }
+    return result;
+}
+
+Result<ParsedPolar> parse_polar_lines(
+    const std::vector<SourceLine>& lines, PolarFormat format) {
+    if (format == PolarFormat::matrix) {
+        return parse_matrix_lines(lines);
+    }
+    if (format == PolarFormat::expedition) {
+        return parse_expedition_lines(lines);
+    }
+    if (format != PolarFormat::automatic) {
+        return invalid_polar(0, "unrecognized polar format");
+    }
+    // A successful numeric parse is not sufficient format detection: the
+    // zero-corner matrix variant can also be a valid native Expedition file.
+    auto matrix = parse_matrix_lines(lines);
+    auto expedition = parse_expedition_lines(lines);
+    if (matrix && expedition) {
+        const auto first_data = std::find_if(lines.begin(), lines.end(), [](const auto& line) {
+            if (is_full_line_comment(line.text)) {
+                return false;
+            }
+            const auto tokens = split_tokens(remove_inline_comment(line.text));
+            return !tokens.empty() && parse_number(tokens.front()).valid;
+        });
+        return invalid_polar(
+            first_data == lines.end() ? lines.front().number : first_data->number,
+            "ambiguous numeric polar; select PolarFormat::matrix or PolarFormat::expedition");
+    }
+    if (matrix) {
+        return matrix;
+    }
+    if (expedition) {
+        return expedition;
+    }
+    return invalid_polar(
+        0, "unrecognized or malformed polar; matrix: " + matrix.error().message +
+            "; Expedition: " + expedition.error().message);
 }
 
 // Fritsch-Carlson slope for a monotone cubic (PCHIP) through `points`.
@@ -643,6 +826,76 @@ double column_speed(
             row.fraction * (wind_angles[row.lower + 1U] - wind_angles[row.lower]));
 }
 
+template <typename PolarImpl>
+void fill_sailing_support(PolarImpl& impl) {
+    const std::size_t columns = impl.wind_speeds.size();
+    const std::size_t rows = impl.wind_angles.size();
+    if (impl.sailing_points.empty()) {
+        impl.sailing_points.resize(rows * columns);
+        impl.sailing_intervals.resize(rows * columns);
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t column = 0; column < columns; ++column) {
+                const std::size_t index = row * columns + column;
+                const bool point =
+                    impl.wind_angles[row] > 0.0 && impl.boat_speeds[index] > 0.0;
+                impl.sailing_points[index] = point;
+                impl.sailing_intervals[index] =
+                    point && row + 1U < rows && impl.boat_speeds[index + columns] > 0.0;
+            }
+        }
+    }
+    // Zero TWS is a scaling anchor, not an independently sailable curve.
+    // Borrow its neighbor's domain only for positive winds interpolated above it.
+    if (impl.wind_speeds.front() == 0.0) {
+        for (std::size_t row = 0; row < rows; ++row) {
+            impl.sailing_points[row * columns] = impl.sailing_points[row * columns + 1U];
+            impl.sailing_intervals[row * columns] =
+                impl.sailing_intervals[row * columns + 1U];
+        }
+    }
+    const double none = std::numeric_limits<double>::quiet_NaN();
+    impl.column_minimum_angles.assign(columns, none);
+    impl.column_maximum_angles.assign(columns, none);
+    impl.between_minimum_angles.assign(columns - 1U, none);
+    impl.between_maximum_angles.assign(columns - 1U, none);
+    const auto bounds = [&](std::size_t low_column, std::size_t high_column) {
+        double minimum = none;
+        double maximum = none;
+        const auto include = [&](double low, double high) {
+            low = std::max(low, impl.minimum_sailing_angle_degrees);
+            if (low > high) {
+                return;
+            }
+            if (!std::isfinite(minimum)) {
+                minimum = low;
+            }
+            maximum = high;
+        };
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::size_t base = row * columns;
+            if (impl.sailing_points[base + low_column] &&
+                impl.sailing_points[base + high_column]) {
+                include(impl.wind_angles[row], impl.wind_angles[row]);
+            }
+            if (row + 1U < rows && impl.sailing_intervals[base + low_column] &&
+                impl.sailing_intervals[base + high_column]) {
+                include(impl.wind_angles[row], impl.wind_angles[row + 1U]);
+            }
+        }
+        return std::pair{minimum, maximum};
+    };
+    for (std::size_t column = 0; column < columns; ++column) {
+        const auto [minimum, maximum] = bounds(column, column);
+        impl.column_minimum_angles[column] = minimum;
+        impl.column_maximum_angles[column] = maximum;
+        if (column + 1U < columns) {
+            const auto [between_minimum, between_maximum] = bounds(column, column + 1U);
+            impl.between_minimum_angles[column] = between_minimum;
+            impl.between_maximum_angles[column] = between_maximum;
+        }
+    }
+}
+
 // Derives the per-column velocity-made-good optima cached on the polar.
 template <typename PolarImpl>
 void fill_velocity_made_good_angles(PolarImpl& impl) {
@@ -655,18 +908,29 @@ void fill_velocity_made_good_angles(PolarImpl& impl) {
     impl.upwind_vmg_cubic.assign(columns, 0.0);
     impl.downwind_vmg_cubic.assign(columns, 180.0);
 
-    const double lowest_angle = impl.wind_angles.front();
-    const double highest_angle = impl.wind_angles.back();
     for (std::size_t column = 0U; column < columns; ++column) {
+        const double lowest_angle = impl.column_minimum_angles[column];
+        const double highest_angle = impl.column_maximum_angles[column];
+        if (!std::isfinite(lowest_angle)) {
+            continue;
+        }
         for (const bool cubic : {false, true}) {
             const auto speed = [&](double angle) {
+                const Interval interval = find_interval(impl.wind_angles, angle);
+                const std::size_t row = interval.lower +
+                    static_cast<std::size_t>(interval.fraction == 1.0);
+                const auto& support = interval.fraction == 0.0 || interval.fraction == 1.0
+                    ? impl.sailing_points : impl.sailing_intervals;
+                if (!support[row * columns + column]) {
+                    return 0.0;
+                }
                 return column_speed(
                     impl.wind_angles, impl.boat_speeds, columns, column, angle, cubic);
             };
             const double upwind = velocity_made_good_angle(
-                speed, lowest_angle, std::min(90.0, highest_angle), true);
+                speed, lowest_angle, std::clamp(90.0, lowest_angle, highest_angle), true);
             const double downwind = velocity_made_good_angle(
-                speed, std::max(90.0, lowest_angle), highest_angle, false);
+                speed, std::clamp(90.0, lowest_angle, highest_angle), highest_angle, false);
             if (cubic) {
                 impl.upwind_vmg_cubic[column] = upwind;
                 impl.downwind_vmg_cubic[column] = downwind;
@@ -675,11 +939,18 @@ void fill_velocity_made_good_angles(PolarImpl& impl) {
                 impl.downwind_vmg_linear[column] = downwind;
             }
         }
+        if (impl.wind_speeds.front() == 0.0) {
+            impl.upwind_vmg_linear[0] = impl.upwind_vmg_linear[1];
+            impl.downwind_vmg_linear[0] = impl.downwind_vmg_linear[1];
+            impl.upwind_vmg_cubic[0] = impl.upwind_vmg_cubic[1];
+            impl.downwind_vmg_cubic[0] = impl.downwind_vmg_cubic[1];
+        }
     }
 }
 
 template <typename PolarImpl>
 std::shared_ptr<const PolarImpl> make_impl(PolarImpl impl) {
+    fill_sailing_support(impl);
     fill_velocity_made_good_angles(impl);
     return std::make_shared<const PolarImpl>(std::move(impl));
 }
@@ -709,6 +980,13 @@ VesselPolar::VesselPolar()
           {},
           {},
           {},
+          {},
+          {},
+          {},
+          0.0,
+          {},
+          {},
+          {},
           {}})) {}
 
 VesselPolar::~VesselPolar() = default;
@@ -720,6 +998,17 @@ VesselPolar& VesselPolar::operator=(VesselPolar&&) noexcept = default;
 VesselPolar::VesselPolar(std::shared_ptr<const Impl> impl) : impl_(std::move(impl)) {}
 
 Result<VesselPolar> VesselPolar::load(const std::filesystem::path& path) {
+    return load(path, PolarLoadOptions{});
+}
+
+Result<VesselPolar> VesselPolar::load(
+    const std::filesystem::path& path, const PolarLoadOptions& options) {
+    if (options.minimum_sailing_angle_degrees &&
+        (!std::isfinite(*options.minimum_sailing_angle_degrees) ||
+         *options.minimum_sailing_angle_degrees <= 0.0 ||
+         *options.minimum_sailing_angle_degrees > 180.0)) {
+        return invalid_polar(0, "minimum sailing angle must be finite and within (0, 180] degrees");
+    }
     std::ifstream input(path);
     if (!input.is_open()) {
         return Error{
@@ -744,7 +1033,7 @@ Result<VesselPolar> VesselPolar::load(const std::filesystem::path& path) {
         return invalid_polar(0, "polar file is empty");
     }
 
-    auto parsed = parse_polar_lines(lines);
+    auto parsed = parse_polar_lines(lines, options.format);
     if (!parsed) {
         return parsed.error();
     }
@@ -755,6 +1044,13 @@ Result<VesselPolar> VesselPolar::load(const std::filesystem::path& path) {
         std::move(data.wind_angles),
         std::move(data.boat_speeds),
         "Loaded vessel polar from '" + path.string() + "'",
+        {},
+        {},
+        {},
+        {},
+        std::move(data.sailing_points),
+        std::move(data.sailing_intervals),
+        options.minimum_sailing_angle_degrees.value_or(0.0),
         {},
         {},
         {},
@@ -783,10 +1079,21 @@ PolarSlice VesselPolar::slice_at(
     const Interval wind = find_interval(impl_->wind_speeds, true_wind_speed_knots);
     slice.wind_angles_ = impl_->wind_angles.data();
     slice.boat_speeds_ = impl_->boat_speeds.data();
+    slice.sailing_points_ = impl_->sailing_points.data();
+    slice.sailing_intervals_ = impl_->sailing_intervals.data();
     slice.wind_angle_count_ = impl_->wind_angles.size();
     slice.wind_speed_count_ = impl_->wind_speeds.size();
     slice.wind_lower_ = wind.lower;
     slice.wind_fraction_ = wind.fraction;
+    if (wind.fraction == 0.0 || wind.fraction == 1.0) {
+        const std::size_t column =
+            wind.lower + static_cast<std::size_t>(wind.fraction == 1.0);
+        slice.minimum_sailing_angle_degrees_ = impl_->column_minimum_angles[column];
+        slice.maximum_sailing_angle_degrees_ = impl_->column_maximum_angles[column];
+    } else {
+        slice.minimum_sailing_angle_degrees_ = impl_->between_minimum_angles[wind.lower];
+        slice.maximum_sailing_angle_degrees_ = impl_->between_maximum_angles[wind.lower];
+    }
     slice.interpolation_ = interpolation;
     slice.above_tabulated_wind_speed_ =
         !impl_->wind_speeds.empty() && true_wind_speed_knots > impl_->wind_speeds.back();
@@ -819,7 +1126,7 @@ double VesselPolar::maximum_boat_speed_knots() const noexcept {
 
 VelocityMadeGoodAngles PolarSlice::velocity_made_good_angles() const noexcept {
     VelocityMadeGoodAngles angles;
-    if (upwind_vmg_ == nullptr) {
+    if (upwind_vmg_ == nullptr || !std::isfinite(minimum_sailing_angle_degrees_)) {
         return angles;
     }
     // The optimum moves smoothly with wind speed, so blending the two bracketing
@@ -828,8 +1135,65 @@ VelocityMadeGoodAngles PolarSlice::velocity_made_good_angles() const noexcept {
         wind_fraction_ * (upwind_vmg_[wind_lower_ + 1U] - upwind_vmg_[wind_lower_]);
     angles.downwind_degrees = downwind_vmg_[wind_lower_] +
         wind_fraction_ * (downwind_vmg_[wind_lower_ + 1U] - downwind_vmg_[wind_lower_]);
+    const auto supported_proposal = [&](double proposal, bool upwind) {
+        proposal = std::clamp(
+            proposal, minimum_sailing_angle_degrees_, maximum_sailing_angle_degrees_);
+        if (supports_sailing_angle(proposal)) {
+            return proposal;
+        }
+        // Blending VMG targets can land inside a forbidden interior sector.
+        double best = minimum_sailing_angle_degrees_;
+        double best_vmg = -std::numeric_limits<double>::infinity();
+        for (std::size_t row = 0; row < wind_angle_count_; ++row) {
+            const double angle = std::clamp(
+                wind_angles_[row],
+                minimum_sailing_angle_degrees_, maximum_sailing_angle_degrees_);
+            if (!supports_sailing_angle(angle)) {
+                continue;
+            }
+            const double vmg = speed_knots(angle) *
+                std::cos(angle * std::numbers::pi / 180.0) * (upwind ? 1.0 : -1.0);
+            if (vmg > best_vmg) {
+                best_vmg = vmg;
+                best = angle;
+            }
+        }
+        return best;
+    };
+    angles.upwind_degrees = supported_proposal(angles.upwind_degrees, true);
+    angles.downwind_degrees = supported_proposal(angles.downwind_degrees, false);
     angles.valid = true;
     return angles;
+}
+
+bool PolarSlice::supports_sailing_angle(double true_wind_angle_degrees) const noexcept {
+    if (!valid() || !std::isfinite(true_wind_angle_degrees) ||
+        !std::isfinite(minimum_sailing_angle_degrees_)) {
+        return false;
+    }
+    double angle = fold_angle(true_wind_angle_degrees);
+    // Inverting a geodesic can perturb an exactly tabulated heading by a few
+    // ulps. This tolerance must not turn a real zero-speed sector into support.
+    constexpr double angle_roundoff_degrees = 1.0e-8;
+    const auto upper = std::lower_bound(wind_angles_, wind_angles_ + wind_angle_count_, angle);
+    if (upper != wind_angles_ + wind_angle_count_ &&
+        std::abs(*upper - angle) <= angle_roundoff_degrees) {
+        angle = *upper;
+    } else if (upper != wind_angles_ &&
+               std::abs(*(upper - 1) - angle) <= angle_roundoff_degrees) {
+        angle = *(upper - 1);
+    }
+    if (angle < minimum_sailing_angle_degrees_ || angle > maximum_sailing_angle_degrees_) {
+        return false;
+    }
+    const Interval interval = find_interval(wind_angles_, wind_angle_count_, angle);
+    const bool point = interval.fraction == 0.0 || interval.fraction == 1.0;
+    const std::size_t row = interval.lower +
+        static_cast<std::size_t>(interval.fraction == 1.0);
+    const auto* support = point ? sailing_points_ : sailing_intervals_;
+    const std::size_t base = row * wind_speed_count_ + wind_lower_;
+    return (wind_fraction_ == 1.0 || support[base]) &&
+        (wind_fraction_ == 0.0 || support[base + 1U]);
 }
 
 double PolarSlice::speed_knots(double true_wind_angle_degrees) const noexcept {

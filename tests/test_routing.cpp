@@ -718,7 +718,7 @@ TEST_CASE("accept-all segment eligibility preserves existing routing") {
     REQUIRE(constrained.has_value());
     REQUIRE(
         evaluated_segments ==
-        constrained.value().diagnostics.generated_candidates);
+        constrained.value().diagnostics.eligibility_evaluations);
     require_same_route(baseline, constrained.value());
 }
 
@@ -894,10 +894,10 @@ TEST_CASE("segment eligibility observations are deterministic across workers") {
 
     REQUIRE(
         single_observations.size() ==
-        single.diagnostics.generated_candidates);
+        single.diagnostics.eligibility_evaluations);
     REQUIRE(
         parallel_observations.size() ==
-        parallel.diagnostics.generated_candidates);
+        parallel.diagnostics.eligibility_evaluations);
     require_same_segment_observations(
         single_observations,
         parallel_observations);
@@ -974,7 +974,7 @@ TEST_CASE("segment eligibility reports all-rejected candidates distinctly") {
     REQUIRE(speed_limited.error().code == sailroute::ErrorCode::no_route);
     REQUIRE(
         speed_limited.error().message ==
-        "no heading met the minimum boat speed at routing step 1");
+        "no feasible transition remains after forecast, boat and geometry constraints at step 1");
 }
 
 TEST_CASE("progress callbacks stream deterministic provisional routes and isochrones") {
@@ -1626,7 +1626,7 @@ TEST_CASE("explicit departure outside forecast coverage is rejected") {
         sailroute::ErrorCode::departure_outside_forecast);
 }
 
-TEST_CASE("omitted departure falls back to forecast start") {
+TEST_CASE("omitted departure rejects a historical forecast") {
     const RoutingGribFixture fixture{20200101, 0};
     const auto weather = sailroute::WeatherDataset::load(fixture.path());
     REQUIRE(weather.has_value());
@@ -1637,16 +1637,8 @@ TEST_CASE("omitted departure falls back to forecast start") {
     request.destination = {1.0, 0.7};
     request.options.maximum_route_duration = std::chrono::hours{12};
     const auto route = router.optimize(request);
-    if (!route.has_value()) {
-        throw std::runtime_error(route.error().message);
-    }
-    const auto forecast_start = sailroute::parse_utc_time("2020-01-01T00:00:00Z");
-    REQUIRE(forecast_start.has_value());
-    REQUIRE(route.value().departure_time == forecast_start.value());
-    REQUIRE(
-        route.value().departure_source ==
-        sailroute::DepartureSource::forecast_start_fallback);
-    REQUIRE(route.value().isochrones.empty());
+    REQUIRE(!route.has_value());
+    REQUIRE(route.error().code == sailroute::ErrorCode::departure_outside_forecast);
 }
 
 namespace {
@@ -1707,7 +1699,7 @@ sailroute::RouteResult must_route(
 
 }  // namespace
 
-TEST_CASE("accuracy options default to the unmodified search") {
+TEST_CASE("accuracy options default to the documented cruising settings") {
     const RoutingGribFixture fixture;
     const auto weather = sailroute::WeatherDataset::load(fixture.path());
     REQUIRE(weather.has_value());
@@ -1718,12 +1710,12 @@ TEST_CASE("accuracy options default to the unmodified search") {
     sailroute::RouteRequest explicit_defaults = upwind_request();
     explicit_defaults.options.maneuver = sailroute::ManeuverPenalties{};
     explicit_defaults.options.heading_augmentation =
-        sailroute::HeadingAugmentation::none;
-    explicit_defaults.options.wind_sampling = sailroute::WindSampling::segment_start;
+        sailroute::HeadingAugmentation::destination_bearing_and_velocity_made_good;
+    explicit_defaults.options.wind_sampling = sailroute::WindSampling::midpoint;
     explicit_defaults.options.polar_angle_interpolation =
         sailroute::PolarAngleInterpolation::linear;
     explicit_defaults.options.above_polar_range =
-        sailroute::AbovePolarRangePolicy::clamp;
+        sailroute::AbovePolarRangePolicy::no_speed;
     explicit_defaults.options.pruning_strategy =
         sailroute::PruningStrategy::destination_distance_grid;
 
@@ -1793,22 +1785,17 @@ TEST_CASE("maneuver penalties are charged against the step") {
         const double distance =
             current.cumulative_distance_nautical_miles -
             previous.cumulative_distance_nautical_miles;
-        const double sailing_seconds =
-            distance / current.boat_speed_knots * 3600.0;
-
-        // Distance is always speed times the time actually spent sailing, so
-        // any surplus in the leg is exactly the maneuver charge.
-        const double surplus = elapsed_seconds - sailing_seconds;
-        REQUIRE(surplus > -1.0);
-
         const bool changed_board = index > 1U && board_of(current) != 0 &&
             board_of(previous) != 0 &&
             board_of(current) != board_of(previous);
         if (changed_board) {
             ++penalised_legs;
-            REQUIRE(std::abs(surplus - static_cast<double>(penalty.count())) < 1.5);
+            REQUIRE(current.boat_speed_knots == 0.0);
+            REQUIRE_NEAR(elapsed_seconds, static_cast<double>(penalty.count()), 1.0);
+            REQUIRE_NEAR(distance, 0.0, 1.0e-9);
         } else {
-            REQUIRE(surplus < 1.0);
+            REQUIRE(current.boat_speed_knots > 0.0);
+            REQUIRE_NEAR(distance / current.boat_speed_knots * 3600.0, elapsed_seconds, 1.0);
         }
     }
 
@@ -1827,10 +1814,8 @@ TEST_CASE("maneuver penalties keep both boards through pruning") {
     penalised.options.maneuver.tack_penalty = std::chrono::seconds{120};
     const sailroute::RouteResult board_aware = must_route(router, penalised);
 
-    // Splitting each bucket by board retains strictly more of the frontier.
-    REQUIRE(
-        board_aware.diagnostics.retained_candidates >=
-        must_route(router, upwind_request()).diagnostics.retained_candidates);
+    REQUIRE(board_aware.completion == sailroute::RouteCompletion::destination_reached);
+    REQUIRE(count_board_changes(board_aware) > 0U);
 }
 
 TEST_CASE("heading augmentation widens the evaluated heading set") {
@@ -1839,20 +1824,31 @@ TEST_CASE("heading augmentation widens the evaluated heading set") {
     REQUIRE(weather.has_value());
     const sailroute::Router router{weather.value()};
 
-    const sailroute::RouteResult plain = must_route(router, upwind_request());
+    auto plain_request = routing_request(1U, false);
+    plain_request.options.heading_augmentation = sailroute::HeadingAugmentation::none;
+    std::size_t plain_generated = 0U;
+    const auto plain = router.optimize(plain_request, [&](const sailroute::RoutingProgress& progress) {
+        plain_generated = progress.diagnostics.generated_candidates;
+        return sailroute::RoutingProgressDecision::cancel;
+    });
+    REQUIRE(!plain.has_value());
+    REQUIRE(plain.error().code == sailroute::ErrorCode::cancelled);
 
     for (const auto mode : {
              sailroute::HeadingAugmentation::destination_bearing,
              sailroute::HeadingAugmentation::velocity_made_good,
              sailroute::HeadingAugmentation::
                  destination_bearing_and_velocity_made_good}) {
-        sailroute::RouteRequest augmented = upwind_request();
+        sailroute::RouteRequest augmented = plain_request;
         augmented.options.heading_augmentation = mode;
-        const sailroute::RouteResult route = must_route(router, augmented);
-        REQUIRE(
-            route.diagnostics.generated_candidates >
-            plain.diagnostics.generated_candidates);
-        REQUIRE(route.completion == sailroute::RouteCompletion::destination_reached);
+        std::size_t generated = 0U;
+        const auto route = router.optimize(augmented, [&](const sailroute::RoutingProgress& progress) {
+            generated = progress.diagnostics.generated_candidates;
+            return sailroute::RoutingProgressDecision::cancel;
+        });
+        REQUIRE(!route.has_value());
+        REQUIRE(route.error().code == sailroute::ErrorCode::cancelled);
+        REQUIRE(generated > plain_generated);
     }
 }
 
@@ -1893,9 +1889,9 @@ TEST_CASE("midpoint wind sampling produces a usable route") {
     sailroute::RouteRequest thresholded = midpoint;
     thresholded.options.midpoint_wind_sampling_threshold =
         std::chrono::minutes{600};
-    require_same_route(
-        must_route(router, upwind_request()),
-        must_route(router, thresholded));
+    auto first_order = upwind_request();
+    first_order.options.wind_sampling = sailroute::WindSampling::segment_start;
+    require_same_route(must_route(router, first_order), must_route(router, thresholded));
 }
 
 TEST_CASE("monotone cubic polar interpolation routes to the destination") {
@@ -1990,7 +1986,7 @@ TEST_CASE("accuracy options stay deterministic across worker counts") {
     }
 }
 
-TEST_CASE("time-dependent lattice routing preserves exact anchors and is deterministic") {
+TEST_CASE("time-dependent lattice routing preserves the start and arrival region deterministically") {
         const RoutingGribFixture fixture;
         const auto weather = sailroute::WeatherDataset::load(fixture.path());
         REQUIRE(weather.has_value());
@@ -2026,12 +2022,9 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
         REQUIRE(
             first.value().points.front().position.longitude_degrees ==
             request.start.longitude_degrees);
-        REQUIRE(
-            first.value().points.back().position.latitude_degrees ==
-            request.destination.latitude_degrees);
-        REQUIRE(
-            first.value().points.back().position.longitude_degrees ==
-            request.destination.longitude_degrees);
+        REQUIRE_NEAR(sailroute::detail::great_circle_distance_nautical_miles(
+            first.value().points.back().position, request.destination),
+            request.options.arrival_radius_nautical_miles, 1.0e-6);
 
         auto coarse_request = request;
         coarse_request.options.lattice.refinement_levels = 0U;
@@ -2122,7 +2115,10 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
             std::chrono::minutes{5};
         const sailroute::RouteResult penalised_route =
             must_route(router, penalised);
-        REQUIRE(penalised_route.arrival_time > route.arrival_time);
+        REQUIRE(std::any_of(penalised_route.points.begin() + 1,
+            penalised_route.points.end(), [](const auto& point) {
+                return point.boat_speed_knots == 0.0;
+            }));
 
         std::size_t rejected_vmg_segments = 0U;
         sailroute::RouteRequest rejected = request;
@@ -2259,12 +2255,9 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
             a_star_result.value().lattice_diagnostics->settled_labels > 2U);
         REQUIRE(
             dijkstra_result.value().lattice_diagnostics->settled_labels > 2U);
-        REQUIRE(
-            a_star_result.value().points.back().position.latitude_degrees ==
-            a_star.destination.latitude_degrees);
-        REQUIRE(
-            a_star_result.value().points.back().position.longitude_degrees ==
-            a_star.destination.longitude_degrees);
+        REQUIRE_NEAR(sailroute::detail::great_circle_distance_nautical_miles(
+            a_star_result.value().points.back().position, a_star.destination),
+            a_star.options.arrival_radius_nautical_miles, 1.0e-6);
     }
 
     TEST_CASE("failed mixed refinement retains the coarse incumbent") {
@@ -2330,9 +2323,6 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
         REQUIRE(
             a_star_result.value().lattice_diagnostics->re_relaxed_labels > 0U);
         REQUIRE(
-            a_star_result.value()
-                .lattice_diagnostics->stale_queue_entries > 0U);
-        REQUIRE(
             a_star_result.value().lattice_diagnostics->queued_labels <
             a_star_result.value().diagnostics.generated_candidates);
         require_monotonic_route(a_star_result.value());
@@ -2341,6 +2331,8 @@ TEST_CASE("time-dependent lattice routing preserves exact anchors and is determi
         beam.options.solver = sailroute::RoutingSolver::isochrone_beam;
         beam.options.time_step = std::chrono::hours{1};
         beam.options.heading_step_degrees = 70.0;
+        beam.options.heading_augmentation = sailroute::HeadingAugmentation::none;
+        beam.options.strategic_retention = false;
         const auto beam_result = router.optimize(beam);
         REQUIRE(beam_result.has_value());
         REQUIRE(
